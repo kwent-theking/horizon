@@ -76,6 +76,10 @@ pub enum Event {
     /// `ClientboundServerLinksPacket`: the links the pause menu's "Server
     /// Links..." lists (ClientCommonPacketListenerImpl.handleServerLinks).
     ServerLinks(Vec<cfg::ServerLink>),
+    /// ModSync: content block definitions the server pushed on the
+    /// `horizon:modsync` channel during configuration (how many).
+    /// Phase 1 reports them; the game thread decides what to do.
+    ModSync(usize),
     /// The connection ended. `from_server`: the server gave the reason (or
     /// the connection was refused for good), rather than the connection
     /// failing (auto-reconnect retries only failures and shutdowns).
@@ -94,6 +98,16 @@ pub struct Session {
     thread: Option<JoinHandle<()>>,
     pub address: String,
     pub name: String,
+    /// ViaHorizonPlus step 1: the version the status probe read off the
+    /// server before login, `(protocol, version_name)`. `None` when the
+    /// server speaks the client's own 26.3, the address is a friend's
+    /// world or local, or the probe failed (a probe failure never blocks
+    /// the join). Shared with the net thread, which runs the probe before
+    /// opening the login connection (a synchronous probe here would freeze
+    /// the game thread for the probe timeout).
+    /// RU: результат пробы версии сервера до входа; общий с сетевым потоком,
+    /// который и делает пробу до login-соединения.
+    pub probed: Arc<Mutex<Option<(i32, String)>>>,
     pub counters: Arc<Mutex<Option<Arc<Counters>>>>,
     /// The cookies this server stored on us (`ClientboundStoreCookiePacket`).
     pub cookies: Cookies,
@@ -184,9 +198,29 @@ impl Session {
             (writer.clone(), counters.clone(), cookies.clone());
         let thread_configuring = configuring.clone();
         let (address_owned, name_owned) = (address.to_owned(), name.to_owned());
+        let probed: Arc<Mutex<Option<(i32, String)>>> = Arc::new(Mutex::new(None));
+        let thread_probed = probed.clone();
+        // ViaHorizonPlus step 1: probe the server's version before the
+        // login connection is opened. Only real server addresses; a
+        // friend's world and the integrated server speak our own protocol.
+        // Runs on the net thread so the game thread never waits.
+        // RU: проба версии сервера до login; на сетевом потоке, игровой
+        // поток не ждёт.
         let thread = std::thread::Builder::new()
             .name("horizon-net".into())
             .spawn(move || {
+                if local.is_none() && !address_owned.starts_with(FRIEND) {
+                    if let Some((protocol, name)) = probe_server_version(&address_owned) {
+                        *thread_probed.lock().unwrap() = Some((protocol, name.clone()));
+                        status(
+                            &send,
+                            &format!(
+                                "ViaHorizonPlus: server runs {name} (protocol {protocol}), \
+                                 Horizon speaks 26.3 (777). Translation is being prepared."
+                            ),
+                        );
+                    }
+                }
                 let result = run(
                     local,
                     &address_owned,
@@ -221,6 +255,7 @@ impl Session {
             thread,
             address: address.to_owned(),
             name: name.to_owned(),
+            probed,
             counters,
             cookies,
             debug,
@@ -557,6 +592,23 @@ fn run(
         uuid: profile.uuid,
         name: profile.name,
     });
+    // Vanilla registers the channels it listens on with `minecraft:register`
+    // (NUL-separated channel names in the payload), so plugin-messenger
+    // servers (Paper) deliver their server->client plugin messages. We
+    // listen for ModSync; declaring it keeps the Messenger path alive.
+    // RU: ванильный minecraft:register — без него Paper не шлёт plugin messages.
+    {
+        let channels = format!("{}\0", crate::modsync::CHANNEL);
+        if let Some(w) = shared_writer.lock().unwrap().as_mut() {
+            let _ = w.send(
+                &play::Serverbound::CustomPayload(cfg::CustomPayload {
+                    channel: "minecraft:register".into(),
+                    data: channels.into_bytes(),
+                })
+                .encode(),
+            );
+        }
+    }
     receive_play(
         &mut reader,
         shared_writer,
@@ -632,6 +684,38 @@ fn receive_play(
                 }));
             }
             play::Clientbound::StoreCookie(p) => {
+                // ModSync over a vanilla cookie: the server's primary
+                // delivery path (ClientboundStoreCookiePacket with the key
+                // "horizon:modsync") needs no channel registration and no
+                // Messenger gate, so the same binary format as the
+                // custom-payload channel is parsed here too.
+                // RU: ModSync через ванильный cookie — основной путь доставки.
+                if p.key == crate::modsync::CHANNEL {
+                    log::info!(
+                        "ModSync: StoreCookie payload received ({} bytes)",
+                        p.payload.len()
+                    );
+                    match crate::modsync::decode(&p.payload) {
+                        Ok(sync) => {
+                            let names: Vec<String> = sync
+                                .blocks
+                                .iter()
+                                .take(10)
+                                .map(|(ns, path, _)| format!("{ns}:{path}"))
+                                .collect();
+                            let _ = send.send(Event::Status(format!(
+                                "ModSync: received {} content blocks from the server ({})",
+                                sync.blocks.len(),
+                                names.join(", ")
+                            )));
+                            let _ = send.send(Event::ModSync(sync.blocks.len()));
+                        }
+                        Err(e) => {
+                            let _ = send
+                                .send(Event::Status(format!("ModSync: malformed payload ({e})")));
+                        }
+                    }
+                }
                 cookies.lock().unwrap().insert(p.key, p.payload);
             }
             play::Clientbound::ServerLinks(p) => {
@@ -650,7 +734,67 @@ fn receive_play(
             play::Clientbound::CustomPayload(p) if p.channel == "minecraft:brand" => {
                 receive_brand(&p, send);
             }
+            play::Clientbound::CustomPayload(p) => {
+                log::info!("CustomPayload(diag): channel {} ({} bytes)", p.channel, p.data.len());
+            }
+            // ModSync in the play state: Paper's plugin messenger delivers
+            // server->client plugin messages here, so the same binary format
+            // as the configuration-phase channel is parsed again.
+            // RU: ModSync в play-фазе — Paper-мессенджер шлёт сюда.
+            play::Clientbound::CustomPayload(p) if p.channel == crate::modsync::CHANNEL => {
+                log::info!("ModSync: play-state payload received ({} bytes)", p.data.len());
+                match crate::modsync::decode(&p.data) {
+                    Ok(sync) => {
+                        let names: Vec<String> = sync
+                            .blocks
+                            .iter()
+                            .take(10)
+                            .map(|(ns, path, _)| format!("{ns}:{path}"))
+                            .collect();
+                        let _ = send.send(Event::Status(format!(
+                            "ModSync: received {} content blocks from the server ({})",
+                            sync.blocks.len(),
+                            names.join(", ")
+                        )));
+                        let _ = send.send(Event::ModSync(sync.blocks.len()));
+                    }
+                    Err(e) => {
+                        let _ = send
+                            .send(Event::Status(format!("ModSync: malformed payload ({e})")));
+                    }
+                }
+            }
             other => {
+                // Paper's NMS serializes common packets (StoreCookie) with the
+                // configuration-state id even while the connection is in play:
+                // catch that here and route it through cookie handling.
+                // RU: Paper шлёт store cookie с configuration-id в play.
+                if let play::Clientbound::Unknown(id, payload) = &other {
+                    if *id == horizon_protocol::ids::configuration::clientbound::STORE_COOKIE {
+                        if let Ok(p) = <cfg::StoreCookie as horizon_protocol::buf::Codec<cfg::StoreCookie>>::read(
+                            &mut horizon_protocol::buf::Reader::new(payload),
+                        ) {
+                            if p.key == crate::modsync::CHANNEL {
+                                log::info!("ModSync: config-id StoreCookie received ({} bytes)", p.payload.len());
+                                match crate::modsync::decode(&p.payload) {
+                                    Ok(sync) => {
+                                        let names: Vec<String> = sync.blocks.iter().take(10)
+                                            .map(|(ns, path, _)| format!("{ns}:{path}")).collect();
+                                        let _ = send.send(Event::Status(format!(
+                                            "ModSync: received {} content blocks from the server ({})",
+                                            sync.blocks.len(), names.join(", "))));
+                                        let _ = send.send(Event::ModSync(sync.blocks.len()));
+                                    }
+                                    Err(e) => {
+                                        let _ = send.send(Event::Status(format!("ModSync: malformed payload ({e})")));
+                                    }
+                                }
+                            }
+                            cookies.lock().unwrap().insert(p.key, p.payload);
+                            continue;
+                        }
+                    }
+                }
                 if send.send(Event::Packet(Box::new(other))).is_err() {
                     return Ok("Disconnected".into());
                 }
@@ -688,6 +832,30 @@ fn configure(
                     channel: crate::content_identity::CHANNEL.into(),
                     data: hash.to_vec(),
                 }))?;
+            }
+            // ModSync: content blocks pushed by a Horizon-aware server. One-way
+            // (no reply); a malformed payload is a status message, not a
+            // disconnect — the server may keep sending configuration packets.
+            cfg::Clientbound::CustomPayload(p) if p.channel == crate::modsync::CHANNEL => {
+                match crate::modsync::decode(&p.data) {
+                    Ok(payload) => {
+                        let names: Vec<String> = payload
+                            .blocks
+                            .iter()
+                            .take(10)
+                            .map(|(namespace, path, _)| format!("{namespace}:{path}"))
+                            .collect();
+                        let _ = send.send(Event::Status(format!(
+                            "ModSync: received {} content blocks from the server ({}…)",
+                            payload.blocks.len(),
+                            names.join(", ")
+                        )));
+                        let _ = send.send(Event::ModSync(payload.blocks.len()));
+                    }
+                    Err(e) => {
+                        let _ = send.send(Event::Status(format!("ModSync: malformed payload ({e})")));
+                    }
+                }
             }
             cfg::Clientbound::CustomPayload(p) => receive_brand(&p, send),
             cfg::Clientbound::Ping(p) => reply(cfg::Serverbound::Pong(p))?,
@@ -819,6 +987,26 @@ pub fn load_language(resources: &std::path::Path) -> Language {
         .unwrap_or_default()
 }
 
+/// ViaHorizonPlus step 1: read the server's version through a status ping
+/// (horizon-via's probe). `None` when the server speaks the client's own
+/// 26.3, when the probe cannot reach or parse the server (an unreachable
+/// or legacy-ping server must never block the join), or when the server
+/// reports a version the probe cannot read.
+///
+/// EN: the answer is used for the "server runs <name> (protocol <n>)"
+/// status message and stored on [`Session::probed`]; the translation layer
+/// (step 2) will consume it later.
+///
+/// RU: пробы версии сервера; None — совпадение, недоступность или
+/// нечитаемый ответ. Результат идёт в сообщение и `Session::probed`.
+fn probe_server_version(address: &str) -> Option<(i32, String)> {
+    let server = horizon_via::probe::probe_server(address, 3).ok()?;
+    if server.protocol == PROTOCOL_VERSION {
+        return None;
+    }
+    Some((server.protocol, server.version_name))
+}
+
 /// Ask a server for its status (ServerStatusPinger): MOTD, players and the
 /// round trip time in milliseconds.
 pub fn ping(address: &str, timeout: Duration) -> Result<(serde_json::Value, u128), String> {
@@ -927,6 +1115,73 @@ mod tests {
     }
 
     #[test]
+    fn modsync_payloads_are_reported_and_malformed_ones_do_not_disconnect() {
+        let (client, server) = horizon_protocol::connection::Pipe::pair();
+        let (mut reader, writer) = Connection::local(client).split();
+        let writer = Mutex::new(Some(writer));
+        let (send, events) = channel();
+        let thread = std::thread::spawn(move || {
+            configure(
+                &mut reader,
+                &writer,
+                &AtomicBool::new(true),
+                &Language::new(),
+                &send,
+                &Cookies::default(),
+                Path::new("."),
+            )
+        });
+        let mut server = Connection::local(server);
+        // One valid block: "HMS1", 1 entry, namespace "demo", path "ruby_ore",
+        // JSON {"template":"minecraft:stone"}.
+        let mut good = horizon_protocol::buf::Writer::new();
+        good.bytes(b"HMS1");
+        good.varint(1);
+        good.string("demo");
+        good.string("ruby_ore");
+        good.byte_array(br#"{"template":"minecraft:stone"}"#);
+        server
+            .send(&cfg::Clientbound::CustomPayload(cfg::CustomPayload {
+                channel: crate::modsync::CHANNEL.into(),
+                data: good.data,
+            })
+            .encode())
+            .unwrap();
+        // A malformed one right after: bad magic.
+        server
+            .send(&cfg::Clientbound::CustomPayload(cfg::CustomPayload {
+                channel: crate::modsync::CHANNEL.into(),
+                data: b"BAD!".to_vec(),
+            })
+            .encode())
+            .unwrap();
+        server
+            .send(&cfg::Clientbound::FinishConfiguration(Empty).encode())
+            .unwrap();
+        let (id, body) = server.recv().unwrap();
+        assert_eq!(
+            cfg::Serverbound::decode(id, &body).unwrap(),
+            cfg::Serverbound::FinishConfiguration(Empty)
+        );
+        assert!(thread.join().unwrap().is_ok());
+        let mut statuses = Vec::new();
+        let mut counts = Vec::new();
+        for event in events.try_iter() {
+            match event {
+                Event::Status(s) => statuses.push(s),
+                Event::ModSync(n) => counts.push(n),
+                _ => {}
+            }
+        }
+        assert_eq!(counts, vec![1]);
+        assert!(
+            statuses.iter().any(|s| s.starts_with("ModSync: received 1 content blocks")
+                && s.contains("demo:ruby_ore"))
+        );
+        assert!(statuses.iter().any(|s| s.starts_with("ModSync: malformed payload")));
+    }
+
+    #[test]
     fn disconnect_and_drop_do_not_wait_for_a_stalled_reader() {
         // A reader can remain stalled after Windows socket shutdown. It must
         // not delay either an explicit leave or Session's Drop on the UI thread.
@@ -948,6 +1203,7 @@ mod tests {
                 thread: Some(thread),
                 address: "local".into(),
                 name: "TestPlayer".into(),
+                probed: Arc::new(Mutex::new(None)),
                 counters: Arc::new(Mutex::new(None)),
                 cookies: Cookies::default(),
                 debug: false,
@@ -1047,6 +1303,7 @@ mod tests {
             thread: None,
             address: "local".into(),
             name: "Player".into(),
+            probed: Arc::new(Mutex::new(None)),
             counters: Arc::new(Mutex::new(None)),
             cookies: Cookies::default(),
             debug: false,
@@ -1175,3 +1432,4 @@ mod tests {
         assert!(events.try_recv().is_err());
     }
 }
+

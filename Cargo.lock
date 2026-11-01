@@ -1069,6 +1069,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "horizon-accounts"
+version = "0.1.0"
+dependencies = [
+ "ureq",
+]
+
+[[package]]
 name = "horizon-assets"
 version = "0.1.0"
 dependencies = [
@@ -1124,6 +1131,7 @@ dependencies = [
  "horizon-telemetry",
  "horizon-theme",
  "horizon-threads",
+ "horizon-via",
  "horizon-world",
  "log",
  "miniz_oxide 0.8.9",
@@ -1413,6 +1421,13 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "horizon-via"
+version = "0.1.0"
+dependencies = [
+ "flate2",
 ]
 
 [[package]]

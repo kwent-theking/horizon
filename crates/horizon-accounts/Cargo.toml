@@ -1,0 +1,36 @@
+[package]
+name = "horizon-accounts"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "In-game account switcher for the Horizon client: MSA device-code sign-in, XBL/XSTS/Minecraft token chain, account store and session-file emission, ported from The-Fireplace/In-Game-Account-Switcher. RU: переключатель аккаунтов для horizon-client (device-code вход, XBL/XSTS/MC-токены, хранилище аккаунтов, session-файл)."
+
+[features]
+default = ["client"]
+# EN: "client" turns on the real HTTPS transport (ureq, TLS). Without it the
+# crate still compiles offline: the `Http` trait and all parsing/store logic
+# are available, and `default_http()` returns a stub error.
+# RU: feature "client" включает реальный HTTPS-транспорт (ureq, TLS). Без него
+# крейт компилируется оффлайн: доступны трейт `Http` и вся логика парсинга/хранилища,
+# а `default_http()` возвращает заглушку-ошибку.
+client = ["dep:ureq"]
+
+[dependencies]
+ureq = { version = "2", optional = true, default-features = false, features = ["tls"] }
+
+# EN: intentionally NO serde — all JSON is parsed/serialized with the tiny
+# hand-rolled parser in `json.rs`, so this crate stays buildable without
+# pulling big dependency trees (and without network access to crates.io).
+# RU: намеренно БЕЗ serde — весь JSON разбирается/сериализуется маленьким
+# собственным парсером (`json.rs`), чтобы крейт собирался без больших деревьев
+# зависимостей (и без сети до crates.io).
+
+[lib]
+name = "horizon_accounts"
+
+[[bin]]
+name = "horizon-switcher"
+path = "src/bin/switcher.rs"
+
+[lints.rust]
+unsafe_code = "forbid"

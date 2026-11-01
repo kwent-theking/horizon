@@ -1172,6 +1172,11 @@ pub struct OptionsUi {
     language_choice: Option<String>,
     language_search: ui::EditBox,
     pub(crate) settings_search: ui::EditBox,
+    /// The Mods page's selected entry (ModMenu-style selection: the first
+    /// click selects, the second toggles). The index is into
+    /// `mods.installed`, `None` when nothing is selected.
+    /// RU: выбранный мод на странице Mods (клик = выбор, повтор = toggle).
+    pub(crate) mods_selected: Option<usize>,
     /// Packs: the packs found and the selection the screen opens with.
     pub pack_infos: Vec<crate::pack_screen::PackInfo>,
     pub pack_selection: Vec<String>,
@@ -1215,6 +1220,7 @@ impl Default for OptionsUi {
             language_choice: None,
             language_search: search,
             settings_search,
+            mods_selected: None,
             pack_infos: Vec::new(),
             pack_selection: Vec::new(),
             pack_screen: None,
@@ -1289,6 +1295,8 @@ enum Row {
     Big(Opt),
     Pair(Opt, Option<Opt>),
     Header(&'static str),
+    /// A header line with ready-made text (the Mods page's count).
+    Count(Text),
     /// A line of grey text (a path).
     Note(String),
     Buttons(Widget, Option<Widget>),
@@ -1306,7 +1314,10 @@ impl OptionsUi {
     }
     fn settings_search_active(&self) -> bool {
         self.settings_search.focused
-            && matches!(self.page(), Page::Video | Page::Controls | Page::KeyBinds)
+            && matches!(
+                self.page(),
+                Page::Video | Page::Controls | Page::KeyBinds | Page::Mods
+            )
     }
     pub fn page(&self) -> Page {
         *self.stack.last().unwrap_or(&Page::Main)
@@ -1370,7 +1381,10 @@ impl OptionsUi {
         self.stack.push(page);
         self.scroll = 0.0;
         self.scrollbar_drag_y = None;
-        if matches!(page, Page::Video | Page::Controls | Page::KeyBinds) {
+        if matches!(
+            page,
+            Page::Video | Page::Controls | Page::KeyBinds | Page::Mods
+        ) {
             self.settings_search.set_value("");
             self.settings_search.focused = false;
         }
@@ -1790,40 +1804,79 @@ impl OptionsUi {
                 if s.mods.installed.is_empty() {
                     return vec![Row::Header("horizon.mods.empty")];
                 }
-                s.mods
+                // The Mods page's search box, as the settings search does:
+                // case-insensitive substring over title and id.
+                let query = self.settings_search.value.to_lowercase();
+                let listed: Vec<usize> = s
+                    .mods
                     .installed
                     .iter()
                     .enumerate()
-                    .map(|(i, installed)| {
-                        let mut label = Text::literal(format!("{}: ", installed.title))
-                            .append(on_off(s.mods.is_on(i)));
-                        if installed.problem.is_some() {
-                            label = label.append(tr("horizon.mods.stopped"));
-                        } else if installed.dev {
-                            label = label.append(tr("horizon.mods.dev"));
-                        }
-                        let dead = installed.dev || installed.id.is_empty();
-                        // A native mod gets its settings page's button beside
-                        // the toggle.
-                        if installed.native.is_some() {
-                            let toggle = button(0.0, 0.0, 150.0, label, Act::ToggleMod(i));
-                            let settings = button(
-                                0.0,
-                                0.0,
-                                150.0,
-                                tr("horizon.mods.settings"),
-                                Act::ModSettings(i),
-                            );
-                            Row::Buttons(
-                                if dead { inactive(toggle) } else { toggle },
-                                Some(settings),
-                            )
-                        } else {
-                            let widget = button(0.0, 0.0, 310.0, label, Act::ToggleMod(i));
-                            Row::Buttons(if dead { inactive(widget) } else { widget }, None)
-                        }
+                    .filter(|(_, m)| {
+                        query.is_empty()
+                            || m.title.to_lowercase().contains(&query)
+                            || m.id.to_lowercase().contains(&query)
                     })
-                    .collect()
+                    .map(|(i, _)| i)
+                    .collect();
+                if listed.is_empty() {
+                    return Vec::new();
+                }
+                // ModMenu's header, exactly its wording: "42/115 Mods
+                // Displayed" while searching, "115 Mods" otherwise.
+                // RU: счётчик в формате ModMenu.
+                let count = if query.is_empty() {
+                    Text::literal(format!("{} Mods", s.mods.installed.len()))
+                } else {
+                    Text::literal(format!(
+                        "{}/{} Mods Displayed",
+                        listed.len(),
+                        s.mods.installed.len()
+                    ))
+                };
+                let mut rows = vec![Row::Count(count)];
+                rows.extend(listed.into_iter().map(|i| {
+                    let installed = &s.mods.installed[i];
+                    // ModMenu's list entry look: the mod's title, its id
+                    // version-style at the end, the description greyed on
+                    // the same row when it fits. Selected entries (the
+                    // first click) get ModMenu's ">" marker; the second
+                    // click toggles.
+                    // RU: строка в стиле ModMenu; "> " помечает выбор.
+                    let selected = self.mods_selected.map_or(false, |sel| sel == i);
+                    let marker = if selected { "> " } else { "  " };
+                    let mut label = Text::literal(format!("{marker}{}: ", installed.title))
+                        .append(on_off(s.mods.is_on(i)));
+                    if installed.problem.is_some() {
+                        label = label.append(tr("horizon.mods.stopped"));
+                    } else if installed.dev {
+                        label = label.append(tr("horizon.mods.dev"));
+                    } else if installed.native.is_some() {
+                        // A native mod is built into the game (source mark).
+                        label = label.append(tr("horizon.mods.native"));
+                    }
+                    let dead = installed.dev || installed.id.is_empty();
+                    // A native mod gets its settings page's button beside
+                    // the toggle.
+                    if installed.native.is_some() {
+                        let toggle = button(0.0, 0.0, 150.0, label, Act::ToggleMod(i));
+                        let settings = button(
+                            0.0,
+                            0.0,
+                            150.0,
+                            tr("horizon.mods.settings"),
+                            Act::ModSettings(i),
+                        );
+                        Row::Buttons(
+                            if dead { inactive(toggle) } else { toggle },
+                            Some(settings),
+                        )
+                    } else {
+                        let widget = button(0.0, 0.0, 310.0, label, Act::ToggleMod(i));
+                        Row::Buttons(if dead { inactive(widget) } else { widget }, None)
+                    }
+                }));
+                rows
             }
             Page::NativeMod(i) => self.native_rows(s, i),
             Page::ShaderPacks => {
@@ -1857,7 +1910,10 @@ impl OptionsUi {
         let mut out = Vec::new();
         let page = self.page();
         let cx = (w / 2.0).floor();
-        if matches!(page, Page::Video | Page::Controls | Page::KeyBinds) {
+        if matches!(
+            page,
+            Page::Video | Page::Controls | Page::KeyBinds | Page::Mods
+        ) {
             self.settings_search.x = cx - 100.0;
             self.settings_search.y = 17.0;
         }
@@ -2242,12 +2298,12 @@ impl OptionsUi {
             // Drawn by `pack_screen`.
             Page::Packs => {}
             _ => {
-                if matches!(page, Page::Video | Page::Controls) {
+                if matches!(page, Page::Video | Page::Controls | Page::Mods) {
                     top = 38.0;
                 }
                 out.push(Widget {
                     x: 0.0,
-                    y: if matches!(page, Page::Video | Page::Controls) {
+                    y: if matches!(page, Page::Video | Page::Controls | Page::Mods) {
                         4.0
                     } else {
                         12.0
@@ -2288,9 +2344,29 @@ impl OptionsUi {
                                 },
                                 list: false,
                             });
-                            y += padding + 18.0;
-                        }
-                        Row::Note(text) => {
+                             y += padding + 18.0;
+                         }
+                         Row::Count(text) => {
+                             let label = text.with_style(&Style {
+                                 bold: Some(true),
+                                 underlined: Some(true),
+                                 ..Style::default()
+                             });
+                             out.push(Widget {
+                                 x: 0.0,
+                                 y: y + 6.0,
+                                 w,
+                                 h: 9.0,
+                                 kind: WKind::Text {
+                                     text: label,
+                                     color: u32::MAX,
+                                     centered: true,
+                                 },
+                                 list: false,
+                             });
+                             y += 18.0;
+                         }
+                         Row::Note(text) => {
                             out.push(Widget {
                                 x: 0.0,
                                 y: y + 4.0,
@@ -2612,7 +2688,10 @@ impl OptionsUi {
             }
             self.language_search = search;
         }
-        if matches!(self.page(), Page::Video | Page::Controls | Page::KeyBinds) {
+        if matches!(
+            self.page(),
+            Page::Video | Page::Controls | Page::KeyBinds | Page::Mods
+        ) {
             let mut search = self.settings_search.clone();
             search.draw(batch, atlas, None);
             if search.value.is_empty() && !search.focused {
@@ -2712,7 +2791,12 @@ impl OptionsUi {
         }
         let (widgets, top, bottom, content) = self.layout(s, size.0, size.1);
         let mut events = Vec::new();
-        if !drag && matches!(self.page(), Page::Video | Page::Controls | Page::KeyBinds) {
+        if !drag
+            && matches!(
+                self.page(),
+                Page::Video | Page::Controls | Page::KeyBinds | Page::Mods
+            )
+        {
             let search = &mut self.settings_search;
             search.focused = ui::hovered((x, y), search.x, search.y, search.width, search.height);
             if search.focused {
@@ -2827,8 +2911,16 @@ impl OptionsUi {
                             events.push(Event::Changed);
                         }
                         Act::ToggleMod(i) => {
-                            s.mods.toggle(i);
-                            events.push(Event::Changed);
+                            // ModMenu-style: the first click selects the
+                            // entry, a click on the already-selected entry
+                            // toggles it.
+                            // RU: клик = выбор; клик по выбранному = toggle.
+                            if self.mods_selected == Some(i) {
+                                s.mods.toggle(i);
+                                events.push(Event::Changed);
+                            } else {
+                                self.mods_selected = Some(i);
+                            }
                         }
                         Act::ModSettings(i) => {
                             events.push(Event::ButtonClick);
@@ -3564,8 +3656,11 @@ mod tests {
             })
             .collect();
         assert_eq!(rows.len(), 3);
+                // ModMenu-style interaction: the first click only selects, the
+        // second click on the same row toggles. Rows beyond the first are
+        // dev/invalid, so their first click merely selects, too.
         for (i, row) in rows.iter().enumerate() {
-            let events = ui.click(
+            let _ = ui.click(
                 &mut s,
                 &atlas,
                 row.x + 1.0,
@@ -3575,13 +3670,25 @@ mod tests {
                 false,
                 false,
             );
-            if i == 0 {
-                assert!(events.contains(&Event::Changed));
-                assert!(events.contains(&Event::ButtonClick));
-            } else {
-                assert!(events.is_empty());
+            if i != 0 {
+                let events = ui.click(
+                    &mut s,
+                    &atlas,
+                    row.x + 1.0,
+                    row.y + 1.0,
+                    size,
+                    [480, 240],
+                    false,
+                    false,
+                );
+                assert!(events.is_empty(), "row {i} must not toggle");
             }
         }
+        // The first row is selected by the loop above: this click toggles.
+        let row = rows[0];
+        let events = ui.click(&mut s, &atlas, row.x + 1.0, row.y + 1.0, size, [480, 240], false, false);
+        assert!(events.contains(&Event::Changed));
+        assert!(events.contains(&Event::ButtonClick));
         assert!(s.mods.is_on(0));
         assert!(s.mods.is_on(1));
         assert!(!s.mods.is_on(2));

@@ -1,0 +1,19 @@
+[package]
+name = "horizon-via"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Protocol translation layer for the Horizon client: joins older Java servers (1.8-26.3) by translating packets, in the spirit of ViaVersion/ViaFabricPlus. RU: слой трансляции протокола для входа на старые Java-сервера."
+
+[dependencies]
+# Backend must match horizon-client's choice ("zlib-rs"): Cargo unifies
+# features of one crate version across the workspace, and flate2 rejects
+# two backends enabled at once. EN: keep in sync with horizon-client/Cargo.toml.
+flate2 = { version = "1", default-features = false, features = ["zlib-rs", "runtime_detection"] }
+# This crate intentionally has no dependencies on the rest of the workspace yet:
+# the pipeline builds it standalone first, then wires it into horizon-protocol
+# via the ServerboundInjector/ClientboundSink traits (see src/lib.rs).
+# EN: keep this crate dependency-light so 10 parallel coders never fight over Cargo.toml.
+
+[lints.rust]
+unsafe_code = "forbid"

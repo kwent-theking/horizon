@@ -55,6 +55,8 @@
   "horizon.mods.stopped": " (Stopped)",
   "horizon.mods.dev": " (Dev)",
   "horizon.mods.settings": "Settings",
+  "horizon.mods.native": " [native]",
+  "horizon.mods.count": "%s mods (%s on)",
   "horizon.mods.open_folder": "Open Mod Folder",
   "horizon.shader_packs.empty": "No shader packs: put them in the shaderpacks folder",
   "horizon.shader_packs.kind_horizon": " (Horizon)",

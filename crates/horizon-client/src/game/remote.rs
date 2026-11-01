@@ -113,6 +113,9 @@ pub(super) struct Remote {
     pub brand: String,
     /// The server announced it runs mods' quiet commands.
     pub quiet_commands: bool,
+    /// Content block definitions the server pushed on `horizon:modsync`
+    /// (ModSync phase 1): how many arrived. Phase 1 does not apply them.
+    pub modsync_blocks: usize,
     pub(super) builtin: Arc<Builtin>,
     lang: Arc<Language>,
     pub(super) registries: Arc<Dynamic>,
@@ -475,6 +478,7 @@ impl Game<'_> {
             session,
             brand: "unknown".into(),
             quiet_commands: false,
+            modsync_blocks: 0,
             builtin: Arc::new(builtin),
             lang,
             registries: Arc::new(Dynamic::default()),
@@ -1045,6 +1049,13 @@ impl Game<'_> {
                 Event::QuietCommands => {
                     if let Some(remote) = &mut self.remote {
                         remote.quiet_commands = true;
+                    }
+                }
+                // ModSync phase 1: the count is kept on the remote for the
+                // UI and diagnostics; the definitions are not applied yet.
+                Event::ModSync(count) => {
+                    if let Some(remote) = &mut self.remote {
+                        remote.modsync_blocks = count;
                     }
                 }
                 Event::Reconfigured(registries) => {

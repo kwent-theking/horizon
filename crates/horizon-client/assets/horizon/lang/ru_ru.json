@@ -55,6 +55,8 @@
   "horizon.mods.stopped": " (остановлен)",
   "horizon.mods.dev": " (разработка)",
   "horizon.mods.settings": "Настройки",
+  "horizon.mods.native": " [встроенный]",
+  "horizon.mods.count": "%s модов (%s включено)",
   "horizon.mods.open_folder": "Открыть папку модов",
   "horizon.shader_packs.empty": "Шейдерпаков нет: положите их в папку shaderpacks",
   "horizon.shader_packs.kind_horizon": " (Horizon)",

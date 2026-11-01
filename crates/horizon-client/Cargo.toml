@@ -20,6 +20,8 @@ horizon-threads = { path = "../horizon-threads" }
 horizon-hdr = { path = "../horizon-hdr" }
 horizon-world = { path = "../horizon-world" }
 horizon-protocol = { path = "../horizon-protocol" }
+# ViaHorizonPlus: server version probe before login (net.rs `run`), later the full translation layer.
+horizon-via = { path = "../horizon-via" }
 # server.properties, eula.txt and the user lists, shared with horizon-server.
 horizon-server-files = { path = "../horizon-server-files" }
 # Shader packs: reading them and turning their GLSL into naga modules.
