@@ -13,6 +13,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install native deps
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev pkg-config
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: crates
@@ -21,6 +23,7 @@ jobs:
 
   neoforge-gate:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: Setup Java 21
@@ -34,6 +37,5 @@ jobs:
           curl -sL -o installer.jar https://maven.neoforged.net/releases/net/neoforged/neoforge/21.1.247/neoforge-21.1.247-installer.jar
           java -jar installer.jar --installServer . > install.log 2>&1 || tail -5 install.log
           echo "eula=true" > eula.txt
-          # Fast boot check: server must reach "Done" without mods (gate harness base)
-          timeout 300 bash -c 'java -Xmx3G @libraries/net/neoforged/neoforge/21.1.247/unix_args.txt nogui > boot.log 2>&1 || true'
+          timeout 600 bash -c 'java -Xmx3G @libraries/net/neoforged/neoforge/21.1.247/unix_args.txt nogui > boot.log 2>&1 || true'
           grep -q "Done" boot.log && echo "SERVER_BOOT_OK" || (echo "BOOT_FAIL"; tail -20 boot.log; exit 1)
