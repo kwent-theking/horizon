@@ -520,24 +520,43 @@ fn run(
                     .map_err(|err| format!("Protocol error: {err}"))?;
                 let secret = generate_secret().map_err(e)?;
                 if hello.should_authenticate {
-                    let account = auth.ok_or_else(|| NOT_SIGNED_IN.to_owned())?;
-                    let hash = server_hash(&hello.server_id, &secret, &hello.public_key);
-                    if let Err(err) = crate::auth::join_server(account, &hash) {
-                        let reason = match err.reason() {
-                            Ok(key) => tr(lang, key),
-                            Err(message) => message.to_owned(),
-                        };
-                        return Err(plain(
-                            &translatable("disconnect.loginFailedInfo", &[&reason]),
-                            lang,
-                        ));
+                    match auth {
+                        Some(account) => {
+                            let hash = server_hash(&hello.server_id, &secret, &hello.public_key);
+                            if let Err(err) = crate::auth::join_server(account, &hash) {
+                                let reason = match err.reason() {
+                                    Ok(key) => tr(lang, key),
+                                    Err(message) => message.to_owned(),
+                                };
+                                return Err(plain(
+                                    &translatable("disconnect.loginFailedInfo", &[&reason]),
+                                    lang,
+                                ));
+                            }
+                        }
+                        // EN: no account: send the key without Mojang-auth; a
+                        // server that is actually offline accepts this, one
+                        // that checks rejects it with a clear reason.
+                        // RU: без аккаунта шлём ключ без аутентификации:
+                        // offline-сервер примет, online отклонит с причиной.
+                        None => log::warn!(
+                            "Horizon: server asked for authentication with no                              signed-in account; continuing without it"
+                        ),
                     }
                 }
                 status(send, &tr(lang, "connect.encrypting"));
+                let key_enc = key.encrypt(&secret).map_err(e)?;
+                let challenge_enc = key.encrypt(&hello.challenge).map_err(e)?;
+                log::info!(
+                    "Horizon: sending Key: secret {}B, challenge {}B (server key {}B)",
+                    key_enc.len(),
+                    challenge_enc.len(),
+                    key.size()
+                );
                 c.send(
                     &login::Serverbound::Key(login::Key {
-                        key: key.encrypt(&secret).map_err(e)?,
-                        challenge: key.encrypt(&hello.challenge).map_err(e)?,
+                        key: key_enc,
+                        challenge: challenge_enc,
                     })
                     .encode(),
                 )

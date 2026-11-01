@@ -313,6 +313,14 @@ fn run(addr: &str, host: &str, port: u16, protocol: i32) -> Result<(), ViaError>
         match state {
             ProtocolState::Login => {
                 match id {
+                    0x01 => {
+                        // Login Hello (encryption): dump the should-authenticate byte.
+                        // RU: дамп байта аутентификации.
+                        if body.len() > 1 {
+                            let tail: Vec<u8> = body.iter().rev().take(4).cloned().collect();
+                            println!("[login hello] last4 (reversed): {:02X?}", tail);
+                        }
+                    }
                     CB_LOGIN_DISCONNECT => {
                         print_disconnect_reason(state, &body);
                         return Ok(());
