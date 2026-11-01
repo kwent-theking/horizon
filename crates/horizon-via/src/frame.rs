@@ -284,6 +284,50 @@ impl FrameQueue {
     ///   so a subsequent `pop` looks at what follows.
     ///
     /// RU: вытаскивает следующий полный пакет, либо None — ждём байты.
+    /// Pop one raw frame's payload *including* its id VarInt: the shape
+    /// `decode_compressed_packet` expects when compression is on. Only the
+    /// length prefix is consumed. `None` when a full frame has not arrived.
+    /// RU: снять сырой кадр с id (без вырезания id): формат для decode_compressed_packet.
+    pub fn pop_raw(&mut self) -> Option<Result<Vec<u8>, ViaError>> {
+        if self.buf.is_empty() {
+            return None;
+        }
+        let (length, varint_bytes) = match peek_varint(&self.buf) {
+            Peeked::Incomplete => return None,
+            Peeked::Invalid => {
+                let n = self.buf.len().min(5);
+                self.buf.drain(..n);
+                return Some(Err(ViaError::Malformed {
+                    context: "packet length varint invalid".to_string(),
+                    bytes_seen: n,
+                }));
+            }
+            Peeked::Value(v, n) => (v, n),
+        };
+        if length < 0 {
+            self.buf.drain(..varint_bytes);
+            return Some(Err(ViaError::Malformed {
+                context: "negative packet length".to_string(),
+                bytes_seen: varint_bytes,
+            }));
+        }
+        let length = length as usize;
+        if length == 0 || length > MAX_PACKET_BYTES {
+            self.buf.drain(..varint_bytes);
+            return Some(Err(ViaError::OversizedPacket {
+                size: length,
+                limit: MAX_PACKET_BYTES,
+            }));
+        }
+        let total = varint_bytes + length;
+        if self.buf.len() < total {
+            return None;
+        }
+        // Drain the whole frame (prefix included), then keep the payload.
+        // RU: съесть кадр целиком и вернуть payload без length.
+        let frame_bytes: Vec<u8> = self.buf.drain(..total).collect();
+        Some(Ok(frame_bytes[varint_bytes..].to_vec()))
+    }
     pub fn pop(&mut self) -> Option<Result<(u32, Vec<u8>), ViaError>> {
         if self.buf.is_empty() {
             return None;
@@ -338,6 +382,28 @@ impl FrameQueue {
         }
         let body_start = varint_bytes + id_pos;
         Some(Ok((id as u32, frame_bytes[body_start..].to_vec())))
+    }
+}
+
+
+#[test]
+fn pop_raw_reads_big_frame() {
+    use crate::frame::FrameQueue;
+    let mut payload = vec![0x8F, 0x10, 0x78, 0x9C];
+    payload.extend(std::iter::repeat(0xAB).take(812));
+    let mut q = FrameQueue::new();
+    q.push(&[0xB0, 0x06]);
+    q.push(&payload);
+    match q.pop_raw() {
+        Some(Ok(raw)) => assert!(raw.len() == 816, "first got {}", raw.len()),
+        other => panic!("unexpected {:?}", other.map(|r| r.map(|v| v.len()))),
+    }
+    // Followed by a small frame: len 28 -> payload 28.
+    q.push(&[0x1C]);
+    q.push(&vec![0x00u8; 28]);
+    match q.pop_raw() {
+        Some(Ok(raw)) => assert!(raw.len() == 28, "second got {}", raw.len()),
+        other => panic!("unexpected second {:?}", other.map(|r| r.map(|v| v.len()))),
     }
 }
 

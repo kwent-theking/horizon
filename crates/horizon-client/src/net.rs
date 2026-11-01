@@ -234,6 +234,10 @@ impl Session {
                     &thread_counters,
                     &thread_cookies,
                     transferred,
+                    // Speak the server's protocol in the handshake, as
+                    // ViaHorizonPlus does: fake our version to match the probe.
+                    // RU: подмена версии в handshake на пробленную протокол-версию.
+                    thread_probed.lock().unwrap().as_ref().map(|&(p, _)| p),
                     &resources,
                 );
                 let from_server = result.is_ok();
@@ -442,6 +446,7 @@ fn run(
     shared_counters: &Mutex<Option<Arc<Counters>>>,
     cookies: &Cookies,
     transferred: bool,
+    probed_protocol: Option<i32>,
     resources: &Path,
 ) -> Result<String, String> {
     let (host, port, mut c) = if let Some(pipe) = local {
@@ -470,7 +475,9 @@ fn run(
     let e = |e: horizon_protocol::Error| e.to_string();
     c.send(
         &handshake::Serverbound::Intention(handshake::Intention {
-            protocol: PROTOCOL_VERSION,
+            // Speak the server's protocol in the handshake so it accepts us
+            // before translation: fake our version to the probed one.
+            protocol: probed_protocol.unwrap_or(PROTOCOL_VERSION),
             host: host.clone(),
             port,
             intent: if transferred {

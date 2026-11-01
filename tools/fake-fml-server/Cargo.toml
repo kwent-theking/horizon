@@ -1,0 +1,18 @@
+[package]
+name = "fake-fml-server"
+version = "0.1.0"
+edition = "2021"
+# Standalone binary: not part of the horizon workspace.
+# Автономный бинарник: вне workspace horizon-rust (пустой [workspace] ниже
+# не даёт cargo подхватить этот каталог как член основного workspace).
+
+[workspace]
+# Intentionally empty: decouple from parent workspace members.
+# Намеренно пусто: отсоединиться от родительского workspace.
+
+[dependencies]
+# Only std. No third-party crates — varints/strings/UUID are hand-rolled.
+# Только std. Сторонних крейтов нет — varint/строки/UUID вручную.
+
+[profile.release]
+opt-level = 2
