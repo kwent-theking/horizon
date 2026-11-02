@@ -1,3 +1,4 @@
+
 //! Multiplayer session: a network thread that connects to a server, logs in,
 //! runs the configuration phase and then forwards decoded play packets to the
 //! game thread. Keep-alives are answered on the network thread; pings wait for
@@ -501,6 +502,26 @@ fn run(
     .map_err(e)?;
     let profile = loop {
         let (id, payload) = c.recv().map_err(e)?;
+        // 767 (1.21.x) login success is [uuid][name][properties], while
+        // 26.x writes [name][uuid][properties][session uuid]: decode the
+        // old order by hand when we speak the probed 767 protocol.
+        // / RU: у 767 успех логина - другой порядок полей; при пробе 767
+        // разбираем вручную.
+        if probed_protocol == Some(767) && id == 0x02 {
+            // [uuid 16][name varint-len str][properties varint count]...
+            // / RU: старый порядок полей 1.21.x.
+            let mut r = horizon_protocol::buf::Reader::new(&payload);
+            let uuid = r.uuid().map_err(|err| format!("profile uuid: {err}"))?;
+            let name = r.string(16).map_err(|err| format!("profile name: {err}"))?;
+            let game = login::GameProfile {
+                name,
+                uuid,
+                properties: Vec::new(),
+            };
+            c.send(&login::Serverbound::LoginAcknowledged(Empty).encode())
+                .map_err(e)?;
+            break game;
+        }
         match login::Clientbound::decode(id, &payload).map_err(e)? {
             login::Clientbound::Compression(p) => c.set_compression(p.threshold),
             login::Clientbound::LoginFinished(p) => {
@@ -590,10 +611,17 @@ fn run(
         }
     };
     status(send, "Joining world...");
-    c.send(
-        &cfg::Serverbound::ClientInformation(cfg::ClientInformation::new(view_distance)).encode(),
-    )
-    .map_err(e)?;
+    let mut info_packet =
+        cfg::Serverbound::ClientInformation(cfg::ClientInformation::new(view_distance)).encode();
+    if probed_protocol == Some(767) {
+        // 767 has no particle status field: the default 0 encodes as one
+        // 0x00 byte at the end - cut it off.
+        // / RU: у 767 нет particle status: отрезаем хвостовой байт.
+        if info_packet.last() == Some(&0) {
+            info_packet.pop();
+        }
+    }
+    c.send(&info_packet).map_err(e)?;
     c.send(
         &cfg::Serverbound::CustomPayload(cfg::CustomPayload {
             channel: "minecraft:brand".into(),
@@ -882,6 +910,77 @@ fn configure(
                         let _ = send.send(Event::Status(format!("ModSync: malformed payload ({e})")));
                     }
                 }
+            }
+            // NeoForge 1.21.x negotiation (ViaHorizonPlus): answer the
+            // channel query and the two blocking payloads so the server
+            // finishes configuration for a "vanilla" client.
+            // / RU: неготовация NeoForge: отвечаем на запрос каналов и
+            // два блокирующих payload, чтобы сервер завершил фазу.
+            cfg::Clientbound::CustomPayload(p) if p.channel == "neoforge:register" => {
+                log::info!(
+                    "ViaHorizonPlus: neoforge:register query received ({} bytes, head {:02X?})",
+                    p.data.len(),
+                    p.data.iter().take(24)
+                );
+                // Mirror the server's channel query back with the same
+                // channels and versions: this is what a matching NeoForge
+                // client answers, so the negotiation succeeds.
+                // / RU: зеркалим запрос каналов сервера - как клиент
+                // с совпадающим набором, чтобы неготовация прошла.
+                let mut data = Vec::new();
+                // Parse the query: varint mapSize; per entry: proto varint,
+                // count varint; per component: id string, version string,
+                // bool flowPresent + varint, bool optional.
+                let q = &p.data;
+                let mut pos = 0usize;
+                let map_size = buf_ext::read_varint_at(q, &mut pos).unwrap_or(0);
+                buf_ext::write_varint_out(map_size, &mut data);
+                for _m in 0..map_size {
+                    let proto = buf_ext::read_varint_at(q, &mut pos).unwrap_or(0);
+                    buf_ext::write_varint_out(proto, &mut data);
+                    let count = buf_ext::read_varint_at(q, &mut pos).unwrap_or(0);
+                    buf_ext::write_varint_out(count, &mut data);
+                    for _c in 0..count {
+                        let id = buf_ext::read_string_at(q, &mut pos).unwrap_or_default();
+                        let version = buf_ext::read_string_at(q, &mut pos).unwrap_or_else(|| "1".into());
+                        buf_ext::write_varint_out(id.len() as i32, &mut data);
+                        data.extend_from_slice(id.as_bytes());
+                        buf_ext::write_varint_out(version.len() as i32, &mut data);
+                        data.extend_from_slice(version.as_bytes());
+                        // flow: bool present + varint ordinal
+                        let flow_present = *q.get(pos).unwrap_or(&0);
+                        pos += 1;
+                        if flow_present != 0 {
+                            let _ = buf_ext::read_varint_at(q, &mut pos);
+                        }
+                        let _optional = *q.get(pos).unwrap_or(&0);
+                        pos += 1;
+                        // answer with no flow restriction
+                        data.push(0x00);
+                        data.push(0x01); // optional: true
+                    }
+                }
+                reply(cfg::Serverbound::CustomPayload(cfg::CustomPayload {
+                    channel: "neoforge:register".into(),
+                    data,
+                }))?;
+            }
+            cfg::Clientbound::CustomPayload(p) if p.channel == "neoforge:known_registry_data_maps" => {
+                let mut data = Vec::new();
+                buf_ext::write_varint(0, &mut data); // empty map
+                reply(cfg::Serverbound::CustomPayload(cfg::CustomPayload {
+                    channel: "neoforge:known_registry_data_maps_reply".into(),
+                    data,
+                }))?;
+            }
+            cfg::Clientbound::CustomPayload(p) if p.channel == "neoforge:extensible_enum_data" => {
+                reply(cfg::Serverbound::CustomPayload(cfg::CustomPayload {
+                    channel: "neoforge:extensible_enum_ack".into(),
+                    data: Vec::new(),
+                }))?;
+            }
+            cfg::Clientbound::Ping(p) if p.id == 0 => {
+                reply(cfg::Serverbound::Pong(p))?;
             }
             cfg::Clientbound::CustomPayload(p) => receive_brand(&p, send),
             cfg::Clientbound::Ping(p) => reply(cfg::Serverbound::Pong(p))?,
@@ -1459,3 +1558,44 @@ mod tests {
     }
 }
 
+/// VarInt writer for hand-built NeoForge payload bodies.
+/// / RU: запись VarInt для самодельных payload NeoForge.
+mod buf_ext {
+    pub fn write_varint(value: i32, out: &mut Vec<u8>) {
+        let mut v = value as u32;
+        loop {
+            let byte = (v & 0x7F) as u8;
+            v >>= 7;
+            if v == 0 {
+                out.push(byte);
+                break;
+            }
+            out.push(byte | 0x80);
+        }
+    }
+
+    pub fn read_varint_at(buf: &[u8], pos: &mut usize) -> Option<i32> {
+        let mut value: i32 = 0;
+        let mut shift = 0;
+        loop {
+            let b = *buf.get(*pos)?;
+            *pos += 1;
+            value |= ((b & 0x7F) as i32) << shift;
+            shift += 7;
+            if b & 0x80 == 0 {
+                return Some(value);
+            }
+        }
+    }
+
+    pub fn read_string_at(buf: &[u8], pos: &mut usize) -> Option<String> {
+        let len = read_varint_at(buf, pos)? as usize;
+        let s = String::from_utf8_lossy(buf.get(*pos..(*pos + len))?).to_string();
+        *pos += len;
+        Some(s)
+    }
+
+    pub fn write_varint_out(value: i32, out: &mut Vec<u8>) {
+        write_varint(value, out);
+    }
+}

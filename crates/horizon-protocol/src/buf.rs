@@ -383,6 +383,25 @@ impl<T, C: Codec<T>> Codec<Option<T>> for Opt<C> {
     }
 }
 /// ByteBufCodecs.OPTIONAL_VAR_INT: 0 = empty, otherwise value + 1.
+
+/// Reads a value only when the reader has bytes left: the 1.21.x wire has no
+/// session id after the game profile, 26.2+ always writes one.
+/// / RU: читает значение, только если байты остались: в 1.21.x нет session id.
+pub struct TailOpt<C>(PhantomData<C>);
+impl<T, C: Codec<T>> Codec<Option<T>> for TailOpt<C> {
+    fn read(r: &mut Reader) -> Result<Option<T>> {
+        if r.remaining() == 0 {
+            return Ok(None);
+        }
+        Ok(Some(C::read(r)?))
+    }
+    fn write(v: &Option<T>, w: &mut Writer) {
+        if let Some(v) = v {
+            C::write(v, w);
+        }
+    }
+}
+
 pub struct OptVarInt;
 impl Codec<Option<i32>> for OptVarInt {
     fn read(r: &mut Reader) -> Result<Option<i32>> {

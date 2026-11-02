@@ -29,7 +29,7 @@ packet!(Hello {
     challenge: Vec<u8> => Bytes,
     should_authenticate: bool => Bool,
 });
-packet!(LoginFinished { profile: GameProfile => GameProfile, session: u128 => Uuid });
+packet!(LoginFinished { profile: GameProfile => GameProfile, session: Option<u128> => crate::buf::TailOpt<Uuid> });
 packet!(Compression { threshold: i32 => VarInt });
 packet!(CustomQuery { transaction: i32 => VarInt, channel: String => Ident, data: Vec<u8> => Rest });
 packet!(CookieRequest { key: String => Ident });

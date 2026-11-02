@@ -774,7 +774,7 @@ fn login_and_configure(
                 name: name.to_owned(),
                 properties: properties.clone(),
             },
-            session: uuid,
+            session: Some(uuid),
         })
         .encode(),
     )
