@@ -640,6 +640,7 @@ fn run(
         send,
         cookies,
         resources,
+        probed_protocol,
     )?;
     let _ = send.send(Event::Joined {
         registries: Arc::new(registries),
@@ -671,6 +672,7 @@ fn run(
         send,
         cookies,
         resources,
+        probed_protocol,
     )
 }
 
@@ -682,6 +684,7 @@ fn receive_play(
     send: &Sender<Event>,
     cookies: &Cookies,
     resources: &Path,
+    probed_protocol: Option<i32>,
 ) -> Result<String, String> {
     loop {
         let (id, payload) = reader.recv().map_err(|e| e.to_string())?;
@@ -725,6 +728,7 @@ fn receive_play(
                     send,
                     cookies,
                     resources,
+                    probed_protocol,
                 )?;
                 let _ = send.send(Event::Reconfigured(Arc::new(registries)));
             }
@@ -867,6 +871,7 @@ fn configure(
     send: &Sender<Event>,
     cookies: &Cookies,
     resources: &Path,
+    probed: Option<i32>,
 ) -> Result<Dynamic, String> {
     let mut registries = Dynamic::default();
     let reply = |p: cfg::Serverbound| -> Result<(), String> {
@@ -877,6 +882,12 @@ fn configure(
     };
     loop {
         let (id, payload) = reader.recv().map_err(|e| e.to_string())?;
+        // 767 configuration packet ids differ from 777 from transfer on:
+        // 767 has no post_effects, so every id >= 0x0B (transfer) is one less
+        // than the 777 id. Remap before decoding with the 777 tables.
+        // / RU: id 767 начиная с transfer сдвинуты на один - у 767 нет
+        // post_effects. Ремапим перед декодом 777-таблицами.
+        let id = if probed == Some(767) && id >= 0x0B { id + 1 } else { id };
         match cfg::Clientbound::decode(id, &payload).map_err(|e| e.to_string())? {
             cfg::Clientbound::KeepAlive(k) => reply(cfg::Serverbound::KeepAlive(k))?,
             cfg::Clientbound::CustomPayload(p) if p.channel == crate::content_identity::CHANNEL => {
@@ -966,12 +977,104 @@ fn configure(
                 }))?;
             }
             cfg::Clientbound::CustomPayload(p) if p.channel == "neoforge:known_registry_data_maps" => {
+                // Mirror every data map the server listed (mandatory ones
+                // included) back as known: the Horizon client learns the
+                // maps from the server payload itself, so the check passes.
+                // / RU: зеркалим все data maps сервера как известные -
+                // клиент узнаёт их из самого payload сервера.
+                // Query: varint mapSize; per registry: string registryKey;
+                // varint listSize; per entry: string mapId, bool mandatory.
+                let q = &p.data;
+                let mut pos = 0usize;
+                let map_size = buf_ext::read_varint_at(q, &mut pos).unwrap_or(0);
                 let mut data = Vec::new();
-                buf_ext::write_varint(0, &mut data); // empty map
+                buf_ext::write_varint(map_size, &mut data);
+                let mut total = 0usize;
+                for _m in 0..map_size {
+                    let registry = buf_ext::read_string_at(q, &mut pos).unwrap_or_default();
+                    let list_size = buf_ext::read_varint_at(q, &mut pos).unwrap_or(0);
+                    buf_ext::write_varint_out(registry.len() as i32, &mut data);
+                    data.extend_from_slice(registry.as_bytes());
+                    buf_ext::write_varint(list_size, &mut data);
+                    for _e in 0..list_size {
+                        let map_id = buf_ext::read_string_at(q, &mut pos).unwrap_or_default();
+                        let _mandatory = *q.get(pos).unwrap_or(&0);
+                        pos += 1;
+                        buf_ext::write_varint_out(map_id.len() as i32, &mut data);
+                        data.extend_from_slice(map_id.as_bytes());
+                        total += 1;
+                    }
+                }
+                log::info!(
+                    "ViaHorizonPlus: known_registry_data_maps query mirrored ({} registries, {} maps)",
+                    map_size,
+                    total
+                );
                 reply(cfg::Serverbound::CustomPayload(cfg::CustomPayload {
                     channel: "neoforge:known_registry_data_maps_reply".into(),
                     data,
                 }))?;
+            }
+            cfg::Clientbound::CustomPayload(p) if p.channel == "bettercombat:config_sync"
+                || p.channel == "bettercombat:weapon_registry" =>
+            {
+                // Better Combat handshake: every config payload is answered
+                // with an Ack on `bettercombat:ack` whose code is the
+                // channel that was received - that is what completes the
+                // mod's configuration tasks on the server.
+                // / RU: рукопожатие Better Combat: на каждый config payload
+                // отвечаем Ack с кодом = имя канала - так завершаются
+                // конфиг-задачи мода на сервере.
+                // The ack code is the task key, not the channel name:
+                // config_sync answers with "bettercombat:config".
+                // / RU: код подтверждения - ключ задачи, а не имя канала.
+                let code = if p.channel == "bettercombat:config_sync" {
+                    "bettercombat:config".to_string()
+                } else {
+                    p.channel.clone()
+                };
+                let mut data = Vec::new();
+                let bytes = code.as_bytes();
+                buf_ext::write_varint_out(bytes.len() as i32, &mut data);
+                data.extend_from_slice(bytes);
+                reply(cfg::Serverbound::CustomPayload(cfg::CustomPayload {
+                    channel: "bettercombat:ack".into(),
+                    data,
+                }))?;
+                log::info!("ViaHorizonPlus: better combat ack sent ({})", code);
+            }
+            cfg::Clientbound::CustomPayload(p) if p.channel == "neoforge:feature_flags" => {
+                // mechanics-mod negotiation: echo the feature flags back as
+                // the acknowledgement a real modded client sends.
+                // / RU: переговоры мода mechanics - эхо флагов как
+                // подтверждение, которое шлёт настоящий модовый клиент.
+                // NeoForge 21.1.247+ CheckFeatureFlags task: the server
+                // sends its modded feature flags and waits for the empty
+                // FeatureFlagAcknowledgePayload on the ack channel.
+                // / RU: задача CheckFeatureFlags - сервер шлёт свои модовые
+                // флаги и ждёт пустой ack на канале feature_flags_ack.
+                reply(cfg::Serverbound::CustomPayload(cfg::CustomPayload {
+                    channel: "neoforge:feature_flags_ack".into(),
+                    data: Vec::new(),
+                }))?;
+                log::info!(
+                    "ViaHorizonPlus: feature flags acknowledged ({} flags payload bytes)",
+                    p.data.len()
+                );
+            }
+            cfg::Clientbound::CustomPayload(p) if p.channel == "neoforge:frozen_registry_sync_completed" => {
+                // The real NeoForge client applies the frozen registry
+                // snapshots and answers with the same empty payload to
+                // finish the SyncRegistries task. Horizon keeps the data for
+                // ModSync but must answer or the server stalls.
+                // / RU: настоящий клиент применяет снапшоты реестров и
+                // отвечает тем же пустым payload - иначе сервер зависает.
+                let _ = &p;
+                reply(cfg::Serverbound::CustomPayload(cfg::CustomPayload {
+                    channel: "neoforge:frozen_registry_sync_completed".into(),
+                    data: Vec::new(),
+                }))?;
+                log::info!("ViaHorizonPlus: frozen registry sync acknowledged");
             }
             cfg::Clientbound::CustomPayload(p) if p.channel == "neoforge:extensible_enum_data" => {
                 reply(cfg::Serverbound::CustomPayload(cfg::CustomPayload {
@@ -982,7 +1085,14 @@ fn configure(
             cfg::Clientbound::Ping(p) if p.id == 0 => {
                 reply(cfg::Serverbound::Pong(p))?;
             }
-            cfg::Clientbound::CustomPayload(p) => receive_brand(&p, send),
+            cfg::Clientbound::CustomPayload(p) => {
+                log::info!(
+                    "ViaHorizonPlus: custom payload channel {} ({} bytes) passthrough",
+                    p.channel,
+                    p.data.len()
+                );
+                receive_brand(&p, send);
+            }
             cfg::Clientbound::Ping(p) => reply(cfg::Serverbound::Pong(p))?,
             // Know no packs: the server then sends every registry entry in full.
             cfg::Clientbound::SelectKnownPacks(_) => {
@@ -1196,6 +1306,7 @@ mod tests {
                 &send,
                 &Cookies::default(),
                 &root,
+                None,
             )
         });
         let mut server = Connection::local(server);
@@ -1254,6 +1365,7 @@ mod tests {
                 &send,
                 &Cookies::default(),
                 Path::new("."),
+                None,
             )
         });
         let mut server = Connection::local(server);
@@ -1380,6 +1492,7 @@ mod tests {
                 &send,
                 &Cookies::default(),
                 Path::new("."),
+                None,
             )
         });
         let mut server = Connection::local(server);

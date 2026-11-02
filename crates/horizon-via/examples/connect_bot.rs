@@ -419,6 +419,7 @@ fn run(addr: &str, host: &str, port: u16, protocol: i32) -> Result<(), ViaError>
                             &body[pos..(pos + _ch_len).min(body.len())],
                         ).to_string();
                         pos += _ch_len.min(body.len() - pos);
+                        let chan_end = pos;
                         println!("[cfg payload] channel: {channel}");
 
                         let mut reply = Vec::new();
@@ -457,10 +458,43 @@ fn run(addr: &str, host: &str, port: u16, protocol: i32) -> Result<(), ViaError>
                                 reply.push(0x01);
                             }
                             true
+                        } else if channel == "neoforge:frozen_registry_sync_completed" {
+                            write_varint("neoforge:frozen_registry_sync_completed".len() as i32, &mut reply);
+                            reply.extend_from_slice(b"neoforge:frozen_registry_sync_completed");
+                            true
                         } else if channel == "neoforge:known_registry_data_maps" {
+                            // Mirror the query: every map the server listed is
+                            // known to the client (mandatory included).
+                            // RU: зеркалим запрос - все maps сервера известны.
                             write_varint("neoforge:known_registry_data_maps_reply".len() as i32, &mut reply);
                             reply.extend_from_slice(b"neoforge:known_registry_data_maps_reply");
-                            write_varint(0, &mut reply);
+                            let q = &body[chan_end..];
+                            let mut qpos = 0usize;
+                            if let Ok(map_size) = read_varint(q, &mut qpos) {
+                                write_varint(map_size, &mut reply);
+                                for _m in 0..map_size {
+                                    let reg_len = read_varint(q, &mut qpos).unwrap_or(0) as usize;
+                                    let reg = String::from_utf8_lossy(
+                                        &q[qpos..(qpos + reg_len).min(q.len())],
+                                    ).to_string();
+                                    qpos += reg_len.min(q.len() - qpos);
+                                    let list = read_varint(q, &mut qpos).unwrap_or(0);
+                                    write_varint(reg.len() as i32, &mut reply);
+                                    reply.extend_from_slice(reg.as_bytes());
+                                    write_varint(list, &mut reply);
+                                    for _e in 0..list {
+                                        let id_len = read_varint(q, &mut qpos).unwrap_or(0) as usize;
+                                        let id = String::from_utf8_lossy(
+                                            &q[qpos..(qpos + id_len).min(q.len())],
+                                        ).to_string();
+                                        qpos += id_len.min(q.len() - qpos);
+                                        let _man = q.get(qpos).copied().unwrap_or(0);
+                                        qpos += 1;
+                                        write_varint(id.len() as i32, &mut reply);
+                                        reply.extend_from_slice(id.as_bytes());
+                                    }
+                                }
+                            }
                             true
                         } else if channel == "neoforge:extensible_enum_data" {
                             write_varint("neoforge:extensible_enum_ack".len() as i32, &mut reply);
