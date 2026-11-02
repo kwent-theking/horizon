@@ -29,6 +29,10 @@ use std::{
     thread::JoinHandle,
     time::Duration,
 };
+/// Whether the current connection speaks protocol 767 (1.21.x): play
+/// packets are id-remapped both ways (see `p767`).
+/// / RU: текущее соединение на протоколе 767 - play-пакеты ремапятся.
+static PROBED_767: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// `CommonListenerCookie.serverCookies`: cookies the server asked the client
 /// to store (`ClientboundStoreCookiePacket`), answered to
@@ -291,9 +295,22 @@ impl Session {
         if self.configuring.load(Ordering::Relaxed) {
             return;
         }
-        if let Some(w) = writer.as_mut()
-            && w.send(&packet.encode()).is_err()
-        {
+        let mut body = packet.encode();
+        if PROBED_767.load(Ordering::Relaxed) {
+            // 777 -> 767 serverbound id; packets missing in 767 are dropped.
+            match p767::sb777_to_767(packet.id()) {
+                Some(id767) => {
+                    log::info!(
+                        "ViaHorizonPlus: play sb 777 {} -> 767 {}",
+                        packet.id(),
+                        id767
+                    );
+                    body = p767::rewire_id(&body, id767);
+                }
+                None => return,
+            }
+        }
+        if let Some(w) = writer.as_mut() && w.send(&body).is_err() {
             w.shutdown();
         }
     }
@@ -301,11 +318,17 @@ impl Session {
     pub fn send_pack_status(&self, id: u128, action: i32) {
         let status = cfg::ResourcePackResponse { id, action };
         let mut writer = self.writer.lock().unwrap();
-        let body = if self.configuring.load(Ordering::Relaxed) {
+        let mut body = if self.configuring.load(Ordering::Relaxed) {
             cfg::Serverbound::ResourcePack(status).encode()
         } else {
             play::Serverbound::ResourcePack(status).encode()
         };
+        if !self.configuring.load(Ordering::Relaxed) && PROBED_767.load(Ordering::Relaxed) {
+            let probe = play::Serverbound::ResourcePack(cfg::ResourcePackResponse { id, action });
+            if let Some(id767) = p767::sb777_to_767(probe.id()) {
+                body = p767::rewire_id(&body, id767);
+            }
+        }
         if let Some(w) = writer.as_mut()
             && w.send(&body).is_err()
         {
@@ -320,11 +343,20 @@ impl Session {
             payload,
         };
         let mut writer = self.writer.lock().unwrap();
-        let body = if self.configuring.load(Ordering::Relaxed) {
+        let mut body = if self.configuring.load(Ordering::Relaxed) {
             cfg::Serverbound::CustomClickAction(click).encode()
         } else {
             play::Serverbound::CustomClickAction(click).encode()
         };
+        if !self.configuring.load(Ordering::Relaxed) && PROBED_767.load(Ordering::Relaxed) {
+            if let Some(id767) = p767::sb777_to_767(play::Serverbound::CustomClickAction(
+                cfg::CustomClickAction { id: String::new(), payload: None },
+            )
+            .id())
+            {
+                body = p767::rewire_id(&body, id767);
+            }
+        }
         if let Some(w) = writer.as_mut()
             && w.send(&body).is_err()
         {
@@ -632,6 +664,7 @@ fn run(
     .map_err(e)?;
     let (mut reader, writer) = c.split();
     *shared_writer.lock().unwrap() = Some(writer);
+    PROBED_767.store(probed_protocol == Some(767), Ordering::Relaxed);
     let registries = configure(
         &mut reader,
         shared_writer,
@@ -654,14 +687,24 @@ fn run(
     // RU: ванильный minecraft:register — без него Paper не шлёт plugin messages.
     {
         let channels = format!("{}\0", crate::modsync::CHANNEL);
+        let mut body = play::Serverbound::CustomPayload(cfg::CustomPayload {
+            channel: "minecraft:register".into(),
+            data: channels.into_bytes(),
+        })
+        .encode();
+        if probed_protocol == Some(767) {
+            // 767 wire id for the play-phase custom payload.
+            if let Some(id767) = p767::sb777_to_767(play::Serverbound::CustomPayload(cfg::CustomPayload {
+                channel: String::new(),
+                data: Vec::new(),
+            })
+            .id())
+            {
+                body = p767::rewire_id(&body, id767);
+            }
+        }
         if let Some(w) = shared_writer.lock().unwrap().as_mut() {
-            let _ = w.send(
-                &play::Serverbound::CustomPayload(cfg::CustomPayload {
-                    channel: "minecraft:register".into(),
-                    data: channels.into_bytes(),
-                })
-                .encode(),
-            );
+            let _ = w.send(&body);
         }
     }
     receive_play(
@@ -688,6 +731,15 @@ fn receive_play(
 ) -> Result<String, String> {
     loop {
         let (id, payload) = reader.recv().map_err(|e| e.to_string())?;
+        // 767 play ids differ from 777 for most packets: remap by name via
+        // the generated table before the 777 decoder sees the id.
+        // / RU: id play-пакетов 767 сильно разошлись с 777 - ремапим
+        // по имени через сгенерированную таблицу до декодера.
+        let id = if probed_protocol == Some(767) {
+            p767::cb(id)
+        } else {
+            id
+        };
         let packet = match play::Clientbound::decode(id, &payload) {
             Ok(p) => p,
             Err(err) => {
@@ -703,7 +755,17 @@ fn receive_play(
         };
         let reply = |p: play::Serverbound| {
             if let Some(w) = shared_writer.lock().unwrap().as_mut() {
-                let _ = w.send(&p.encode());
+                let mut body = p.encode();
+                if probed_protocol == Some(767) {
+                    match p767::sb777_to_767(p.id()) {
+                        Some(id767) => {
+                            log::info!("ViaHorizonPlus: reply sb 777 {} -> 767 {}", p.id(), id767);
+                            body = p767::rewire_id(&body, id767);
+                        }
+                        None => return,
+                    }
+                }
+                let _ = w.send(&body);
             }
         };
         match packet {
@@ -717,7 +779,15 @@ fn receive_play(
             }
             play::Clientbound::StartConfiguration(_) => {
                 if let Some(w) = shared_writer.lock().unwrap().as_mut() {
-                    let _ = w.send(&play::Serverbound::ConfigurationAcknowledged(Empty).encode());
+                    let mut ack = play::Serverbound::ConfigurationAcknowledged(Empty).encode();
+                    if probed_protocol == Some(767) {
+                        if let Some(id767) = p767::sb777_to_767(
+                            play::Serverbound::ConfigurationAcknowledged(Empty).id(),
+                        ) {
+                            ack = p767::rewire_id(&ack, id767);
+                        }
+                    }
+                    let _ = w.send(&ack);
                     configuring.store(true, Ordering::Relaxed);
                 }
                 let registries = configure(
@@ -1710,5 +1780,224 @@ mod buf_ext {
 
     pub fn write_varint_out(value: i32, out: &mut Vec<u8>) {
         write_varint(value, out);
+    }
+}
+
+/// Packet id translation tables for protocol 767 (1.21.x) servers.
+/// Generated from vanilla GameProtocols 1.21.1 + Horizon's 777 ids.
+/// / RU: таблицы перевода id пакетов для серверов 767.
+pub mod p767 {
+    /// Rewrite the packet id (the leading VarInt) of an encoded packet,
+    /// re-encoding the header when its length changes.
+    /// / RU: переписывает id пакета (ведущий VarInt), пересобирая заголовок.
+    pub fn rewire_id(data: &[u8], new_id: i32) -> Vec<u8> {
+        let mut k = 0usize;
+        while let Some(&b) = data.get(k) {
+            k += 1;
+            if b & 0x80 == 0 {
+                break;
+            }
+        }
+        let mut out = Vec::with_capacity(data.len() + 2);
+        let mut v = new_id as u32;
+        loop {
+            let byte = (v & 0x7F) as u8;
+            v >>= 7;
+            if v == 0 {
+                out.push(byte);
+                break;
+            }
+            out.push(byte | 0x80);
+        }
+        out.extend_from_slice(&data[k..]);
+        out
+    }
+
+    /// 777 id -> 767 raw wire id (wire = index + 1: the bundle
+    /// delimiter occupies wire id 0), serverbound play. None: drop.
+    /// / RU: id 777 -> проводной id 767 (провод = индекс + 1,
+    /// 0 - делимитер бандла), serverbound play. None = дроп.
+    pub fn sb777_to_767(id: i32) -> Option<i32> {
+        match id {
+            0 => Some(1),
+            2 => Some(2),
+            4 => Some(3),
+            6 => Some(4),
+            7 => Some(5),
+            8 => Some(6),
+            9 => Some(7),
+            10 => Some(8),
+            11 => Some(9),
+            12 => Some(10),
+            14 => Some(11),
+            15 => Some(12),
+            16 => Some(13),
+            17 => Some(14),
+            18 => Some(15),
+            19 => Some(16),
+            20 => Some(17),
+            22 => Some(18),
+            24 => Some(20),
+            25 => Some(21),
+            26 => Some(22),
+            27 => Some(23),
+            28 => Some(24),
+            29 => Some(25),
+            30 => Some(26),
+            31 => Some(27),
+            32 => Some(28),
+            33 => Some(29),
+            34 => Some(30),
+            35 => Some(31),
+            39 => Some(33),
+            40 => Some(34),
+            41 => Some(35),
+            42 => Some(36),
+            43 => Some(37),
+            45 => Some(38),
+            47 => Some(39),
+            48 => Some(40),
+            49 => Some(41),
+            50 => Some(42),
+            51 => Some(43),
+            52 => Some(44),
+            53 => Some(45),
+            54 => Some(46),
+            55 => Some(47),
+            56 => Some(48),
+            57 => Some(49),
+            59 => Some(50),
+            60 => Some(51),
+            62 => Some(52),
+            64 => Some(54),
+            66 => Some(55),
+            67 => Some(56),
+            _ => None,
+        }
+    }
+
+    /// 767 wire id (bundle+delimiter occupy 0/1) -> 777 id, clientbound play.
+    /// / RU: проводной id 767 -> id 777, clientbound play.
+    pub fn cb(id: i32) -> i32 {
+        match id {
+            2 => 1,
+            4 => 2,
+            5 => 3,
+            6 => 4,
+            7 => 5,
+            8 => 6,
+            9 => 7,
+            10 => 8,
+            11 => 9,
+            12 => 10,
+            13 => 11,
+            14 => 12,
+            15 => 13,
+            16 => 14,
+            17 => 15,
+            18 => 16,
+            19 => 17,
+            20 => 18,
+            21 => 19,
+            22 => 20,
+            23 => 22,
+            24 => 23,
+            25 => 24,
+            26 => 25,
+            27 => 30,
+            28 => 31,
+            29 => 32,
+            30 => 33,
+            31 => 34,
+            32 => 36,
+            33 => 38,
+            34 => 39,
+            36 => 43,
+            37 => 44,
+            38 => 45,
+            39 => 46,
+            40 => 47,
+            41 => 48,
+            42 => 49,
+            43 => 50,
+            44 => 52,
+            45 => 53,
+            46 => 54,
+            47 => 55,
+            48 => 57,
+            49 => 58,
+            50 => 59,
+            51 => 60,
+            52 => 61,
+            53 => 62,
+            54 => 64,
+            55 => 65,
+            56 => 66,
+            57 => 67,
+            58 => 68,
+            59 => 69,
+            60 => 70,
+            61 => 71,
+            62 => 72,
+            63 => 73,
+            65 => 78,
+            66 => 79,
+            67 => 80,
+            68 => 81,
+            69 => 82,
+            70 => 84,
+            71 => 85,
+            72 => 86,
+            73 => 87,
+            74 => 88,
+            75 => 89,
+            76 => 90,
+            77 => 91,
+            78 => 92,
+            79 => 93,
+            80 => 94,
+            81 => 95,
+            83 => 96,
+            84 => 97,
+            85 => 99,
+            86 => 100,
+            87 => 101,
+            88 => 102,
+            89 => 103,
+            90 => 104,
+            91 => 105,
+            92 => 106,
+            93 => 108,
+            94 => 109,
+            95 => 111,
+            96 => 112,
+            97 => 113,
+            98 => 114,
+            99 => 115,
+            100 => 116,
+            101 => 117,
+            102 => 118,
+            103 => 119,
+            104 => 120,
+            105 => 121,
+            106 => 122,
+            107 => 124,
+            108 => 125,
+            109 => 126,
+            110 => 127,
+            111 => 128,
+            112 => 130,
+            113 => 131,
+            114 => 132,
+            115 => 133,
+            116 => 134,
+            117 => 135,
+            118 => 136,
+            119 => 137,
+            120 => 138,
+            121 => 139,
+            122 => 140,
+            other => other,
+        }
     }
 }

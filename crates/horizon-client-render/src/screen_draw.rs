@@ -431,10 +431,16 @@ pub fn button(
     };
     sprite(out, sprite_id, x, y, w, h);
     let (left, right) = (x + 2, x + w - 2);
-    let lw = m.width(label);
+    // A label wider than the button is clipped with an ellipsis so long
+    // mod names and their statuses stay inside the widget (vanilla clips
+    // button labels the same way).
+    // / RU: текст шире кнопки обрезается с многоточием - длинные имена
+    // модов и статусы остаются внутри кнопки.
+    let label = clip(m, label, w - 8);
+    let lw = m.width(&label);
     let top = (y + y + h - 9) / 2 + 1;
     let cx = ((left + right) / 2).clamp(left + lw / 2, right - lw / 2);
-    text(out, label.clone(), center_left(cx, lw), top, WHITE, true);
+    text(out, label, center_left(cx, lw), top, WHITE, true);
 }
 /// `Tooltip.splitTooltip` of a widget's tooltip, shown under the mouse.
 pub fn tooltip(out: &mut Vec<Draw>, m: &Measure, message: &Text, mouse: (i32, i32)) {

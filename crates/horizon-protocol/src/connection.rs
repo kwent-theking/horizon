@@ -354,6 +354,23 @@ impl ConnReader {
 impl ConnWriter {
     /// Send one packet body (VarInt id + payload).
     pub fn send(&mut self, body: &[u8]) -> Result<()> {
+        // Debug tap: with HORIZON_DUMP_SB set, every outgoing packet's id
+        // and size land in the log - the last resort for finding packets
+        // that bypass the id remap.
+        /// / RU: отладочный кран: с HORIZON_DUMP_SB каждый исходящий
+        /// пакет логируется - последняя надежда найти обход ремапа.
+        if std::env::var_os("HORIZON_DUMP_SB").is_some() {
+            let mut r = crate::buf::Reader::new(body);
+            let id = r.varint().unwrap_or(-1);
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("horizon-dump-sb.txt")
+            {
+                let _ = writeln!(f, "id {} ({} bytes)", id, body.len() - r.position());
+            }
+        }
         self.send_contents(&frame::contents(body, self.threshold)?)
     }
     /// Send a frame whose contents [`frame::contents`] made with this
