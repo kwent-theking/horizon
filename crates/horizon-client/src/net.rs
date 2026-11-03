@@ -723,6 +723,32 @@ fn receive_play(
         };
         match packet {
             play::Clientbound::KeepAlive(k) => reply(play::Serverbound::KeepAlive(k)),
+            // The chunk streaming feedback loop: after every finished batch
+            // the client tells the server how many chunks per tick it can
+            // take; without the reply the server stops streaming further
+            // batches and the world never loads.
+            // / RU: цикл обратной связи потоковой передачи чанков: после
+            // каждой завершённой пачки клиент сообщает серверу сколько чанков
+            // в тике он готов принимать; без ответа сервер перестаёт слать
+            // пачки и мир не грузится.
+            play::Clientbound::ChunkBatchFinished(_) => {
+                // The 265 wire has the serverbound chunk-batch-received on
+                /// wire id 8 (lambda index, no +1): write the raw reply so
+                /// the server's dispatcher accepts it. The egress table
+                /// would map it to 9 (client_command's slot) and the server
+                /// would die with a DecoderException.
+                /// / RU: на проводе 265 этот пакет идёт по wire id 8
+                /// (индекс лямбды, без +1) - пишем сырой ответ, иначе
+                /// сервер падает с DecoderException.
+                // The egress table now maps 777 CHUNK_BATCH_RECEIVED (11)
+                /// to wire 8 directly; the normal reply path is correct.
+                /// / RU: egress-таблица теперь переводит 777 id 11 в wire 8;
+                /// обычный путь ответа корректен.
+                reply(play::Serverbound::ChunkBatchReceived(play::ChunkBatchReceived {
+                    chunks_per_tick: 25.0,
+                }));
+                log::info!("ViaHorizonPlus: chunk batch finished - acknowledged (25 chunks/tick, raw wire 8)");
+            }
             play::Clientbound::BundleDelimiter(_) => {}
             play::Clientbound::ResourcePackPush(p) => {
                 let _ = send.send(Event::PackPush(p));
@@ -735,6 +761,15 @@ fn receive_play(
                     let _ = w.send(&play::Serverbound::ConfigurationAcknowledged(Empty).encode());
                     configuring.store(true, Ordering::Relaxed);
                 }
+                // A reconfiguration begins: the wire switches to the
+                // configuration protocol, where 767 and 777 agree, so the
+                // play translation must stand down for the whole phase.
+                // / RU: началась реконфигурация: провод переходит на язык
+                // конфигурации (у 767 и 777 он общий) - трансляция
+                // выключается на всю фазу.
+                if probed_protocol == Some(767) {
+                    horizon_protocol::translation::deactivate();
+                }
                 let registries = configure(
                     reader,
                     shared_writer,
@@ -745,6 +780,13 @@ fn receive_play(
                     resources,
                     probed_protocol,
                 )?;
+                // Back in play: the translation takes over again.
+                // / RU: снова play - трансляция включается.
+                if probed_protocol == Some(767) {
+                    horizon_protocol::translation::activate(
+                        horizon_protocol::translation::p767::translation(),
+                    );
+                }
                 let _ = send.send(Event::Reconfigured(Arc::new(registries)));
             }
             // ClientCommonPacketListenerImpl.handleRequestCookie: the stored

@@ -335,6 +335,7 @@ impl ConnReader {
                 // / RU: единый входящий шлюз: активная трансляция
                 // отображает проводной id в родной сразу после
                 // разбора кадра, до любого декодера.
+                let raw_id = id;
                 let id = crate::translation::ingress(id);
                 if std::env::var_os("HORIZON_DUMP_SB").is_some() {
                     use std::io::Write;
@@ -344,12 +345,19 @@ impl ConnReader {
                         .open("horizon-dump-sb.txt")
                     {
                         let n = body.len() - start;
-                        let full = if n <= 64 { &body[start..] } else { &body[start..start + 64] };
-                        let _ = writeln!(f, "RECV id {} ({} bytes) {:02X?}", id, n, full);
+                        let full = if n <= 512 { &body[start..] } else { &body[start..start + 64] };
+                        let _ = writeln!(f, "RECV wire {raw_id} -> id {id} ({n} bytes) {:02X?}", full);
                     }
                 }
+                // The body gateway: the active translation may rewrite the
+                // packet body from the wire (767) shape into the native
+                // (777) shape after the id was mapped.
+                // / RU: шлюз тел: активная трансляция может переписать тело
+                // пакета из формата 767 в родной 777 после маппинга id.
+                let payload = crate::translation::ingress_body(id, &body[start..])
+                    .unwrap_or_else(|| body[start..].to_vec());
                 self.counters.received.fetch_add(1, Ordering::Relaxed);
-                return Ok((id, body[start..].to_vec()));
+                return Ok((id, payload));
             }
             let mut chunk = [0u8; 16384];
             let n = self.stream.read(&mut chunk)?;
@@ -403,6 +411,15 @@ impl ConnWriter {
             }
         }
         self.send_contents(&frame::contents(routed, self.threshold)?)
+    }
+    /// Send a raw packet body WITHOUT the egress translation: for the rare
+    /// reply whose wire id must be written exactly (the 265 chunk-batch
+    /// ack). Everything else must go through `send`.
+    /// / RU: отправить сырое тело пакета БЕЗ egress-трансляции: для редких
+    /// ответов с точным wire-id (ack пакетных пачек 265). Всё остальное -
+    /// через send.
+    pub fn send_raw(&mut self, body: &[u8]) -> Result<()> {
+        self.send_contents(&frame::contents(body, self.threshold)?)
     }
     /// Send a frame whose contents [`frame::contents`] made with this
     /// writer's threshold.
