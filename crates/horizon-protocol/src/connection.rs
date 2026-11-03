@@ -343,7 +343,9 @@ impl ConnReader {
                         .append(true)
                         .open("horizon-dump-sb.txt")
                     {
-                        let _ = writeln!(f, "RECV id {} ({} bytes)", id, body.len() - start);
+                        let n = body.len() - start;
+                        let full = if n <= 64 { &body[start..] } else { &body[start..start + 64] };
+                        let _ = writeln!(f, "RECV id {} ({} bytes) {:02X?}", id, n, full);
                     }
                 }
                 self.counters.received.fetch_add(1, Ordering::Relaxed);

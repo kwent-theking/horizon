@@ -634,13 +634,6 @@ fn run(
     .map_err(e)?;
     let (mut reader, writer) = c.split();
     *shared_writer.lock().unwrap() = Some(writer);
-    // One activation, before any packet flows: the unified translation
-    // gateway in horizon-protocol now owns every id rewrite.
-    /// / RU: единственная активация до первого пакета: единый шлюз
-    /// трансляции в horizon-protocol теперь владеет всеми правками id.
-    if probed_protocol == Some(767) {
-        horizon_protocol::translation::activate(horizon_protocol::translation::p767::translation());
-    }
     let registries = configure(
         &mut reader,
         shared_writer,
@@ -656,6 +649,16 @@ fn run(
         uuid: profile.uuid,
         name: profile.name,
     });
+    // Activation AFTER configuration: the translation tables describe the
+    // play phase only. Activating earlier would rewrite the configuration
+    // ids (the two protocols happen to agree there) and corrupt the
+    // negotiation replies.
+    // / RU: активация ПОСЛЕ конфигурации: таблицы описывают только play-фазу.
+    // Более ранняя активация переписывала id конфиг-фазы и портила ответы
+    // неготовации (у 767 и 777 в конфиге id совпадают).
+    if probed_protocol == Some(767) {
+        horizon_protocol::translation::activate(horizon_protocol::translation::p767::translation());
+    }
     // Vanilla registers the channels it listens on with `minecraft:register`
     // (NUL-separated channel names in the payload), so plugin-messenger
     // servers (Paper) deliver their server->client plugin messages. We
@@ -888,29 +891,6 @@ fn configure(
     let mut registries = Dynamic::default();
     let reply = |p: cfg::Serverbound| -> Result<(), String> {
         let mut body = p.encode();
-        // The 265 configuration serverbound wire has finish on id 4 (one
-        /// past vanilla): every configuration reply at or after the
-        /// server's finish id shifts by one.
-        /// / RU: у 265 конфиг-SB finish на id 4 (сдвиг +1 от vanilla):
-        /// ответы с id >= 3 сдвигаются на один.
-        if probed == Some(767) {
-            let id = p.id();
-            if id >= 3 {
-                let mut out = Vec::with_capacity(body.len() + 2);
-                let mut v = (id + 1) as u32;
-                loop {
-                    let byte = (v & 0x7F) as u8;
-                    v >>= 7;
-                    if v == 0 {
-                        out.push(byte);
-                        break;
-                    }
-                    out.push(byte | 0x80);
-                }
-                out.extend_from_slice(&body[varint_skip(&body)..]);
-                body = out;
-            }
-        }
         match writer.lock().unwrap().as_mut() {
             Some(w) => w.send(&body).map_err(|e| e.to_string()),
             None => Err("Disconnected".into()),
@@ -931,71 +911,6 @@ fn configure(
         /// / RU: живой 265 шлёт конфиг-пинг на id 3 ([Int 0]) и
         /// keep-alive-подобный пакет на id 2 - отвечаем на оба, иначе
         /// рукопожатие сервера встаёт.
-        if probed == Some(767) && id == 3 && payload.len() == 4 {
-            // The 767 pong is [VarInt], not the 777 [Int]; write it by hand
-            /// over the raw reply so the server's codec accepts it.
-            /// / RU: pong у 767 - [VarInt], а не [Int] как у 777; пишем
-            /// вручную, чтобы серверный кодек принял.
-            let mut body = Vec::new();
-            let mut v = 0u32;
-            loop {
-                let byte = (v & 0x7F) as u8;
-                v >>= 7;
-                if v == 0 {
-                    body.push(byte);
-                    break;
-                }
-                body.push(byte | 0x80);
-            }
-            if probed == Some(767) {
-                // sb wire: pong lands on id 6 (shift +1 like every reply
-                /// at or past finish's slot).
-                let mut out = Vec::with_capacity(body.len() + 2);
-                let mut w = 6u32;
-                loop {
-                    let byte = (w & 0x7F) as u8;
-                    w >>= 7;
-                    if w == 0 {
-                        out.push(byte);
-                        break;
-                    }
-                    out.push(byte | 0x80);
-                }
-                out.extend_from_slice(&body);
-                body = out;
-            }
-            if let Some(w) = writer.lock().unwrap().as_mut() {
-                // Probe: a keep-alive-shaped long body on the pong slot -
-                /// if 265 maps id 5 to keep-alive this is valid and the
-                /// handshake survives; that pins the table down.
-                /// / RU: тело long в слоте pong - если у 265 id 5 это
-                /// keep-alive, тело валидно и рукопожатие выживет.
-                let mut probe = Vec::new();
-                probe.push(5u8); // varint id 5
-                probe.extend_from_slice(&0i64.to_be_bytes()); // long 0
-                let _ = w.send(&probe);
-            }
-            log::info!("ViaHorizonPlus: config ping answered with keep-alive-shaped probe");
-            continue;
-        }
-        if probed == Some(767) && id == 2 && payload.len() >= 8 {
-            let mut r = horizon_protocol::buf::Reader::new(&payload);
-            let key = match r.i64() {
-                Ok(k) => k,
-                Err(_) => {
-                    log::warn!("ViaHorizonPlus: undecodable id2 keep-alive, skipping");
-                    continue;
-                }
-            };
-            reply(cfg::Serverbound::KeepAlive(cfg::KeepAlive { id: key }))?;
-            log::info!("ViaHorizonPlus: config keep-alive {key} answered (id 2)");
-            continue;
-        }
-        // A configuration packet that does not decode cleanly is skipped,
-        // not fatal: the 767 configuration stream still carries payloads
-        /// whose 777 codecs differ; the state machine keeps going.
-        /// / RU: конфиг-пакет с ошибкой декода пропускается, а не рвёт
-        /// соединение - в потоке 767 есть payload с другими 777-кодеками.
         let decoded = match cfg::Clientbound::decode(id, &payload) {
             Ok(p) => p,
             Err(err) => {
@@ -1687,6 +1602,7 @@ mod tests {
                 &send,
                 &Cookies::default(),
                 Path::new("."),
+                None,
             )
         });
         let mut server = Connection::local(server);
@@ -1734,6 +1650,7 @@ mod tests {
                 &send,
                 &thread_cookies,
                 Path::new("."),
+                None,
             )
         });
         let mut server = Connection::local(server);
