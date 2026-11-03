@@ -1205,9 +1205,10 @@ fn configure(
             }
             cfg::Clientbound::CustomPayload(p) => {
                 log::info!(
-                    "ViaHorizonPlus: custom payload channel {} ({} bytes) passthrough",
+                    "ViaHorizonPlus: custom payload channel {:?} ({} bytes, data {:02X?}) passthrough",
                     p.channel,
-                    p.data.len()
+                    p.data.len(),
+                    p.data.iter().take(32)
                 );
                 receive_brand(&p, send);
             }
