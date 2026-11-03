@@ -329,6 +329,23 @@ impl ConnReader {
                 let mut r = Reader::new(&body);
                 let id = r.varint()?;
                 let start = r.position();
+                // The single ingress gateway: the active translation
+                // (`translation.rs`) maps the wire id to the native one
+                // right after the frame is split, before any decoder.
+                // / RU: единый входящий шлюз: активная трансляция
+                // отображает проводной id в родной сразу после
+                // разбора кадра, до любого декодера.
+                let id = crate::translation::ingress(id);
+                if std::env::var_os("HORIZON_DUMP_SB").is_some() {
+                    use std::io::Write;
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open("horizon-dump-sb.txt")
+                    {
+                        let _ = writeln!(f, "RECV id {} ({} bytes)", id, body.len() - start);
+                    }
+                }
                 self.counters.received.fetch_add(1, Ordering::Relaxed);
                 return Ok((id, body[start..].to_vec()));
             }
@@ -352,15 +369,27 @@ impl ConnReader {
     }
 }
 impl ConnWriter {
-    /// Send one packet body (VarInt id + payload).
+    /// Send one packet body (VarInt id + payload). This is the single
+    /// egress gateway: the active translation (`translation.rs`) rewrites
+    /// the id of serverbound play packets here, before framing, so no
+    /// producer can bypass it. With `HORIZON_DUMP_SB` set every outgoing
+    /// id is logged - the guard against silent bypasses.
+    /// / RU: единый шлюз исходящего трафика: активная трансляция
+    /// переписывает id serverbound play-пакетов здесь, до обрамления -
+    /// обойти его из кода отправки нельзя. С HORIZON_DUMP_SB каждый
+    /// исходящий id пишется в лог - защита от тихих обходов.
     pub fn send(&mut self, body: &[u8]) -> Result<()> {
-        // Debug tap: with HORIZON_DUMP_SB set, every outgoing packet's id
-        // and size land in the log - the last resort for finding packets
-        // that bypass the id remap.
-        /// / RU: отладочный кран: с HORIZON_DUMP_SB каждый исходящий
-        /// пакет логируется - последняя надежда найти обход ремапа.
+        let routed = crate::translation::egress(body);
+        let routed = routed.as_deref().unwrap_or_default();
+        if routed.is_empty() {
+            // The translation dropped the packet (no counterpart on the
+            // wire). Producers must not notice: send stays a success.
+            // / RU: трансляция дропнула пакет (нет аналога на проводе).
+            // Для отправителя это молчаливый успех.
+            return Ok(());
+        }
         if std::env::var_os("HORIZON_DUMP_SB").is_some() {
-            let mut r = crate::buf::Reader::new(body);
+            let mut r = crate::buf::Reader::new(routed);
             let id = r.varint().unwrap_or(-1);
             use std::io::Write;
             if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -368,10 +397,10 @@ impl ConnWriter {
                 .append(true)
                 .open("horizon-dump-sb.txt")
             {
-                let _ = writeln!(f, "id {} ({} bytes)", id, body.len() - r.position());
+                let _ = writeln!(f, "id {} ({} bytes)", id, routed.len() - r.position());
             }
         }
-        self.send_contents(&frame::contents(body, self.threshold)?)
+        self.send_contents(&frame::contents(routed, self.threshold)?)
     }
     /// Send a frame whose contents [`frame::contents`] made with this
     /// writer's threshold.

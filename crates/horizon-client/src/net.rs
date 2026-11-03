@@ -29,10 +29,6 @@ use std::{
     thread::JoinHandle,
     time::Duration,
 };
-/// Whether the current connection speaks protocol 767 (1.21.x): play
-/// packets are id-remapped both ways (see `p767`).
-/// / RU: текущее соединение на протоколе 767 - play-пакеты ремапятся.
-static PROBED_767: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// `CommonListenerCookie.serverCookies`: cookies the server asked the client
 /// to store (`ClientboundStoreCookiePacket`), answered to
@@ -295,22 +291,11 @@ impl Session {
         if self.configuring.load(Ordering::Relaxed) {
             return;
         }
-        let mut body = packet.encode();
-        if PROBED_767.load(Ordering::Relaxed) {
-            // 777 -> 767 serverbound id; packets missing in 767 are dropped.
-            match p767::sb777_to_767(packet.id()) {
-                Some(id767) => {
-                    log::info!(
-                        "ViaHorizonPlus: play sb 777 {} -> 767 {}",
-                        packet.id(),
-                        id767
-                    );
-                    body = p767::rewire_id(&body, id767);
-                }
-                None => return,
-            }
-        }
-        if let Some(w) = writer.as_mut() && w.send(&body).is_err() {
+        // No id rewrite here: ConnWriter.send routes every packet through
+        // the active translation (see horizon_protocol::translation).
+        /// / RU: id здесь не трогаем - ConnWriter.send пропускает каждый
+        /// пакет через активную трансляцию.
+        if let Some(w) = writer.as_mut() && w.send(&packet.encode()).is_err() {
             w.shutdown();
         }
     }
@@ -318,17 +303,11 @@ impl Session {
     pub fn send_pack_status(&self, id: u128, action: i32) {
         let status = cfg::ResourcePackResponse { id, action };
         let mut writer = self.writer.lock().unwrap();
-        let mut body = if self.configuring.load(Ordering::Relaxed) {
+        let body = if self.configuring.load(Ordering::Relaxed) {
             cfg::Serverbound::ResourcePack(status).encode()
         } else {
             play::Serverbound::ResourcePack(status).encode()
         };
-        if !self.configuring.load(Ordering::Relaxed) && PROBED_767.load(Ordering::Relaxed) {
-            let probe = play::Serverbound::ResourcePack(cfg::ResourcePackResponse { id, action });
-            if let Some(id767) = p767::sb777_to_767(probe.id()) {
-                body = p767::rewire_id(&body, id767);
-            }
-        }
         if let Some(w) = writer.as_mut()
             && w.send(&body).is_err()
         {
@@ -343,20 +322,11 @@ impl Session {
             payload,
         };
         let mut writer = self.writer.lock().unwrap();
-        let mut body = if self.configuring.load(Ordering::Relaxed) {
+        let body = if self.configuring.load(Ordering::Relaxed) {
             cfg::Serverbound::CustomClickAction(click).encode()
         } else {
             play::Serverbound::CustomClickAction(click).encode()
         };
-        if !self.configuring.load(Ordering::Relaxed) && PROBED_767.load(Ordering::Relaxed) {
-            if let Some(id767) = p767::sb777_to_767(play::Serverbound::CustomClickAction(
-                cfg::CustomClickAction { id: String::new(), payload: None },
-            )
-            .id())
-            {
-                body = p767::rewire_id(&body, id767);
-            }
-        }
         if let Some(w) = writer.as_mut()
             && w.send(&body).is_err()
         {
@@ -664,7 +634,13 @@ fn run(
     .map_err(e)?;
     let (mut reader, writer) = c.split();
     *shared_writer.lock().unwrap() = Some(writer);
-    PROBED_767.store(probed_protocol == Some(767), Ordering::Relaxed);
+    // One activation, before any packet flows: the unified translation
+    // gateway in horizon-protocol now owns every id rewrite.
+    /// / RU: единственная активация до первого пакета: единый шлюз
+    /// трансляции в horizon-protocol теперь владеет всеми правками id.
+    if probed_protocol == Some(767) {
+        horizon_protocol::translation::activate(horizon_protocol::translation::p767::translation());
+    }
     let registries = configure(
         &mut reader,
         shared_writer,
@@ -687,22 +663,11 @@ fn run(
     // RU: ванильный minecraft:register — без него Paper не шлёт plugin messages.
     {
         let channels = format!("{}\0", crate::modsync::CHANNEL);
-        let mut body = play::Serverbound::CustomPayload(cfg::CustomPayload {
+        let body = play::Serverbound::CustomPayload(cfg::CustomPayload {
             channel: "minecraft:register".into(),
             data: channels.into_bytes(),
         })
         .encode();
-        if probed_protocol == Some(767) {
-            // 767 wire id for the play-phase custom payload.
-            if let Some(id767) = p767::sb777_to_767(play::Serverbound::CustomPayload(cfg::CustomPayload {
-                channel: String::new(),
-                data: Vec::new(),
-            })
-            .id())
-            {
-                body = p767::rewire_id(&body, id767);
-            }
-        }
         if let Some(w) = shared_writer.lock().unwrap().as_mut() {
             let _ = w.send(&body);
         }
@@ -731,15 +696,10 @@ fn receive_play(
 ) -> Result<String, String> {
     loop {
         let (id, payload) = reader.recv().map_err(|e| e.to_string())?;
-        // 767 play ids differ from 777 for most packets: remap by name via
-        // the generated table before the 777 decoder sees the id.
-        // / RU: id play-пакетов 767 сильно разошлись с 777 - ремапим
-        // по имени через сгенерированную таблицу до декодера.
-        let id = if probed_protocol == Some(767) {
-            p767::cb(id)
-        } else {
-            id
-        };
+        // The id is already native: the ingress gateway in ConnReader.recv
+        // applied the active translation when the frame was split.
+        /// / RU: id уже родной - входящий шлюз в ConnReader.recv применил
+        /// активную трансляцию при разборе кадра.
         let packet = match play::Clientbound::decode(id, &payload) {
             Ok(p) => p,
             Err(err) => {
@@ -755,17 +715,7 @@ fn receive_play(
         };
         let reply = |p: play::Serverbound| {
             if let Some(w) = shared_writer.lock().unwrap().as_mut() {
-                let mut body = p.encode();
-                if probed_protocol == Some(767) {
-                    match p767::sb777_to_767(p.id()) {
-                        Some(id767) => {
-                            log::info!("ViaHorizonPlus: reply sb 777 {} -> 767 {}", p.id(), id767);
-                            body = p767::rewire_id(&body, id767);
-                        }
-                        None => return,
-                    }
-                }
-                let _ = w.send(&body);
+                let _ = w.send(&p.encode());
             }
         };
         match packet {
@@ -779,15 +729,7 @@ fn receive_play(
             }
             play::Clientbound::StartConfiguration(_) => {
                 if let Some(w) = shared_writer.lock().unwrap().as_mut() {
-                    let mut ack = play::Serverbound::ConfigurationAcknowledged(Empty).encode();
-                    if probed_protocol == Some(767) {
-                        if let Some(id767) = p767::sb777_to_767(
-                            play::Serverbound::ConfigurationAcknowledged(Empty).id(),
-                        ) {
-                            ack = p767::rewire_id(&ack, id767);
-                        }
-                    }
-                    let _ = w.send(&ack);
+                    let _ = w.send(&play::Serverbound::ConfigurationAcknowledged(Empty).encode());
                     configuring.store(true, Ordering::Relaxed);
                 }
                 let registries = configure(
@@ -945,8 +887,32 @@ fn configure(
 ) -> Result<Dynamic, String> {
     let mut registries = Dynamic::default();
     let reply = |p: cfg::Serverbound| -> Result<(), String> {
+        let mut body = p.encode();
+        // The 265 configuration serverbound wire has finish on id 4 (one
+        /// past vanilla): every configuration reply at or after the
+        /// server's finish id shifts by one.
+        /// / RU: у 265 конфиг-SB finish на id 4 (сдвиг +1 от vanilla):
+        /// ответы с id >= 3 сдвигаются на один.
+        if probed == Some(767) {
+            let id = p.id();
+            if id >= 3 {
+                let mut out = Vec::with_capacity(body.len() + 2);
+                let mut v = (id + 1) as u32;
+                loop {
+                    let byte = (v & 0x7F) as u8;
+                    v >>= 7;
+                    if v == 0 {
+                        out.push(byte);
+                        break;
+                    }
+                    out.push(byte | 0x80);
+                }
+                out.extend_from_slice(&body[varint_skip(&body)..]);
+                body = out;
+            }
+        }
         match writer.lock().unwrap().as_mut() {
-            Some(w) => w.send(&p.encode()).map_err(|e| e.to_string()),
+            Some(w) => w.send(&body).map_err(|e| e.to_string()),
             None => Err("Disconnected".into()),
         }
     };
@@ -958,7 +924,89 @@ fn configure(
         // / RU: id 767 начиная с transfer сдвинуты на один - у 767 нет
         // post_effects. Ремапим перед декодом 777-таблицами.
         let id = if probed == Some(767) && id >= 0x0B { id + 1 } else { id };
-        match cfg::Clientbound::decode(id, &payload).map_err(|e| e.to_string())? {
+        // The live 265 wire puts the configuration ping on id 3 (4 bytes,
+        /// [Int 0]) and a keep-alive-looking long packet on id 2; neither
+        /// maps through the 777 tables. Answer both so the server's
+        /// handshake keeps moving.
+        /// / RU: живой 265 шлёт конфиг-пинг на id 3 ([Int 0]) и
+        /// keep-alive-подобный пакет на id 2 - отвечаем на оба, иначе
+        /// рукопожатие сервера встаёт.
+        if probed == Some(767) && id == 3 && payload.len() == 4 {
+            // The 767 pong is [VarInt], not the 777 [Int]; write it by hand
+            /// over the raw reply so the server's codec accepts it.
+            /// / RU: pong у 767 - [VarInt], а не [Int] как у 777; пишем
+            /// вручную, чтобы серверный кодек принял.
+            let mut body = Vec::new();
+            let mut v = 0u32;
+            loop {
+                let byte = (v & 0x7F) as u8;
+                v >>= 7;
+                if v == 0 {
+                    body.push(byte);
+                    break;
+                }
+                body.push(byte | 0x80);
+            }
+            if probed == Some(767) {
+                // sb wire: pong lands on id 6 (shift +1 like every reply
+                /// at or past finish's slot).
+                let mut out = Vec::with_capacity(body.len() + 2);
+                let mut w = 6u32;
+                loop {
+                    let byte = (w & 0x7F) as u8;
+                    w >>= 7;
+                    if w == 0 {
+                        out.push(byte);
+                        break;
+                    }
+                    out.push(byte | 0x80);
+                }
+                out.extend_from_slice(&body);
+                body = out;
+            }
+            if let Some(w) = writer.lock().unwrap().as_mut() {
+                // Probe: a keep-alive-shaped long body on the pong slot -
+                /// if 265 maps id 5 to keep-alive this is valid and the
+                /// handshake survives; that pins the table down.
+                /// / RU: тело long в слоте pong - если у 265 id 5 это
+                /// keep-alive, тело валидно и рукопожатие выживет.
+                let mut probe = Vec::new();
+                probe.push(5u8); // varint id 5
+                probe.extend_from_slice(&0i64.to_be_bytes()); // long 0
+                let _ = w.send(&probe);
+            }
+            log::info!("ViaHorizonPlus: config ping answered with keep-alive-shaped probe");
+            continue;
+        }
+        if probed == Some(767) && id == 2 && payload.len() >= 8 {
+            let mut r = horizon_protocol::buf::Reader::new(&payload);
+            let key = match r.i64() {
+                Ok(k) => k,
+                Err(_) => {
+                    log::warn!("ViaHorizonPlus: undecodable id2 keep-alive, skipping");
+                    continue;
+                }
+            };
+            reply(cfg::Serverbound::KeepAlive(cfg::KeepAlive { id: key }))?;
+            log::info!("ViaHorizonPlus: config keep-alive {key} answered (id 2)");
+            continue;
+        }
+        // A configuration packet that does not decode cleanly is skipped,
+        // not fatal: the 767 configuration stream still carries payloads
+        /// whose 777 codecs differ; the state machine keeps going.
+        /// / RU: конфиг-пакет с ошибкой декода пропускается, а не рвёт
+        /// соединение - в потоке 767 есть payload с другими 777-кодеками.
+        let decoded = match cfg::Clientbound::decode(id, &payload) {
+            Ok(p) => p,
+            Err(err) => {
+                log::warn!(
+                    "ViaHorizonPlus: skipped undecodable config packet {id}: {err}; head {:02X?}",
+                    payload.iter().take(16)
+                );
+                continue;
+            }
+        };
+        match decoded {
             cfg::Clientbound::KeepAlive(k) => reply(cfg::Serverbound::KeepAlive(k))?,
             cfg::Clientbound::CustomPayload(p) if p.channel == crate::content_identity::CHANNEL => {
                 let hash = crate::content_identity::identity(resources)
@@ -1305,11 +1353,22 @@ pub fn load_language(resources: &std::path::Path) -> Language {
 /// RU: пробы версии сервера; None — совпадение, недоступность или
 /// нечитаемый ответ. Результат идёт в сообщение и `Session::probed`.
 fn probe_server_version(address: &str) -> Option<(i32, String)> {
-    let server = horizon_via::probe::probe_server(address, 3).ok()?;
-    if server.protocol == PROTOCOL_VERSION {
-        return None;
+    // The hosting panel's gateway sometimes stalls the status ping for a
+    // few seconds; a single 3-second try then fakes our protocol into the
+    // handshake and the server kicks with "Incompatible client". Probe
+    /// twice with a longer timeout before falling back.
+    /// / RU: шлюз панели иногда задумывается на несколько секунд; при
+    /// одном 3-секундном опросе клиент шлёт свой протокол в handshake и
+    /// сервер кикает "Incompatible client". Опрашиваем дважды.
+    for timeout in [8, 5] {
+        if let Ok(server) = horizon_via::probe::probe_server(address, timeout) {
+            if server.protocol == PROTOCOL_VERSION {
+                return None;
+            }
+            return Some((server.protocol, server.version_name));
+        }
     }
-    Some((server.protocol, server.version_name))
+    None
 }
 
 /// Ask a server for its status (ServerStatusPinger): MOTD, players and the
@@ -1783,221 +1842,15 @@ mod buf_ext {
     }
 }
 
-/// Packet id translation tables for protocol 767 (1.21.x) servers.
-/// Generated from vanilla GameProtocols 1.21.1 + Horizon's 777 ids.
-/// / RU: таблицы перевода id пакетов для серверов 767.
-pub mod p767 {
-    /// Rewrite the packet id (the leading VarInt) of an encoded packet,
-    /// re-encoding the header when its length changes.
-    /// / RU: переписывает id пакета (ведущий VarInt), пересобирая заголовок.
-    pub fn rewire_id(data: &[u8], new_id: i32) -> Vec<u8> {
-        let mut k = 0usize;
-        while let Some(&b) = data.get(k) {
-            k += 1;
-            if b & 0x80 == 0 {
-                break;
-            }
-        }
-        let mut out = Vec::with_capacity(data.len() + 2);
-        let mut v = new_id as u32;
-        loop {
-            let byte = (v & 0x7F) as u8;
-            v >>= 7;
-            if v == 0 {
-                out.push(byte);
-                break;
-            }
-            out.push(byte | 0x80);
-        }
-        out.extend_from_slice(&data[k..]);
-        out
-    }
-
-    /// 777 id -> 767 raw wire id (wire = index + 1: the bundle
-    /// delimiter occupies wire id 0), serverbound play. None: drop.
-    /// / RU: id 777 -> проводной id 767 (провод = индекс + 1,
-    /// 0 - делимитер бандла), serverbound play. None = дроп.
-    pub fn sb777_to_767(id: i32) -> Option<i32> {
-        match id {
-            0 => Some(1),
-            2 => Some(2),
-            4 => Some(3),
-            6 => Some(4),
-            7 => Some(5),
-            8 => Some(6),
-            9 => Some(7),
-            10 => Some(8),
-            11 => Some(9),
-            12 => Some(10),
-            14 => Some(11),
-            15 => Some(12),
-            16 => Some(13),
-            17 => Some(14),
-            18 => Some(15),
-            19 => Some(16),
-            20 => Some(17),
-            22 => Some(18),
-            24 => Some(20),
-            25 => Some(21),
-            26 => Some(22),
-            27 => Some(23),
-            28 => Some(24),
-            29 => Some(25),
-            30 => Some(26),
-            31 => Some(27),
-            32 => Some(28),
-            33 => Some(29),
-            34 => Some(30),
-            35 => Some(31),
-            39 => Some(33),
-            40 => Some(34),
-            41 => Some(35),
-            42 => Some(36),
-            43 => Some(37),
-            45 => Some(38),
-            47 => Some(39),
-            48 => Some(40),
-            49 => Some(41),
-            50 => Some(42),
-            51 => Some(43),
-            52 => Some(44),
-            53 => Some(45),
-            54 => Some(46),
-            55 => Some(47),
-            56 => Some(48),
-            57 => Some(49),
-            59 => Some(50),
-            60 => Some(51),
-            62 => Some(52),
-            64 => Some(54),
-            66 => Some(55),
-            67 => Some(56),
-            _ => None,
+/// Length of the leading VarInt of an encoded packet.
+/// / RU: длина ведущего VarInt закодированного пакета.
+fn varint_skip(body: &[u8]) -> usize {
+    let mut k = 0;
+    while let Some(&b) = body.get(k) {
+        k += 1;
+        if b & 0x80 == 0 {
+            break;
         }
     }
-
-    /// 767 wire id (bundle+delimiter occupy 0/1) -> 777 id, clientbound play.
-    /// / RU: проводной id 767 -> id 777, clientbound play.
-    pub fn cb(id: i32) -> i32 {
-        match id {
-            2 => 1,
-            4 => 2,
-            5 => 3,
-            6 => 4,
-            7 => 5,
-            8 => 6,
-            9 => 7,
-            10 => 8,
-            11 => 9,
-            12 => 10,
-            13 => 11,
-            14 => 12,
-            15 => 13,
-            16 => 14,
-            17 => 15,
-            18 => 16,
-            19 => 17,
-            20 => 18,
-            21 => 19,
-            22 => 20,
-            23 => 22,
-            24 => 23,
-            25 => 24,
-            26 => 25,
-            27 => 30,
-            28 => 31,
-            29 => 32,
-            30 => 33,
-            31 => 34,
-            32 => 36,
-            33 => 38,
-            34 => 39,
-            36 => 43,
-            37 => 44,
-            38 => 45,
-            39 => 46,
-            40 => 47,
-            41 => 48,
-            42 => 49,
-            43 => 50,
-            44 => 52,
-            45 => 53,
-            46 => 54,
-            47 => 55,
-            48 => 57,
-            49 => 58,
-            50 => 59,
-            51 => 60,
-            52 => 61,
-            53 => 62,
-            54 => 64,
-            55 => 65,
-            56 => 66,
-            57 => 67,
-            58 => 68,
-            59 => 69,
-            60 => 70,
-            61 => 71,
-            62 => 72,
-            63 => 73,
-            65 => 78,
-            66 => 79,
-            67 => 80,
-            68 => 81,
-            69 => 82,
-            70 => 84,
-            71 => 85,
-            72 => 86,
-            73 => 87,
-            74 => 88,
-            75 => 89,
-            76 => 90,
-            77 => 91,
-            78 => 92,
-            79 => 93,
-            80 => 94,
-            81 => 95,
-            83 => 96,
-            84 => 97,
-            85 => 99,
-            86 => 100,
-            87 => 101,
-            88 => 102,
-            89 => 103,
-            90 => 104,
-            91 => 105,
-            92 => 106,
-            93 => 108,
-            94 => 109,
-            95 => 111,
-            96 => 112,
-            97 => 113,
-            98 => 114,
-            99 => 115,
-            100 => 116,
-            101 => 117,
-            102 => 118,
-            103 => 119,
-            104 => 120,
-            105 => 121,
-            106 => 122,
-            107 => 124,
-            108 => 125,
-            109 => 126,
-            110 => 127,
-            111 => 128,
-            112 => 130,
-            113 => 131,
-            114 => 132,
-            115 => 133,
-            116 => 134,
-            117 => 135,
-            118 => 136,
-            119 => 137,
-            120 => 138,
-            121 => 139,
-            122 => 140,
-            other => other,
-        }
-    }
+    k
 }

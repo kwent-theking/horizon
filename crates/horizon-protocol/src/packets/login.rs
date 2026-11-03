@@ -84,7 +84,7 @@ mod tests {
             }),
             Clientbound::LoginFinished(LoginFinished {
                 profile,
-                session: 7,
+                session: Some(7),
             }),
             Clientbound::Compression(Compression { threshold: 256 }),
             Clientbound::CustomQuery(CustomQuery {
