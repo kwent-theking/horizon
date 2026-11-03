@@ -407,7 +407,9 @@ impl ConnWriter {
                 .append(true)
                 .open("horizon-dump-sb.txt")
             {
-                let _ = writeln!(f, "id {} ({} bytes)", id, routed.len() - r.position());
+                let n = routed.len() - r.position();
+                let full = if n <= 64 { &routed[r.position()..] } else { &routed[r.position()..r.position() + 64] };
+                let _ = writeln!(f, "SB id {} ({} bytes) {:02X?}", id, n, full);
             }
         }
         self.send_contents(&frame::contents(routed, self.threshold)?)
