@@ -167,7 +167,7 @@ pub mod p767 {
             18 => Some(14),
             19 => Some(15),
             20 => Some(16),
-            22 => Some(18),
+            22 => Some(17),
             24 => Some(19),
             25 => Some(20),
             26 => Some(21),
@@ -291,27 +291,27 @@ pub mod p767 {
             79 => 93,
             80 => 94,
             81 => 95,
-            83 => 96,
-            84 => 97,
-            85 => 99,
-            86 => 100,
-            87 => 101,
-            88 => 102,
-            89 => 103,
+            83 => 97,
+            84 => 98,
+            85 => 100,
+            86 => 101,
+            87 => 102,
+            88 => 103,
+            89 => 104,
             90 => 54,
-            91 => 105,
-            92 => 106,
-            93 => 108,
-            94 => 109,
-            95 => 111,
-            96 => 112,
-            97 => 113,
-            98 => 114,
-            99 => 115,
-            100 => 116,
-            101 => 117,
-            102 => 118,
-            103 => 119,
+            91 => 106,
+            92 => 107,
+            93 => 109,
+            94 => 110,
+            95 => 112,
+            96 => 113,
+            97 => 114,
+            98 => 115,
+            99 => 116,
+            100 => 117,
+            101 => 118,
+            102 => 119,
+            103 => 120,
             104 => 35,
             105 => 121,
             106 => 122,
@@ -320,7 +320,7 @@ pub mod p767 {
             109 => 126,
             110 => 127,
             111 => 128,
-            112 => 128,
+            112 => 130,
             113 => 131,
             114 => 132,
             115 => 133,
@@ -370,6 +370,18 @@ pub mod p767 {
             /// / RU: 767 заканчивается одним bool; у 777 их два и в SpawnInfo
             /// есть sea_level. Вставляем недостающие поля.
             crate::ids::play::clientbound::LOGIN => Some(login_767_to_777(body)),
+            // COMMANDS: node layout identical, argument type ids remapped
+            /// (resource_selector inserted at 47, uuid 53 -> 60).
+            /// / RU: структура узлов та же, id типов аргументов сдвигаются.
+            crate::ids::play::clientbound::COMMANDS => Some(commands_767_to_777(body)),
+            // UPDATE_ADVANCEMENTS: the icon stack's count/item varints
+            /// swap, x/y move to the advancement tail, trailing bool added.
+            /// / RU: у icon меняются местами count/item, x/y переезжают
+            /// в хвост, добавляется bool в конец.
+            crate::ids::play::clientbound::UPDATE_ADVANCEMENTS => Some(update_advancements_767_to_777(body)),
+            // UPDATE_ATTRIBUTES: holder (id+1) -> plain registry id.
+            /// / RU: holder (id+1) -> плоский id реестра.
+            crate::ids::play::clientbound::UPDATE_ATTRIBUTES => Some(update_attributes_767_to_777(body)),
             _ => None,
         }
     }
@@ -383,15 +395,32 @@ pub mod p767 {
     /// / RU: переносим скорость из трёх short'ов в хвосте в слот LpVec3
     /// после позиции.
     fn add_entity_velocity(body: &[u8]) -> Vec<u8> {
+        // 767: [varint id][uuid][varint kind][dbl x y z][b pitch][b yaw][b
+        /// headYaw][varint data][short vx][short vy][short vz]
+        /// 777: [varint id][uuid][varint kind][dbl x y z][LpVec3][b
+        /// pitch][b yaw][b headYaw][varint data]
+        /// / RU: скорость из трёх short'ов в хвосте переносится в слот
+        /// LpVec3 сразу после позиции.
         use crate::buf::Reader;
         let mut r = Reader::new(body);
         let _id = r.varint();
-        let uuid_ok = r.uuid();
+        let _uuid = r.uuid();
         let _kind = r.varint();
-        let xyz = (r.f64(), r.f64(), r.f64());
-        if xyz.0.is_err() || xyz.1.is_err() || xyz.2.is_err() || uuid_ok.is_err() {
+        let mut xyz = [0f64; 3];
+        let mut ok = true;
+        for v in xyz.iter_mut() {
+            match r.f64() {
+                Ok(x) => *v = x,
+                Err(_) => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if !ok || _id.is_err() || _uuid.is_err() || _kind.is_err() {
             return body.to_vec();
         }
+        let after_xyz = r.position();
         // Three shorts at the tail: the 767 velocity.
         if body.len() < 6 {
             return body.to_vec();
@@ -399,18 +428,17 @@ pub mod p767 {
         let vx = i16::from_be_bytes([body[body.len() - 6], body[body.len() - 5]]);
         let vy = i16::from_be_bytes([body[body.len() - 4], body[body.len() - 3]]);
         let vz = i16::from_be_bytes([body[body.len() - 2], body[body.len() - 1]]);
-        // The common case is a zero velocity (static spawnes); the 777
-        /// encoding of zero is a single zero byte.
-        /// / RU: частый случай - нулевая скорость; в 777 это один ноль.
-        let mut out = Vec::with_capacity(body.len());
-        out.extend_from_slice(&body[..body.len() - 6]);
         let [x, y, z] = [vx as f64 / 8000.0, vy as f64 / 8000.0, vz as f64 / 8000.0];
+        let mut out = Vec::with_capacity(body.len());
+        // head + position
+        out.extend_from_slice(&body[..after_xyz]);
+        // LpVec3 right after the position (before pitch/yaw/headYaw)
         write_lp_vec3(&mut out, [x, y, z]);
+        // the rest up to the six velocity bytes
+        out.extend_from_slice(&body[after_xyz..body.len() - 6]);
         out
     }
 
-    /// Write the 777 LpVec3 (the packed low-precision velocity).
-    /// / RU: записать LpVec3 777 (упакованная скорость).
     fn write_lp_vec3(out: &mut Vec<u8>, v: [f64; 3]) {
         let unpack = |b: u64| ((b & 32767) as f64).min(32766.0) * 2.0 / 32766.0 - 1.0;
         let pack = |v: f64| ((v * 0.5 + 0.5) * 32766.0).round() as u64;
@@ -441,6 +469,192 @@ pub mod p767 {
             }
         }
         let _ = unpack(0u64); // silence unused
+    }
+
+    /// ResourceLocation.STREAM_CODEC == STRING_UTF8: copy verbatim.
+    /// / RU: ResourceLocation = строка UTF-8: копия как есть.
+    fn copy_ident(r: &mut crate::buf::Reader, w: &mut crate::buf::Writer) -> crate::Result<()> {
+        let s = r.string(32767)?;
+        w.string(&s);
+        Ok(())
+    }
+    fn copy_nbt(r: &mut crate::buf::Reader, w: &mut crate::buf::Writer) -> crate::Result<()> {
+        let tag = r.nbt()?;
+        w.nbt(&tag);
+        Ok(())
+    }
+
+    /// UpdateAdvancements 767 -> 777: the icon stack's count/item varints
+    /// swap (767: [count][holder id+1][patch]; 777: [id][count][patch]),
+    /// the x/y floats move from the display to the advancement tail and
+    /// the 777 packet ends with one more bool.
+    /// / RU: у icon меняются местами count/item, x/y переезжают из display
+    /// в хвост advancement, в конце добавляется bool.
+    fn update_advancements_767_to_777(body: &[u8]) -> Vec<u8> {
+        let mut r = crate::buf::Reader::new(body);
+        let mut w = crate::buf::Writer::new();
+        let reset = match r.bool() { Ok(v) => v, Err(_) => return body.to_vec() };
+        w.bool(reset);
+        let n = match r.count(r.remaining()) { Ok(v) => v, Err(_) => return body.to_vec() };
+        w.varint(n as i32);
+        for _ in 0..n {
+            if copy_ident(&mut r, &mut w).is_err() { return body.to_vec(); }
+            let has = match r.bool() { Ok(v) => v, Err(_) => return body.to_vec() };
+            w.bool(has);
+            if has && copy_ident(&mut r, &mut w).is_err() { return body.to_vec(); }
+            let has_display = match r.bool() { Ok(v) => v, Err(_) => return body.to_vec() };
+            w.bool(has_display);
+            let (x, y) = if has_display {
+                if copy_nbt(&mut r, &mut w).is_err() { return body.to_vec(); }
+                if copy_nbt(&mut r, &mut w).is_err() { return body.to_vec(); }
+                // ItemStack 767: [varint count][varint holder = id+1][patch]
+                let count = match r.varint() { Ok(v) => v, Err(_) => return body.to_vec() };
+                let holder = match r.varint() { Ok(v) => v, Err(_) => return body.to_vec() };
+                if count <= 0 || holder <= 0 { return body.to_vec(); }
+                let start = r.position();
+                let positive = match r.count(65536) { Ok(v) => v, Err(_) => return body.to_vec() };
+                for _ in 0..positive {
+                    let kind = match r.varint() { Ok(v) => v, Err(_) => return body.to_vec() };
+                    if crate::item::Component::read(kind, &mut r).is_err() { return body.to_vec(); }
+                }
+                let negative = match r.count(65536) { Ok(v) => v, Err(_) => return body.to_vec() };
+                for _ in 0..negative {
+                    if r.varint().is_err() { return body.to_vec(); }
+                }
+                // 777: [varint item][varint count][patch verbatim]
+                w.varint(holder - 1);
+                w.varint(count);
+                w.bytes(r.since(start));
+                let frame = match r.varint() { Ok(v) => v, Err(_) => return body.to_vec() };
+                w.varint(frame);
+                let flags = match r.i32() { Ok(v) => v, Err(_) => return body.to_vec() };
+                w.i32(flags);
+                if flags & 1 != 0 && copy_ident(&mut r, &mut w).is_err() { return body.to_vec(); }
+                let x = match r.f32() { Ok(v) => v, Err(_) => return body.to_vec() };
+                let y = match r.f32() { Ok(v) => v, Err(_) => return body.to_vec() };
+                (x, y)
+            } else { (0.0, 0.0) };
+            // requirements: [varint groups][per: [varint k][k strings]]
+            let groups = match r.count(r.remaining()) { Ok(v) => v, Err(_) => return body.to_vec() };
+            w.varint(groups as i32);
+            for _ in 0..groups {
+                let k = match r.count(r.remaining()) { Ok(v) => v, Err(_) => return body.to_vec() };
+                w.varint(k as i32);
+                for _ in 0..k {
+                    if copy_ident(&mut r, &mut w).is_err() { return body.to_vec(); }
+                }
+            }
+            let telemetry = match r.bool() { Ok(v) => v, Err(_) => return body.to_vec() };
+            w.bool(telemetry);
+            w.f32(x);
+            w.f32(y);
+        }
+        // removed
+        let n = match r.count(r.remaining()) { Ok(v) => v, Err(_) => return body.to_vec() };
+        w.varint(n as i32);
+        for _ in 0..n {
+            if copy_ident(&mut r, &mut w).is_err() { return body.to_vec(); }
+        }
+        // progress
+        let n = match r.count(r.remaining()) { Ok(v) => v, Err(_) => return body.to_vec() };
+        w.varint(n as i32);
+        for _ in 0..n {
+            if copy_ident(&mut r, &mut w).is_err() { return body.to_vec(); }
+            let k = match r.count(r.remaining()) { Ok(v) => v, Err(_) => return body.to_vec() };
+            w.varint(k as i32);
+            for _ in 0..k {
+                if copy_ident(&mut r, &mut w).is_err() { return body.to_vec(); }
+                let done = match r.bool() { Ok(v) => v, Err(_) => return body.to_vec() };
+                w.bool(done);
+                if done {
+                    let at = match r.i64() { Ok(v) => v, Err(_) => return body.to_vec() };
+                    w.i64(at);
+                }
+            }
+        }
+        w.bool(true); // the 777-only trailing show
+        w.data
+    }
+
+    /// Commands 767 -> 777: node layout identical, argument type ids
+    /// remapped (resource_selector inserted at 47, uuid 53 -> 60).
+    /// / RU: структура узлов та же, id типов аргументов сдвигаются.
+    fn commands_767_to_777(body: &[u8]) -> Vec<u8> {
+        let map = |id: i32| match id {
+            0..=46 => id,
+            47..=52 => id + 1,
+            53 => 60,
+            other => other,
+        };
+        let mut r = crate::buf::Reader::new(body);
+        let mut w = crate::buf::Writer::new();
+        let n = match r.count(r.remaining()) { Ok(v) => v, Err(_) => return body.to_vec() };
+        w.varint(n as i32);
+        for _ in 0..n {
+            let flags = match r.u8() { Ok(v) => v, Err(_) => return body.to_vec() };
+            w.u8(flags);
+            let k = match r.count(r.remaining()) { Ok(v) => v, Err(_) => return body.to_vec() };
+            w.varint(k as i32);
+            for _ in 0..k {
+                let c = match r.varint() { Ok(v) => v, Err(_) => return body.to_vec() };
+                w.varint(c);
+            }
+            if flags & 8 != 0 {
+                let redirect = match r.varint() { Ok(v) => v, Err(_) => return body.to_vec() };
+                w.varint(redirect);
+            }
+            let kind = flags & 3;
+            if kind >= 1 && copy_ident(&mut r, &mut w).is_err() { return body.to_vec(); }
+            if kind == 2 {
+                let id = match r.varint() { Ok(v) => v, Err(_) => return body.to_vec() };
+                let props: Vec<u8> = if (0..=46).contains(&id) {
+                    let start = r.position();
+                    if crate::packets::play::ArgumentProperties::read(&mut r, id).is_err() {
+                        return body.to_vec();
+                    }
+                    r.since(start).to_vec()
+                } else if (47..=53).contains(&id) {
+                    Vec::new()
+                } else {
+                    return body.to_vec(); // modded argument type: unmappable
+                };
+                w.varint(map(id));
+                w.bytes(&props);
+                if flags & 16 != 0 && copy_ident(&mut r, &mut w).is_err() { return body.to_vec(); }
+            }
+        }
+        let root = match r.varint() { Ok(v) => v, Err(_) => return body.to_vec() };
+        w.varint(root);
+        w.data
+    }
+
+    /// UpdateAttributes 767 -> 777: the 767 attribute is a registry holder
+    /// (varint id+1, 0 = direct); 777 uses the plain registry id.
+    /// / RU: holder (id+1) -> плоский id; остальное байт-в-байт.
+    fn update_attributes_767_to_777(body: &[u8]) -> Vec<u8> {
+        let mut r = crate::buf::Reader::new(body);
+        let mut w = crate::buf::Writer::new();
+        let id = match r.varint() { Ok(v) => v, Err(_) => return body.to_vec() };
+        w.varint(id);
+        let n = match r.count(r.remaining()) { Ok(v) => v, Err(_) => return body.to_vec() };
+        w.varint(n as i32);
+        for _ in 0..n {
+            let holder = match r.varint() { Ok(v) => v, Err(_) => return body.to_vec() };
+            if holder <= 0 { return body.to_vec(); }
+            w.varint(holder - 1);
+            let base = match r.f64() { Ok(v) => v, Err(_) => return body.to_vec() };
+            w.f64(base);
+            let k = match r.count(r.remaining()) { Ok(v) => v, Err(_) => return body.to_vec() };
+            w.varint(k as i32);
+            for _ in 0..k {
+                if copy_ident(&mut r, &mut w).is_err() { return body.to_vec(); }
+                let amount = match r.f64() { Ok(v) => v, Err(_) => return body.to_vec() };
+                w.f64(amount);
+                let op = match r.varint() { Ok(v) => v, Err(_) => return body.to_vec() };
+                w.varint(op);
+            }
+        }
+        w.data
     }
 
     /// Heightmap kind ids for the 777 list form, from the 777 heightmap
@@ -640,7 +854,12 @@ pub mod p767 {
                 out.append(&mut transformed);
             }
             None => {
-                // Not parseable as sections: copy through unchanged.
+                // Not parseable as sections: pass through unchanged and
+                // say so once - a silent passthrough never decodes
+                // natively on 777.
+                // / RU: секции не разобрались - проход насквозь с одним
+                // логом: молчаливый проход никогда не декодится в 777.
+                
                 w = crate::buf::Writer::new();
                 w.varint(buf_len as i32);
                 out.extend_from_slice(&w.data);

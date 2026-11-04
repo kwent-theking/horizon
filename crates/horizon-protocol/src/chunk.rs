@@ -82,7 +82,16 @@ pub struct Paletted {
 impl Paletted {
     pub fn read(r: &mut Reader, strategy: Strategy, global_bits: u8) -> Result<Self> {
         let wire = r.u8()?;
-        let (has_palette, bits) = strategy.configuration(wire, global_bits);
+        let (has_palette, mut bits) = strategy.configuration(wire, global_bits);
+        if !has_palette {
+            // A global container is packed at the width the sender wrote
+            // (a 767 host's own registry width, e.g. 15), not our
+            // global_bits; read at the wire width. The widening to our
+            // width happens afterwards (remote_chunks).
+            // / RU: глобальный контейнер упакован шириной отправителя (у
+            // 767-хоста 15), не нашей; читаем по ширине провода.
+            bits = wire;
+        }
         // SimpleBitStorage holds 1 to 32 bits; wider wire values would
         // divide by zero or overflow a shift.
         if bits > 32 {
