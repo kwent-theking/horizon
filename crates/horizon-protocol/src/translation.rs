@@ -356,7 +356,22 @@ pub mod p767 {
             /// (varint kind, long array) pairs.
             /// / RU: у 767 heightmaps - один NBT-compound из long-массивов;
             /// 777 шлёт список пар (varint-тип, long-массив).
-            crate::ids::play::clientbound::LEVEL_CHUNK_WITH_LIGHT => Some(heightmaps_nbt_to_list(body)),
+            crate::ids::play::clientbound::LEVEL_CHUNK_WITH_LIGHT => {
+                // Debug capture: full 767 chunk bodies for offline analysis.
+                /// / RU: отладочный захват полных тел чанков 767.
+                if let Ok(dir) = std::env::var("TEMP") {
+                    use std::sync::atomic::{AtomicU32, Ordering};
+                    static N: AtomicU32 = AtomicU32::new(0);
+                    let n = N.fetch_add(1, Ordering::Relaxed);
+                    if n < 3 {
+                        let _ = std::fs::write(
+                            format!("{}\\horizon-chunk-767-{n}.bin", dir),
+                            body,
+                        );
+                    }
+                }
+                Some(heightmaps_nbt_to_list(body))
+            }
             // ADD_ENTITY: the 767 velocity is three packed shorts at the
             /// tail; 777 carries a low-precision packed Vec3 right after
             /// the position.
@@ -866,10 +881,109 @@ pub mod p767 {
                 out.extend_from_slice(sections);
             }
         }
-        out.extend_from_slice(after);
+        // The trailing block entities copy through; the 767 light data
+        /// does not: its bit sets are [varint long count][longs]
+        /// (FriendlyByteBuf.writeBitSet) while the native 777 shape uses
+        /// byte arrays ([varint byte count][bytes]). Repack the light
+        /// section after the block entity list.
+        /// / RU: хвост block entities проходит как есть; свет 767 - нет:
+        /// его битовые маски это [varint число longs][longs]
+        /// (writeBitSet), а нативный формат 777 - байтовые массивы.
+        /// Перепаковываем секцию света после списка block entities.
+        let after = repack_light_767(after);
+        out.extend_from_slice(&after);
         out
     }
 
+    /// Repack the 767 light tail into the native 777 byte-array shape.
+    /// Structure: [BE list (passed through)][4 bit sets][2 layer lists].
+    /// The block entity list is parsed to find where the light starts.
+    /// / RU: перепаковка хвоста света 767 в байтовый формат 777. Структура:
+    /// [список BE (проходит насквозь)][4 битовые маски][2 списка слоёв].
+    /// Encode a u32 as a bare varint (Writer is not always at hand).
+    /// / RU: кодирование u32 как varint без Writer.
+    fn varint_bytes(mut v: u32) -> Vec<u8> {
+        let mut out = Vec::with_capacity(5);
+        loop {
+            let b = (v & 0x7F) as u8;
+            v >>= 7;
+            if v == 0 {
+                out.push(b);
+                return out;
+            }
+            out.push(b | 0x80);
+        }
+    }
+
+    fn repack_light_767(tail: &[u8]) -> Vec<u8> {
+        let limits = horizon_world::nbt::Limits::default();
+        let mut r = crate::buf::Reader::new(tail);
+        // Block entity list: [varint count][per: i8, i16, varint, NBT].
+        /// The NBT root may be a single End byte (empty compound payload).
+        /// / RU: список block entities: [varint count][i8, i16, varint, NBT].
+        /// Корень NBT может быть одним байтом End.
+        let n = match r.count(tail.len()) {
+            Ok(v) => v,
+            Err(_) => return tail.to_vec(),
+        };
+        for _ in 0..n {
+            if r.i8().is_err() || r.i16().is_err() || r.varint().is_err() {
+                return tail.to_vec();
+            }
+            let before = r.position();
+            match horizon_world::nbt::read_network(&tail[before..], limits) {
+                Ok((_, used)) => {
+                    if r.bytes(used).is_err() {
+                        return tail.to_vec();
+                    }
+                }
+                Err(_) => return tail.to_vec(),
+            }
+        }
+        let light_start = r.position();
+        let light = &tail[light_start..];
+        // 4 bit sets: 767 [varint long count][longs] -> 777
+        /// [varint byte count][bytes]. BitSet.toByteArray is
+        /// little-endian longs with trailing zero bytes dropped.
+        /// / RU: 4 битовые маски: 767 [varint число longs][longs] ->
+        /// 777 [varint число байтов][байты]. toByteArray - little-endian
+        /// longs без хвостовых нулевых байтов.
+        let mut lr = crate::buf::Reader::new(light);
+        let mut masks: Vec<Vec<u8>> = Vec::with_capacity(4);
+        for _ in 0..4 {
+            let longs = match lr.varint() {
+                Ok(v) => v,
+                Err(_) => return tail.to_vec(),
+            };
+            let Ok(longs) = usize::try_from(longs) else {
+                return tail.to_vec();
+            };
+            let data = match lr.fixed_longs(longs) {
+                Ok(v) => v,
+                Err(_) => return tail.to_vec(),
+            };
+            let mut bytes = Vec::with_capacity(longs * 8);
+            for l in &data {
+                bytes.extend_from_slice(&l.to_le_bytes());
+            }
+            let len = bytes.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+            bytes.truncate(len);
+            masks.push(bytes);
+        }
+        // 2 layer lists ([varint n][byte_array(2048)]) share their shape
+        /// in both revisions; copy the rest verbatim.
+        /// / RU: 2 списка слоёв ([varint n][byte_array(2048)]) совпадают
+        /// по форме; остаток копируется дословно.
+        let layers_start = lr.position();
+        let mut out = Vec::with_capacity(tail.len());
+        out.extend_from_slice(&tail[..light_start]);
+        for m in &masks {
+            out.extend_from_slice(&varint_bytes(m.len() as u32));
+            out.extend_from_slice(m);
+        }
+        out.extend_from_slice(&light[layers_start..]);
+        out
+    }
     /// Rewrite the 767 section run into the 777 shape: per section the 767
     /// is [i16 nonEmpty][Paletted blocks][Paletted biomes] and the 777 adds
     /// an i16 fluids after the nonEmpty count. The whole run must parse;
@@ -899,19 +1013,30 @@ pub mod p767 {
     /// occupies; None when the run cannot parse.
     /// / RU: пропустить один контейнер 767 и вернуть его байтовый диапазон.
     fn copy_paletted_767(r: &mut crate::buf::Reader, entries: usize) -> Option<std::ops::Range<usize>> {
+        // Canonical 767 (vanilla 1.21.1) container, byte-exact-verified
+        /// against captured chunk bodies: [u8 bits][palette?][varint
+        /// long-count][longs]. A palette list is present for bits 0,
+        /// blocks 1..=8 and biomes 1..=3 (the 767 host packs "global"
+        /// containers with a palette up to width 8); the longs are
+        /// prefixed by their count as a varint (FriendlyByteBuf
+        /// writeLongArray) and packed at the wire width.
+        /// / RU: канонический контейнер 767 (vanilla 1.21.1), сверенный
+        /// байт-в-байт по захваченным телам: [u8 bits][палитра?][varint
+        /// число longs][longs]. Список палитры есть при bits 0, блоках
+        /// 1..=8 и биомах 1..=3 (хост 767 пакует "глобальные" контейнеры
+        /// с палитрой до ширины 8); longs идут с varint-счётчиком
+        /// (writeLongArray) и упакованы шириной провода.
         let start = r.position();
         let bits = r.u8().ok()?;
-        // getConfigurationForBitCount: 0 = single value; 1..=4 (blocks) /
-        /// 1..=3 (biomes) use a palette; beyond that the global palette.
-        let has_palette = match (entries, bits) {
-            (_, 0) => true,
-            (4096, 1..=4) => true,
-            (64, 1..=3) => true,
-            _ => false,
-        };
         if bits > 32 {
             return None;
         }
+        let has_palette = match (entries, bits) {
+            (_, 0) => true,
+            (4096, 1..=8) => true,
+            (64, 1..=3) => true,
+            _ => false,
+        };
         if has_palette {
             if bits == 0 {
                 r.varint().ok()?;
@@ -922,9 +1047,15 @@ pub mod p767 {
                 }
             }
         }
-        let per = if bits == 0 { 0 } else { 64 / bits as usize };
-        let longs = if bits == 0 { 0 } else { entries.div_ceil(per) };
-        r.fixed_longs(longs).ok()?;
+        let per = if bits == 0 { usize::MAX } else { 64 / bits as usize };
+        let expected = if bits == 0 { 0 } else { entries.div_ceil(per) };
+        // FriendlyByteBuf.writeLongArray: varint count then the longs.
+        let count = r.varint().ok()?;
+        let count = usize::try_from(count).ok()?;
+        if count != expected {
+            return None;
+        }
+        r.fixed_longs(count).ok()?;
         Some(start..r.position())
     }
 }

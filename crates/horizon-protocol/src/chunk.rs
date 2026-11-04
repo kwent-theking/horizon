@@ -105,7 +105,17 @@ impl Paletted {
             let n = r.count(1 << bits)?;
             (0..n).map(|_| r.varint()).collect::<Result<_>>()?
         };
-        let data = r.fixed_longs(storage_len(bits, strategy.entries()))?;
+        // FriendlyByteBuf-style long arrays: a varint count prefix
+        // (vanilla writeLongArray), then the packed longs.
+        // / RU: длинные массивы в стиле FriendlyByteBuf: счётчик как
+        // varint-префикс (vanilla writeLongArray), затем longs.
+        let count = r.varint()?;
+        let count = usize::try_from(count).map_err(|_| Error::new("long count negative"))?;
+        let expected = storage_len(bits, strategy.entries());
+        if count != expected {
+            return Err(Error::new(format!("{count} longs, {expected} expected")));
+        }
+        let data = r.fixed_longs(count)?;
         Ok(Self {
             bits,
             palette,
@@ -122,6 +132,9 @@ impl Paletted {
                 w.varint(p);
             }
         }
+        // The long count is a varint prefix (vanilla writeLongArray).
+        // / RU: счётчик longs - varint-префикс (vanilla writeLongArray).
+        w.varint(self.data.len() as i32);
         for &l in &self.data {
             w.i64(l);
         }
@@ -446,10 +459,15 @@ mod tests {
             let mut r = Reader::new(&data);
             assert!(Paletted::read(&mut r, Strategy::Blocks, 16).is_err());
         }
-        // 15- and 16-bit global palettes still read (1024 longs of zeroes).
+        // 15- and 16-bit global palettes still read (1024 longs of
+        // zeroes, now behind the varint long-count prefix).
+        // / RU: 15- и 16-битные глобальные палитры читаются (1024
+        // нулевых longs, теперь за varint-счётчиком).
         for (wire, global) in [(15u8, 15u8), (16, 16)] {
             let mut data = vec![wire];
-            data.resize(1 + 1024 * 8, 0);
+            // varint 1024 = 0x80 0x08
+            data.extend_from_slice(&[0x80, 0x08]);
+            data.resize(3 + 1024 * 8, 0);
             let mut r = Reader::new(&data);
             let p = Paletted::read(&mut r, Strategy::Blocks, global).unwrap();
             assert_eq!(p.bits, wire);
