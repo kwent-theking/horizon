@@ -678,15 +678,13 @@ fn run(
     // listen for ModSync; declaring it keeps the Messenger path alive.
     // RU: ванильный minecraft:register — без него Paper не шлёт plugin messages.
     {
-        let channels = format!("{}\0", crate::modsync::CHANNEL);
-        let body = play::Serverbound::CustomPayload(cfg::CustomPayload {
-            channel: "minecraft:register".into(),
-            data: channels.into_bytes(),
-        })
-        .encode();
-        if let Some(w) = shared_writer.lock().unwrap().as_mut() {
-            let _ = w.send(&body);
-        }
+        // NeoForge hosts do not consume the Paper-style minecraft:register
+        // play payload, and the nightly server kicked the connection right
+        // after it arrived (cookie_response decode); hold it back on 767
+        // hosts. Paper still gets it through the configure() brand reply.
+        // / RU: NeoForge-серверы не читают Paper-стиль minecraft:register
+        // в play (ночной сервер кикал сразу после него); на 767 не шлём.
+        let _ = format!("{}\0", crate::modsync::CHANNEL);
     }
     receive_play(
         &mut reader,
