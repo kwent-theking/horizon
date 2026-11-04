@@ -475,6 +475,14 @@ fn run(
         (host, port, c)
     };
     *shared_counters.lock().unwrap() = Some(c.reader.counters.clone());
+    // A fresh run starts from the login phase: any translation left over
+    // from a previous connection must stand down (its body rewriters would
+    // chew the login packets - e.g. the encryption request masquerading as
+    // a play add_entity on id 1).
+    // / RU: новый заход начинается с фазы логина: трансляция от прошлого
+    // соединения выключается (иначе её телесные трансформеры портят пакеты
+    // логина - encryption request на id 1 превращается в add_entity).
+    horizon_protocol::translation::deactivate();
     let e = |e: horizon_protocol::Error| e.to_string();
     c.send(
         &handshake::Serverbound::Intention(handshake::Intention {
@@ -524,7 +532,12 @@ fn run(
                 .map_err(e)?;
             break game;
         }
-        match login::Clientbound::decode(id, &payload).map_err(e)? {
+        let len = payload.len();
+        let decoded_login = login::Clientbound::decode(id, &payload).map_err(|err| {
+            let msg = format!("login packet {id} ({len} bytes): {err}");
+            e(horizon_protocol::Error::new(msg))
+        })?;
+        match decoded_login {
             login::Clientbound::Compression(p) => c.set_compression(p.threshold),
             login::Clientbound::LoginFinished(p) => {
                 c.send(&login::Serverbound::LoginAcknowledged(Empty).encode())
