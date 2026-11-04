@@ -678,13 +678,27 @@ fn run(
     // listen for ModSync; declaring it keeps the Messenger path alive.
     // RU: ванильный minecraft:register — без него Paper не шлёт plugin messages.
     {
-        // NeoForge hosts do not consume the Paper-style minecraft:register
-        // play payload, and the nightly server kicked the connection right
-        // after it arrived (cookie_response decode); hold it back on 767
-        // hosts. Paper still gets it through the configure() brand reply.
-        // / RU: NeoForge-серверы не читают Paper-стиль minecraft:register
-        // в play (ночной сервер кикал сразу после него); на 767 не шлём.
-        let _ = format!("{}\0", crate::modsync::CHANNEL);
+        // The play-state channel registration starts the server's chunk
+        // streaming on 767 hosts (empirically: without it no batch starts).
+        // / RU: play-регистрация каналов запускает стриминг чанков на 767
+        // (эмпирически: без неё пакетные пачки не начинаются).
+        let channels = format!("{}\0", crate::modsync::CHANNEL);
+        let body = play::Serverbound::CustomPayload(cfg::CustomPayload {
+            channel: "minecraft:register".into(),
+            data: channels.into_bytes(),
+        })
+        .encode();
+        // A short delay: the server may still be switching its decoder from
+        // the configuration protocol when the finish reply lands; a packet
+        // sent too early decodes against the configuration id table (the
+        // nightly host read it as cookie_response).
+        // / RU: короткая пауза: сервер может ещё переключать декодер с
+        // протокола конфигурации; слишком ранний пакет читается по таблице
+        // конфигурации (ночной хост видел в нём cookie_response).
+        std::thread::sleep(std::time::Duration::from_millis(2500));
+        if let Some(w) = shared_writer.lock().unwrap().as_mut() {
+            let _ = w.send(&body);
+        }
     }
     receive_play(
         &mut reader,
