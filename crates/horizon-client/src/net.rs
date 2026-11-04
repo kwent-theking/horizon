@@ -677,29 +677,7 @@ fn run(
     // servers (Paper) deliver their server->client plugin messages. We
     // listen for ModSync; declaring it keeps the Messenger path alive.
     // RU: ванильный minecraft:register — без него Paper не шлёт plugin messages.
-    {
-        // The play-state channel registration starts the server's chunk
-        // streaming on 767 hosts (empirically: without it no batch starts).
-        // / RU: play-регистрация каналов запускает стриминг чанков на 767
-        // (эмпирически: без неё пакетные пачки не начинаются).
-        let channels = format!("{}\0", crate::modsync::CHANNEL);
-        let body = play::Serverbound::CustomPayload(cfg::CustomPayload {
-            channel: "minecraft:register".into(),
-            data: channels.into_bytes(),
-        })
-        .encode();
-        // A short delay: the server may still be switching its decoder from
-        // the configuration protocol when the finish reply lands; a packet
-        // sent too early decodes against the configuration id table (the
-        // nightly host read it as cookie_response).
-        // / RU: короткая пауза: сервер может ещё переключать декодер с
-        // протокола конфигурации; слишком ранний пакет читается по таблице
-        // конфигурации (ночной хост видел в нём cookie_response).
-        std::thread::sleep(std::time::Duration::from_millis(2500));
-        if let Some(w) = shared_writer.lock().unwrap().as_mut() {
-            let _ = w.send(&body);
-        }
-    }
+
     receive_play(
         &mut reader,
         shared_writer,
@@ -722,6 +700,7 @@ fn receive_play(
     resources: &Path,
     probed_protocol: Option<i32>,
 ) -> Result<String, String> {
+    let mut register_sent = false;
     loop {
         let (id, payload) = reader.recv().map_err(|e| e.to_string())?;
         // The id is already native: the ingress gateway in ConnReader.recv
@@ -738,6 +717,9 @@ fn receive_play(
                 )
                 .unwrap_or("?");
                 let _ = send.send(Event::DecodeError(format!("{name}: {err}")));
+                if name == "level_chunk_with_light" {
+                    log::warn!("ViaHorizonPlus: chunk body transform failed: {err}");
+                }
                 continue;
             }
         };
@@ -746,6 +728,26 @@ fn receive_play(
                 let _ = w.send(&p.encode());
             }
         };
+        // The first decoded play packet proves the server has switched its
+        /// decoder to the play table: only now is it safe to send the
+        /// channel registration (earlier it decoded as a configuration
+        /// cookie_response and dropped the connection).
+        /// / RU: первый декодированный play-пакет доказывает, что сервер
+        /// переключил декодер на play-таблицу: только теперь безопасна
+        /// регистрация каналов (раньше она читалась как cookie_response
+        /// конфигурации и рвала соединение).
+        if !register_sent {
+            register_sent = true;
+            let channels = format!("{}\0", crate::modsync::CHANNEL);
+            let body = play::Serverbound::CustomPayload(cfg::CustomPayload {
+                channel: "minecraft:register".into(),
+                data: channels.into_bytes(),
+            })
+            .encode();
+            if let Some(w) = shared_writer.lock().unwrap().as_mut() {
+                let _ = w.send(&body);
+            }
+        }
         match packet {
             play::Clientbound::KeepAlive(k) => reply(play::Serverbound::KeepAlive(k)),
             // The chunk streaming feedback loop: after every finished batch
