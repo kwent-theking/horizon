@@ -83,17 +83,27 @@ impl ChunkFormat {
             let words = s.states.data.iter().map(|&w| w as u64).collect();
             let mut blocks = PalettedContainer::from_wire(strategy, s.states.bits, palette, words)
                 .map_err(|e| e.to_string())?;
-            if strategy.global_bits != ours.global_bits {
+            {
+                // Palette entries carry the 767 host's registry ids; ours
+                /// has fewer states, so any id past our table (mods we
+                /// lack) becomes air - same rule the global widening
+                /// applies, now also for palette-backed sections.
+                /// / RU: записи палитры несут id реестра хоста 767; наш
+                /// таблица меньше, поэтому любой id за её пределами
+                /// (моды, которых у нас нет) становится воздухом - то же
+                /// правило, что и при расширении глобальных секций.
                 let mut values = [0u32; 4096];
                 blocks.unpack(&mut values);
-                // Ids past our registry (a host with mods we lack) read as air.
                 let limit = 1u64 << ours.global_bits;
-                for v in &mut values {
-                    if u64::from(*v) >= limit {
-                        *v = 0;
+                let changed = values.iter().any(|&v| u64::from(v) >= limit);
+                if changed || strategy.global_bits != ours.global_bits {
+                    for v in &mut values {
+                        if u64::from(*v) >= limit {
+                            *v = 0;
+                        }
                     }
+                    blocks = PalettedContainer::from_values(ours, &values);
                 }
-                blocks = PalettedContainer::from_values(ours, &values);
             }
             let mut section = Section {
                 blocks,
