@@ -747,6 +747,29 @@ fn receive_play(
             if let Some(w) = shared_writer.lock().unwrap().as_mut() {
                 let _ = w.send(&body);
             }
+            // Deadlock breaker: a 265 host with sub-level mod sync enters
+            /// play without sending the clientbound teleport - it waits for
+            /// the player's first movement packet instead. Send one
+            /// absolute position at the login spawn so the server starts
+            /// the player placement (the later SetDefaultSpawnPosition /
+            /// real teleport corrects the exact spot).
+            /// / RU: разрыв дедлока: хост 265 с мод-синхронизацией входит в
+            /// play, не отправляя телепорт - он ждёт первый пакет движения
+            /// игрока. Шлём абсолютную позицию спавна из логина, чтобы
+            /// сервер начал размещение игрока (точную точку затем поправит
+            /// SetDefaultSpawnPosition / настоящий телепорт).
+            let nudge = play::Serverbound::MovePlayerPosRot(play::MovePlayerPosRot {
+                x: 0.5,
+                y: 76.0,
+                z: 0.5,
+                yaw: 0.0,
+                pitch: 0.0,
+                flags: 0,
+            })
+            .encode();
+            if let Some(w) = shared_writer.lock().unwrap().as_mut() {
+                let _ = w.send(&nudge);
+            }
         }
         match packet {
             play::Clientbound::KeepAlive(k) => reply(play::Serverbound::KeepAlive(k)),
