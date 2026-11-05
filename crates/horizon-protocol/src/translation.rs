@@ -174,8 +174,13 @@ pub mod p767 {
             27 => Some(22),
             28 => Some(24),
             29 => Some(24),
-            30 => Some(25),
-            31 => Some(26),
+            30 => Some(26),
+            31 => Some(27),
+            // BUNDLE_ITEM_SELECTED has no 767 counterpart on this host;
+            // dropping it keeps the decoder from misreading the slot.
+            /// / RU: у BUNDLE_ITEM_SELECTED нет пары на этом хосте 767;
+            /// дроп, чтобы декодер сервера не читал чужой слот.
+            3 => None,
             32 => Some(27),
             33 => Some(28),
             34 => Some(29),
@@ -242,7 +247,7 @@ pub mod p767 {
             28 => 31,
             29 => 32,
             30 => 33,
-            31 => 34,
+            31 => 35,
             32 => 36,
             33 => 38,
             34 => 39,
@@ -274,6 +279,7 @@ pub mod p767 {
             61 => 71,
             62 => 72,
             63 => 73,
+            64 => 73,
             65 => 78,
             66 => 79,
             67 => 80,
