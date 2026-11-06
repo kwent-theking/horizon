@@ -362,6 +362,29 @@ pub mod p767 {
             /// (varint kind, long array) pairs.
             /// / RU: у 767 heightmaps - один NBT-compound из long-массивов;
             /// 777 шлёт список пар (varint-тип, long-массив).
+            // PLAYER_POSITION: the 767 body is [x,y,z][yaw,pitch]
+            /// [u8 flags][varint id]; the 777 shape is [varint id][pos]
+            /// [delta][yaw,pitch][i32 flags]. Reorder into the native
+            /// shape with a zero delta and the wire byte flags widened
+            /// to i32.
+            /// / RU: PLAYER_POSITION: тело 767 - [x,y,z][yaw,pitch]
+            /// [u8 флаги][varint id]; формат 777 - [varint id][позиция]
+            /// [дельта][yaw,pitch][i32 флаги]. Перестановка в нативный
+            /// формат с нулевой дельтой и флагами, расширенными до i32.
+            crate::ids::play::clientbound::PLAYER_POSITION => {
+                if body.len() == 34 {
+                    let mut out = Vec::with_capacity(46);
+                    // varint id (last byte of the 767 body)
+                    out.push(body[33]);
+                    out.extend_from_slice(&body[..24]); // x,y,z
+                    out.extend_from_slice(&[0u8; 24]); // zero delta
+                    out.extend_from_slice(&body[24..32]); // yaw,pitch
+                    out.extend_from_slice(&[0, 0, 0, body[32]]); // flags i32
+                    Some(out)
+                } else {
+                    Some(body.to_vec())
+                }
+            }
             crate::ids::play::clientbound::LEVEL_CHUNK_WITH_LIGHT => {
                 // Debug capture: full 767 chunk bodies for offline analysis.
                 /// / RU: отладочный захват полных тел чанков 767.
