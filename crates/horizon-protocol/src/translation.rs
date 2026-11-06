@@ -62,12 +62,41 @@ pub fn is_active() -> bool {
 /// / RU: переписать исходящее тело пакета. None = дроп. Идемпотентно:
 /// пакет с уже проводным id проходит без изменений - фазы без трансляции
 /// не задваиваются.
+
+/// Length in bytes of the varint at the start of `b`.
+/// / RU: длина varint в начале среза `b`.
+fn varint_len_at(b: &[u8]) -> usize {
+    for (i, &x) in b.iter().enumerate().take(5) {
+        if x & 0x80 == 0 {
+            return i + 1;
+        }
+    }
+    5
+}
+
 pub fn egress(body: &[u8]) -> Option<Vec<u8>> {
     let Some(tr) = ACTIVE.read().unwrap().clone() else {
         return Some(body.to_vec());
     };
     let (id, k) = read_varint(body)?;
     let wire = (tr.egress)(id)?;
+    // ACCEPT_TELEPORTATION: the 777 body carries [varint id][pos][rot]
+    /// for resync; the 767 confirm is [varint id] alone. Trim the tail
+    /// or the host kicks with "32 bytes extra" and never streams chunks.
+    /// / RU: ACCEPT_TELEPORTATION: тело 777 несёт [varint id][позиция]
+    /// [углы]; подтверждение 767 - только [varint id]. Обрезаем хвост,
+    /// иначе хост кикает с "32 bytes extra" и не стримит чанки.
+    if id == crate::ids::play::serverbound::ACCEPT_TELEPORTATION {
+        // Keep only the varint teleport id: the 767 confirm body is the
+        /// id alone. Copy the full varint length from the 777 body.
+        /// / RU: оставляем только varint id телепорта: тело подтверждения
+        /// 767 - один id. Копируем полную длину varint из тела 777.
+        let mut out = Vec::with_capacity(k + 6);
+        write_varint(&mut out, wire);
+        let idk = varint_len_at(&body[k..]);
+        out.extend_from_slice(&body[k..k + idk]);
+        return Some(out);
+    }
     if wire == id && k == varint_len(wire) {
         return Some(body.to_vec());
     }
@@ -181,8 +210,16 @@ pub mod p767 {
             /// / RU: у BUNDLE_ITEM_SELECTED нет пары на этом хосте 767;
             /// дроп, чтобы декодер сервера не читал чужой слот.
             3 => None,
-            32 => Some(27),
-            33 => Some(28),
+            // MOVE_PLAYER_ROT: +4 zone shift like the other move
+            // packets; 27 is pos_rot's slot and decodes as a truncated
+            // rot packet.
+            /// / RU: MOVE_PLAYER_ROT: тот же сдвиг зоны +4, что и у
+            /// остальных move-пакетов; 27 - слот pos_rot, декод
+            /// обрывается как неполный rot.
+            32 => Some(28),
+            // MOVE_PLAYER_STATUS_ONLY: +4 shift; 28 is rot's slot now.
+            /// / RU: MOVE_PLAYER_STATUS_ONLY: сдвиг +4; 28 теперь слот rot.
+            33 => Some(29),
             34 => Some(29),
             35 => Some(30),
             39 => Some(32),
@@ -198,7 +235,13 @@ pub mod p767 {
             51 => Some(42),
             52 => Some(43),
             53 => Some(44),
-            54 => Some(45),
+            // SET_CARRIED_ITEM: mod inserts shift this zone by +4, the
+            // same delta as the move packets above; 45 lands in
+            // select_trade's slot and kicks.
+            /// / RU: SET_CARRIED_ITEM: вставки модов сдвигают зону на +4,
+            /// как у move-пакетов выше; 45 попадает в слот select_trade
+            /// и роняет соединение.
+            54 => Some(44),
             55 => Some(46),
             56 => Some(47),
             57 => Some(48),
