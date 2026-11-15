@@ -20,7 +20,10 @@ use horizon_world::{
     registry::{BlockRegistry, BlockStateId},
     worldgen::tags::TagDefinitions,
 };
-use std::{collections::BTreeMap, path::Path};
+use std::{
+    collections::{BTreeMap, HashSet},
+    path::Path,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Animate {
@@ -321,6 +324,17 @@ pub struct AnimateTables {
 }
 impl AnimateTables {
     pub fn load(root: &Path, registry: &BlockRegistry, biomes: &Biomes) -> crate::Result<Self> {
+        let behaviour =
+            serde_json::from_slice(&std::fs::read(root.join("block-behaviours.json"))?)?;
+        Self::load_with_behaviour_json(root, registry, biomes, &behaviour)
+    }
+    /// Reuse the behaviour document already read for block facts and server tables.
+    pub fn load_with_behaviour_json(
+        root: &Path,
+        registry: &BlockRegistry,
+        biomes: &Biomes,
+        behaviour: &serde_json::Value,
+    ) -> crate::Result<Self> {
         let kinds = (0..registry.len() as u32)
             .map(|id| {
                 registry.state(BlockStateId(id)).map_or(Animate::None, |s| {
@@ -337,17 +351,21 @@ impl AnimateTables {
         let built =
             definitions.build(|name, _| registry.default_state(name).map(|_| name.to_owned()))?;
         let by_state = |tag: &str| -> Vec<bool> {
-            let names = built.tags.get(tag);
+            let names: HashSet<&str> = built
+                .tags
+                .get(tag)
+                .into_iter()
+                .flatten()
+                .map(String::as_str)
+                .collect();
             (0..registry.len() as u32)
                 .map(|id| {
                     registry
                         .state(BlockStateId(id))
-                        .is_some_and(|s| names.is_some_and(|n| n.contains(&s.name)))
+                        .is_some_and(|s| names.contains(s.name.as_str()))
                 })
                 .collect()
         };
-        let behaviour: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(root.join("block-behaviours.json"))?)?;
         let ignite_odds = behaviour["fire"]["igniteOdds"].as_object();
         let burnable = (0..registry.len() as u32)
             .map(|id| {

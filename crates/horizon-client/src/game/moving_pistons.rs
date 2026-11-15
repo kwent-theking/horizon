@@ -121,6 +121,17 @@ impl Game<'_> {
         at: glam::DVec3,
         out: &mut Vec<Vertex>,
     ) {
+        self.spun_block_vertices(state, seed, at, glam::Quat::IDENTITY, out);
+    }
+    /// `moving_block_vertices` with the block turned by `spin` about its centre.
+    pub(super) fn spun_block_vertices(
+        &self,
+        state: BlockStateId,
+        seed: horizon_core::position::BlockPos,
+        at: glam::DVec3,
+        spin: glam::Quat,
+        out: &mut Vec<Vertex>,
+    ) {
         let chunks = &self.world.chunks;
         let (cx, cz) = (seed.x >> 4, seed.z >> 4);
         let region: [[Option<&horizon_client::chunk::Chunk>; 3]; 3] = std::array::from_fn(|dz| {
@@ -139,7 +150,7 @@ impl Game<'_> {
             self.streaming.biome_blend,
         );
         let tables = &self.pack.context.tables;
-        let light = |quad: &horizon_assets::bake::ModelQuad| {
+        let light = |quad: &horizon_client::models::catalog::BakedQuad| {
             let coords = tables.flat_light(state, [seed.x, seed.y, seed.z], quad, |p| {
                 self.world.light(p[0], p[1], p[2])
             });
@@ -149,7 +160,9 @@ impl Game<'_> {
         self.tinted_block_model_vertices(
             state,
             horizon_core::random::position_seed(seed),
-            glam::Mat4::from_translation(at.as_vec3()),
+            glam::Mat4::from_translation(at.as_vec3() + glam::Vec3::splat(0.5))
+                * glam::Mat4::from_quat(spin)
+                * glam::Mat4::from_translation(glam::Vec3::splat(-0.5)),
             light,
             false,
             tint,

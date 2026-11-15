@@ -11,6 +11,7 @@ use horizon_core::geometry::{Direction, ShapeOp, VoxelShape};
 use std::{
     collections::{BTreeMap, HashMap},
     io,
+    sync::Arc,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,8 +42,8 @@ struct State {
 /// is deduplicated by the imported immutable shape, not copied for every state.
 #[derive(Clone)]
 pub struct FaceVisibility {
-    states: Vec<State>,
-    faces: Vec<VoxelShape>,
+    states: Arc<[State]>,
+    faces: Arc<[VoxelShape]>,
     cache: HashMap<(u32, u32), bool>,
 }
 impl FaceVisibility {
@@ -127,8 +128,8 @@ impl FaceVisibility {
             });
         }
         Ok(Self {
-            states,
-            faces,
+            states: states.into(),
+            faces: faces.into(),
             cache: HashMap::new(),
         })
     }
@@ -212,5 +213,24 @@ impl FaceVisibility {
         }
         self.cache.insert(key, visible);
         Ok(visible)
+    }
+}
+
+#[cfg(test)]
+mod sharing_tests {
+    use super::*;
+
+    #[test]
+    fn clones_share_geometry_but_keep_independent_pair_caches() {
+        let a = FaceVisibility {
+            states: Vec::new().into(),
+            faces: vec![VoxelShape::empty(), VoxelShape::block()].into(),
+            cache: HashMap::from([((0, 1), false)]),
+        };
+        let mut b = a.clone();
+        assert!(Arc::ptr_eq(&a.states, &b.states));
+        assert!(Arc::ptr_eq(&a.faces, &b.faces));
+        b.cache.insert((1, 0), true);
+        assert!(!a.cache.contains_key(&(1, 0)));
     }
 }

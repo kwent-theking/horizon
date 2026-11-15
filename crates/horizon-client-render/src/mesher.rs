@@ -349,6 +349,10 @@ pub struct MeshTables {
     lava_still: u16,
     lava_flow: u16,
 }
+/// Create's shaft and small cogwheel: drawn turning by the game, not meshed.
+pub fn is_kinetic_part(name: &str) -> bool {
+    matches!(name, "create:shaft" | "create:cogwheel")
+}
 fn stem_color(age: u8) -> u32 {
     let a = u32::from(age);
     (a * 32) << 16 | (255 - a * 8) << 8 | (a * 4)
@@ -476,7 +480,7 @@ impl MeshTables {
                 tier: hdr_tier(name, s.emission),
                 emissive,
                 fluid: FluidState::from_block(state)?,
-                model: s.render_shape == RenderShape::Model,
+                model: s.render_shape == RenderShape::Model && !is_kinetic_part(&s.name),
                 block_entity: s.block_entity,
                 tints,
                 tint_count,
@@ -593,7 +597,7 @@ impl MeshTables {
         &self,
         state: BlockStateId,
         pos: [i32; 3],
-        quad: &horizon_assets::bake::ModelQuad,
+        quad: &crate::models::catalog::BakedQuad,
         light: impl Fn([i32; 3]) -> u8,
     ) -> u32 {
         let own = self.info.get(state.0 as usize);

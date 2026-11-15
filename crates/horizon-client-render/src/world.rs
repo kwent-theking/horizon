@@ -97,6 +97,9 @@ pub struct World {
     /// The moving-piston block entities of the level, by position, copied
     /// from the block ticks after each tick: collision and rendering read them.
     pub moving_pistons: Vec<([i32; 3], horizon_world::piston_shape::MovingPistonState)>,
+    /// Create's shafts and small cogwheels by position, with the `Speed` (rpm)
+    /// of their block entity: drawn turning, not in the chunk mesh.
+    pub kinetic_speeds: std::collections::HashMap<(i32, i32, i32), f32>,
 }
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Weather {
@@ -189,6 +192,7 @@ impl World {
             light_log: None,
             moving_piston_fallback: Vec::new(),
             moving_pistons: Vec::new(),
+            kinetic_speeds: Default::default(),
             pois: Default::default(),
         }
     }

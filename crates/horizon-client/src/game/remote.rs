@@ -100,6 +100,21 @@ fn place_interpolated(m: &mut Mob, at: PosRot) {
     m.head_pitch = (at.pitch % 360.0).clamp(-90.0, 90.0);
 }
 
+#[derive(Clone)]
+struct MobInterpolationInput {
+    id: i32,
+    index: usize,
+    stepped: Option<SteppedInterpolation>,
+    at: Option<PosRot>,
+}
+
+fn interpolate_mob(input: &mut MobInterpolationInput) {
+    input.at = input
+        .stepped
+        .as_mut()
+        .and_then(SteppedInterpolation::interpolate);
+}
+
 /// What the network thread delivered, in order: an event, or a chunk packet
 /// handed to the decoder (with the format it decodes with), whose column
 /// comes back from `ChunkDecoder::next`.
@@ -110,6 +125,9 @@ enum Received {
 
 pub(super) struct Remote {
     pub session: Session,
+    /// The server's block state ids to ours (`server_states`): a modded
+    /// 767 host's table, else empty (same numbering).
+    pub(super) block_map: &'static [u32],
     pub brand: String,
     /// The server announced it runs mods' quiet commands.
     pub quiet_commands: bool,
@@ -133,6 +151,9 @@ pub(super) struct Remote {
     pub(super) chunk_format: Arc<ChunkFormat>,
     /// Decodes chunk packets as they arrive, off the frame.
     decoder: ChunkDecoder,
+    /// Sable sub-levels (moving chunk groups): poses, chunks, routing.
+    /// RU: суб-уровни Sable (движущиеся группы чанков).
+    pub(super) sublevels: horizon_client::sublevel::SubLevelManager,
     /// Options.serverRenderDistance: the server's view distance from the
     /// login or the last chunk-cache-radius packet.
     pub(super) view_distance: i32,
@@ -268,6 +289,53 @@ const BACKLOG_LIMIT: Duration = Duration::from_millis(50);
 /// The open menu name of a server's horse inventory, then its chest's
 /// columns (the packet names no `MenuType`).
 const MOUNT_MENU: &str = "horizon:mount";
+/// The open menu name of a menu type Horizon has no screen for (a modded
+/// machine, backpack or storage), then its own slot count: a chest-like grid.
+const GENERIC_MENU: &str = "horizon:generic_";
+
+/// The open menu name of a generic menu with `slots` slots of its own.
+fn generic_menu_name(slots: usize) -> String {
+    format!("{GENERIC_MENU}{slots}")
+}
+
+/// The open menu name of a generic menu whose layout is not known: all
+/// `slots` slots are its own, and none maps to the player's inventory.
+const GENERIC_ALL_MENU: &str = "horizon:genericall_";
+
+/// The largest own slot count taken as a standard chest-like "own + 36
+/// player slots" layout (`generic_9x6`).
+const STANDARD_GENERIC_OWN_MAX: usize = 54;
+/// The player slots that end a standard menu.
+const PLAYER_MENU_SLOTS: usize = 36;
+
+/// The open menu name for a generic menu whose ContainerSetContent holds
+/// `total` slots. Only a chest-like count (own slots a multiple of 9 up to 54,
+/// then 36) is taken to end with the player's inventory; any other count could
+/// have extra slots after it or none, so all of it stays the menu's own and
+/// nothing is written into the real inventory.
+fn generic_menu_layout_name(total: usize) -> String {
+    let own = total.saturating_sub(PLAYER_MENU_SLOTS);
+    let standard =
+        total >= PLAYER_MENU_SLOTS + 9 && own % 9 == 0 && own <= STANDARD_GENERIC_OWN_MAX;
+    if standard {
+        generic_menu_name(own)
+    } else {
+        format!("{GENERIC_ALL_MENU}{total}")
+    }
+}
+
+/// The own slot count of a generic menu's name.
+fn generic_menu_slots(menu: &str) -> Option<usize> {
+    menu.strip_prefix(GENERIC_MENU)
+        .or_else(|| menu.strip_prefix(GENERIC_ALL_MENU))?
+        .parse()
+        .ok()
+}
+
+/// The 9-wide rows that show `slots` slots.
+fn generic_menu_rows(slots: usize) -> usize {
+    slots.div_ceil(9)
+}
 
 fn face_direction(face: [i32; 3]) -> u8 {
     match face {
@@ -289,6 +357,17 @@ fn number_format(f: &play::NumberFormat) -> horizon_client::scoreboard::NumberFo
         play::NumberFormat::Styled(t) => NumberFormat::Styled(tag_to_json(t)),
         play::NumberFormat::Fixed(t) => NumberFormat::Fixed(tag_to_json(t)),
     }
+}
+
+/// `ReceivingLevelScreen.tick` / `Minecraft.setScreen(null)`: while the
+/// terrain has not come, a player known dead (health 0 from `SetHealth`) gets
+/// the death screen instead of waiting for chunks the server never sends.
+fn terrain_wait_opens_death_screen(
+    health: f32,
+    show_death_screen: bool,
+    on_death_screen: bool,
+) -> bool {
+    health <= 0.0 && show_death_screen && !on_death_screen
 }
 
 impl Game<'_> {
@@ -492,8 +571,11 @@ impl Game<'_> {
                 &DimensionType::vanilla("minecraft:overworld"),
                 Vec::new(),
                 7,
+                &[],
             )),
+            block_map: &[],
             decoder: ChunkDecoder::new(),
+            sublevels: horizon_client::sublevel::SubLevelManager::new(),
             view_distance: self.settings.render_distance,
             sequence: 0,
             position_sender: Default::default(),
@@ -950,6 +1032,7 @@ impl Game<'_> {
         if loaded && self.remote.as_ref().is_some_and(|r| !r.loaded_sent) {
             self.send(S::PlayerLoaded(Empty));
             self.remote.as_mut().unwrap().loaded_sent = true;
+            super::log_memory("joined world: terrain ready (stationary client)");
         }
         Ok(())
     }
@@ -1027,6 +1110,7 @@ impl Game<'_> {
                     uuid,
                 } => {
                     self.set_registries(registries);
+                    horizon_client::player_anim::reset();
                     self.extras_joined();
                     // handleLogin: the level loading screen replaces any dialog.
                     self.close_dialogs();
@@ -1058,7 +1142,29 @@ impl Game<'_> {
                         remote.modsync_blocks = count;
                     }
                 }
+                // Sable snapshot: update sub-level poses.
+                // RU: снапшот Sable — обновить позы суб-уровней.
+                Event::SableSnapshot(snap) => {
+                    if let Some(remote) = &mut self.remote {
+                        remote.sublevels.apply_snapshot(&snap);
+                    }
+                }
+                Event::PlayerAnim(event) => {
+                    if let Some(r) = &self.remote {
+                        let local = horizon_client::player_anim::LocalPlayer {
+                            entity_id: r.entity_id,
+                            uuid: r.profile,
+                        };
+                        let lookup = |uuid: u128| {
+                            r.level_players
+                                .iter()
+                                .find_map(|(id, u)| (*u == uuid).then_some(*id))
+                        };
+                        horizon_client::player_anim::dispatch(event, local, &lookup);
+                    }
+                }
                 Event::Reconfigured(registries) => {
+                    horizon_client::player_anim::reset();
                     // handleConfigurationStart → clearClientLevel, and the next
                     // ClientPacketListener starts with no players or scoreboard.
                     self.hud_disconnected();
@@ -1195,6 +1301,15 @@ impl Game<'_> {
         }
     }
     fn set_registries(&mut self, registries: Arc<Dynamic>) {
+        // DEBUG: dump the server's block registry for state-id mapping.
+        if let Some(blocks) = registries.registries.get("minecraft:block") {
+            let path = std::path::Path::new("server_block_registry.json");
+            let names: Vec<String> = blocks.iter().map(|(n, _)| n.clone()).collect();
+            if let Ok(json) = serde_json::to_string(&names) {
+                let _ = std::fs::write(path, json);
+                log::info!("server block registry dumped: {} blocks", names.len());
+            }
+        }
         let biomes: Vec<u16> = registries
             .registries
             .get("minecraft:worldgen/biome")
@@ -1204,9 +1319,22 @@ impl Game<'_> {
                     .collect()
             })
             .unwrap_or_default();
+        let registry = self.pack.assets.registry;
         if let Some(r) = self.remote.as_mut() {
+            let modded_767 =
+                r.session.probed.lock().unwrap().as_ref().map(|&(p, _)| p) == Some(767);
+            r.block_map = if modded_767 {
+                super::server_states::block_map(registry)
+            } else {
+                &[]
+            };
+            if modded_767 {
+                if let Some(builtin) = super::server_states::builtin(&r.builtin) {
+                    r.builtin = Arc::new(builtin);
+                }
+            }
             let bits = ceil_log2(biomes.len());
-            r.chunk_format = Arc::new(ChunkFormat::new(&r.dimension, biomes, bits));
+            r.chunk_format = Arc::new(ChunkFormat::new(&r.dimension, biomes, bits, r.block_map));
             r.registries = registries;
         }
     }
@@ -1298,6 +1426,11 @@ impl Game<'_> {
     /// view centre, `calculateStorageRange` (the server's radius, at least
     /// two, plus three) chunks each way.
     pub(super) fn remote_chunk_in_range(&self, x: i32, z: i32) -> bool {
+        // Sable plot-parking chunks are always in range (forced).
+        // RU: чанки плот-парковки Sable всегда в диапазоне (forced).
+        if horizon_client::sable::is_plot_chunk(x, z) {
+            return true;
+        }
         self.remote.as_ref().is_none_or(|r| {
             let range = r.view_distance.max(2) + 3;
             (x - r.chunk_center.0).abs() <= range && (z - r.chunk_center.1).abs() <= range
@@ -1327,6 +1460,9 @@ impl Game<'_> {
         self.world
             .block_entities
             .retain(|k, _| !gone.contains(&(k.0 >> 4, k.2 >> 4)));
+        self.world
+            .kinetic_speeds
+            .retain(|k, _| !gone.contains(&(k.0 >> 4, k.2 >> 4)));
     }
     /// `handleBlockEntityData`: the block entity at `pos`, when it is of the
     /// packet's type, loads the tag (`loadWithComponents`); an empty tag
@@ -1355,6 +1491,10 @@ impl Game<'_> {
                 let state = self.world.block(pos[0], pos[1], pos[2]);
                 let _ = self.world.set(pos[0], pos[1], pos[2], state);
             }
+            return;
+        }
+        if name == super::kinetics::KINETIC_BLOCK_ENTITY {
+            self.store_kinetic_speed(key, tag);
             return;
         }
         let Some(entity) = self.world.block_entities.get(&key) else {
@@ -1461,6 +1601,7 @@ impl Game<'_> {
     /// Keep the renderable block entities (chests, furnaces) in step with blocks.
     pub(super) fn sync_block_entity(&mut self, pos: (i32, i32, i32), state: BlockStateId) {
         let name = self.res.facts().get(state).name.clone();
+        self.sync_kinetic_part(pos, &name);
         match BlockEntity::for_block(&name) {
             Some(entity) => {
                 let same = self
@@ -1481,6 +1622,10 @@ impl Game<'_> {
     /// predicted state until the server acknowledges the action; the server's state is
     /// remembered for then.
     fn server_block(&mut self, pos: [i32; 3], state: i32) {
+        let state = match self.remote.as_ref().map(|r| r.block_map) {
+            Some(map) if !map.is_empty() => map.get(state as usize).copied().unwrap_or(0) as i32,
+            _ => state,
+        };
         if let Some((_, known)) = self
             .remote
             .as_mut()
@@ -1549,6 +1694,34 @@ impl Game<'_> {
             }
         }
     }
+    /// Whether the mob at `index` may be attacked or interacted with: a modded
+    /// type whose name says it is no living mob (an item, a seat) never is, as
+    /// the server rejects such an attack (`invalid_entity_attacked`).
+    fn remote_mob_is_living(&self, index: usize) -> bool {
+        let id = self.mobs[index].id as i32;
+        !self
+            .remote
+            .as_ref()
+            .and_then(|r| r.entities.get(&id))
+            .is_some_and(|t| non_living_name(&t.kind))
+    }
+    /// A vanilla mob's type standing in for a modded entity type with no model
+    /// at all (see `stand_in_mob`); logged once per type.
+    fn stand_in_mob_type(&self, kind: &str) -> Option<Arc<MobType>> {
+        if kind.starts_with("minecraft:") {
+            return None;
+        }
+        let stand_in = stand_in_mob(kind)?;
+        let t = self.res.mob_types().get(stand_in).cloned()?;
+        static LOGGED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        if let Ok(mut logged) = LOGGED.lock()
+            && !logged.iter().any(|k| k == kind)
+        {
+            log::info!("Horizon: entity type {kind} has no model, drawn as {stand_in}");
+            logged.push(kind.to_owned());
+        }
+        Some(t)
+    }
     /// `recreateFromPacket`: yRot and xRot from the packet, the body and head
     /// both at its head yaw (LivingEntity).
     fn spawn_entity(&mut self, id: i32, kind: &str, position: [f64; 3], rotation: [f32; 3]) {
@@ -1557,8 +1730,16 @@ impl Game<'_> {
         let mob_type = if kind == "minecraft:player" {
             self.remote.as_ref().and_then(|r| r.player_type.clone())
         } else {
-            self.res.mob_types().get(kind).cloned()
+            self.res.mob_types().get(kind).cloned().or_else(|| {
+                // A mod's Java-modelled mob from the modded client's model dump (renderer
+                // exact), else a ported mod's GeckoLib mob; both on a vanilla type's physics.
+                let template = self.res.mob_types().get("minecraft:pig")?;
+                horizon_client::mobs::modded::mob_type(template, kind)
+                    .or_else(|| horizon_client::mobs::gecko::mob_type(template, kind))
+                    .map(Arc::new)
+            })
         };
+        let mob_type = mob_type.or_else(|| self.stand_in_mob_type(kind));
         if kind == "minecraft:ender_dragon" {
             self.spawn_remote_dragon(id, position, yaw);
         }
@@ -1858,6 +2039,8 @@ impl Game<'_> {
             // HopperMenu; DispenserMenu (dispensers and droppers).
             "minecraft:hopper" => slots(5),
             "minecraft:generic_3x3" => slots(9),
+            m if m.starts_with(GENERIC_ALL_MENU) => (s < generic_menu_slots(m)?).then_some(300 + s),
+            m if m.starts_with(GENERIC_MENU) => slots(generic_menu_slots(m)?),
             "minecraft:brewing_stand" => slots(5),
             // CrafterMenu: the grid, the inventory, then the result (the
             // client's own).
@@ -1938,6 +2121,39 @@ impl Game<'_> {
         if internal >= super::stations::INPUT && self.station.is_some() {
             self.remote_station_slot_changed(internal);
         }
+    }
+
+    /// `Inventory.setItem` by the player inventory's own slot numbers.
+    fn set_player_inventory_slot(&mut self, slot: i32, stack: Option<ItemStack>) {
+        match slot {
+            0..=35 => self.inventory[slot as usize] = stack,
+            36..=39 => self.armor[3 - (slot - 36) as usize] = stack,
+            // Inventory.SLOT_OFFHAND.
+            40 => self.offhand = stack,
+            _ => {}
+        }
+    }
+
+    /// The snapshots with the server's attribute ids (its registry numbering,
+    /// `server_states::builtin`) turned into ours by name; modded attributes
+    /// we do not have are dropped.
+    fn local_attributes(&self, values: &[play::AttributeSnapshot]) -> Vec<play::AttributeSnapshot> {
+        let Some(server) = self
+            .remote
+            .as_ref()
+            .and_then(|r| r.builtin.get("minecraft:attribute"))
+        else {
+            return values.to_vec();
+        };
+        let catalog = &self.motion.attributes;
+        remap_attributes(
+            values,
+            |id| server.name(id),
+            |name| {
+                let name = attribute_name_26(name);
+                catalog.id(&name).map(|a| a.registry_id())
+            },
+        )
     }
 
     /// `ClientPacketListener.handleUpdateAttributes` for a mob, each value from
@@ -2029,6 +2245,9 @@ impl Game<'_> {
                 }
                 self.screen = Screen::Playing;
                 if let Some(r) = self.remote.as_mut() {
+                    // The server's new player is neither sneaking nor sprinting.
+                    r.last_input = 0;
+                    r.was_sprinting = false;
                     r.death_message = None;
                     r.health = (20.0, 20, 5.0);
                 }
@@ -2049,7 +2268,17 @@ impl Game<'_> {
                 .clamp(-90.0, 90.0);
             }
             C::PlayerLookAt(p) => self.remote_look_at(&p),
-            C::LevelChunkWithLight(p) => self.remote_chunk(&p, None),
+            C::LevelChunkWithLight(p) => {
+                // Sable: chunks in the plot parking lot belong to sub-levels.
+                // Force-mesh them (they're far from the player, outside the
+                // normal render distance) and route to the world as usual.
+                // RU: чанки плот-парковки Sable — форсируем мешинг (далеко
+                // от игрока) и маршрутизируем в мир как обычно.
+                if horizon_client::sable::is_plot_chunk(p.x, p.z) {
+                    self.streaming.forced.insert((p.x, p.z));
+                }
+                self.remote_chunk(&p, None)
+            }
             C::LightUpdate(p) => self.remote_light_update(&p),
             C::ForgetLevelChunk(p) => {
                 let [x, z] = p.pos;
@@ -2117,7 +2346,16 @@ impl Game<'_> {
             // ClientPacketListener.handleLevelEvent: a global one is heard
             // from anywhere (ClientLevel.globalLevelEvent).
             C::LevelEvent(p) if p.global => self.global_level_event_sound(p.kind, p.pos),
-            C::LevelEvent(p) => self.level_event_at(p.kind, p.pos, p.data),
+            C::LevelEvent(p) => {
+                // 2001 (a block broken) carries the server's state id.
+                let data = match self.remote.as_ref().map(|r| r.block_map) {
+                    Some(map) if p.kind == 2001 && !map.is_empty() => {
+                        map.get(p.data as usize).copied().unwrap_or(0) as i32
+                    }
+                    _ => p.data,
+                };
+                self.level_event_at(p.kind, p.pos, data)
+            }
             C::LevelParticles(p) => self.remote_level_particles(&p),
             C::Explode(p) => self.remote_explode(&p),
             C::Sound(p) => {
@@ -2161,6 +2399,7 @@ impl Game<'_> {
                     r.level_player_textures.remove(&p.id);
                     if kind == "minecraft:player" {
                         r.level_players.insert(p.id, p.uuid);
+                        horizon_client::player_anim::player_spawned(p.id, p.uuid, r.entity_id);
                         // createEntityFromPacket: the player takes the profile of its list entry.
                         match r.players.get(&p.uuid) {
                             Some(name) => r.level_player_names.insert(p.id, name.clone()),
@@ -2770,12 +3009,16 @@ impl Game<'_> {
             // HUD draws and the health it may hold), reach, speed and so on.
             // Then the received health again, which the old maximum clamped.
             C::UpdateAttributes(p) if self.remote.as_ref().is_some_and(|r| r.entity_id == p.id) => {
+                let values = self.local_attributes(&p.values);
                 if let Some(pl) = self.player.as_mut() {
-                    horizon_client::lan::attributes::apply(&mut pl.attributes, &p.values);
+                    horizon_client::lan::attributes::apply(&mut pl.attributes, &values);
                 }
                 self.apply_remote_health();
             }
-            C::UpdateAttributes(p) => self.remote_mob_attributes(p.id, &p.values),
+            C::UpdateAttributes(p) => {
+                let values = self.local_attributes(&p.values);
+                self.remote_mob_attributes(p.id, &values);
+            }
             C::UpdateMobEffect(p) => self.remote_effect(&p),
             C::RemoveMobEffect(p) => {
                 if self.remote.as_ref().is_some_and(|r| r.entity_id == p.id)
@@ -2941,12 +3184,26 @@ impl Game<'_> {
                 if let Some(r) = self.remote.as_mut() {
                     r.state_id = p.state;
                 }
+                self.remote_size_generic_menu(p.container, p.items.len());
                 for (slot, item) in p.items.iter().enumerate() {
                     let stack = self.to_stack(item);
                     self.set_menu_slot(p.container, slot as i32, stack);
                 }
                 self.carried = self.to_stack(&p.carried);
                 self.remote_synced();
+            }
+            // handleContainerSetSlot: -1 sets the carried stack and -2 a slot of the
+            // player's inventory, neither touching the open menu or its state id.
+            C::ContainerSetSlot(p) if p.container == -1 || p.container == -2 => {
+                let stack = self.to_stack(&p.item);
+                self.tutorial_get_item(stack.as_ref());
+                if p.container == -1 {
+                    self.carried = stack;
+                } else {
+                    let before = self.creative_stacks();
+                    self.set_player_inventory_slot(i32::from(p.slot), stack);
+                    self.remote_synced_since(&before);
+                }
             }
             C::ContainerSetSlot(p) => {
                 if let Some(r) = self.remote.as_mut() {
@@ -2981,18 +3238,14 @@ impl Game<'_> {
                 let stack = self.to_stack(&p.item);
                 self.tutorial_get_item(stack.as_ref());
                 let before = self.creative_stacks();
-                match p.slot {
-                    0..=35 => self.inventory[p.slot as usize] = stack,
-                    36..=39 => self.armor[3 - (p.slot - 36) as usize] = stack,
-                    // Inventory.SLOT_OFFHAND.
-                    40 => self.offhand = stack,
-                    _ => {}
-                }
+                self.set_player_inventory_slot(p.slot, stack);
                 self.remote_synced_since(&before);
             }
             C::ContainerSetData(p) if self.open_menu_name(p.container) == "minecraft:lectern" => {
                 self.remote_lectern_page(i32::from(p.value));
             }
+            C::ContainerSetData(p)
+                if generic_menu_slots(&self.open_menu_name(p.container)).is_some() => {}
             C::ContainerSetData(p) if self.remote_station_open(p.container) => {
                 self.remote_station_data(usize::try_from(p.id).unwrap_or(usize::MAX), p.value);
             }
@@ -4110,6 +4363,18 @@ impl Game<'_> {
             (player.position.z.floor() as i32) >> 4,
         );
         if !self.streaming.is_lit(cx, cz) {
+            // ReceivingLevelScreen.tick: the screen closes without chunks once
+            // the timeout passed, and a dead player (the server sends none
+            // around it) gets the DeathScreen, whose Respawn asks the server
+            // for PERFORM_RESPAWN. Vanilla's wait is over for the dead at once.
+            let health = self.remote.as_ref().map_or(20.0, |r| r.health.0);
+            let shown = self.remote.as_ref().is_none_or(|r| r.show_death_screen);
+            if terrain_wait_opens_death_screen(health, shown, self.screen == Screen::Dead) {
+                self.screen = Screen::Dead;
+                self.ui.death_time = 0;
+                self.ui.death_confirm = None;
+                self.capture(false);
+            }
             // LocalPlayer.tick can wait for chunks, but Minecraft.tick still
             // calls sendChanges: rotations and the 20-tick position reminder
             // must continue, as well as moves into the unloaded area.
@@ -4128,6 +4393,7 @@ impl Game<'_> {
                 r.loaded_sent = true;
             }
             self.capture_loaded_world();
+            super::log_memory("joined world: terrain ready");
         }
         let stick = self.pad_move();
         if self.player.is_none() {
@@ -4549,7 +4815,68 @@ impl Game<'_> {
         let players = &r.level_players;
         let mut using = Vec::new();
         let mut mob_fx = Vec::new();
-        for m in &mut self.mobs {
+        let mob_tick_started = Instant::now();
+        let mob_count = self.mobs.len();
+        let ticked_mob_count = self
+            .mobs
+            .iter()
+            .filter(|m| running || players.contains_key(&(m.id as i32)))
+            .count();
+        let interpolation_job_count = self
+            .mobs
+            .iter()
+            .filter(|m| {
+                (running || players.contains_key(&(m.id as i32)))
+                    && stepped.contains_key(&(m.id as i32))
+            })
+            .count();
+        let interpolation_threads = horizon_client::par::frame_threads(
+            horizon_client::par::threads(),
+            interpolation_job_count,
+            16,
+        );
+        let mob_interpolation = if interpolation_threads > 1 {
+            let started = Instant::now();
+            let mut inputs = Vec::with_capacity(interpolation_job_count);
+            for (index, m) in self.mobs.iter().enumerate() {
+                let id = m.id as i32;
+                if !running && !players.contains_key(&id) {
+                    continue;
+                }
+                let stepped_state = stepped.remove(&id);
+                if stepped_state.is_none() {
+                    continue;
+                }
+                inputs.push(MobInterpolationInput {
+                    id,
+                    index,
+                    stepped: stepped_state,
+                    at: None,
+                });
+            }
+            horizon_client::par::for_each_mut_with(
+                interpolation_threads,
+                &mut inputs,
+                interpolate_mob,
+            );
+            let mut results = vec![None; self.mobs.len()];
+            for input in inputs {
+                if let Some(state) = input.stepped {
+                    stepped.insert(input.id, state);
+                }
+                results[input.index] = input.at;
+            }
+            log::debug!(
+                "Horizon: stage=mob_interpolation mobs={} threads={} elapsed_us={}",
+                interpolation_job_count,
+                interpolation_threads,
+                started.elapsed().as_micros()
+            );
+            Some(results)
+        } else {
+            None
+        };
+        for (index, m) in self.mobs.iter_mut().enumerate() {
             let player = players.contains_key(&(m.id as i32));
             if !running && !player {
                 continue;
@@ -4609,13 +4936,20 @@ impl Game<'_> {
             m.anim.attack_anim_o = m.anim.attack_anim;
             horizon_client::mobs::ai::tick_swing(m);
             // Entity.tick: the SteppedInterpolationHandler's step.
-            if let Some(at) = stepped
-                .get_mut(&(m.id as i32))
-                .and_then(|h| h.interpolate())
-            {
-                place_interpolated(m, at);
+            if let Some(results) = &mob_interpolation {
+                if let Some(at) = results[index] {
+                    place_interpolated(m, at);
+                }
+            } else {
+                if let Some(at) = stepped
+                    .get_mut(&(m.id as i32))
+                    .and_then(SteppedInterpolation::interpolate)
+                {
+                    place_interpolated(m, at);
+                }
             }
-            // LivingEntity.aiStep: the head's own interpolation.
+            // LivingEntity.aiStep: keep head interpolation after the species
+            // hooks; workers own only the stepped handler, not mob state.
             if let Some((yaw, steps)) = head_lerps.get_mut(&(m.id as i32))
                 && *steps > 0
             {
@@ -4726,6 +5060,13 @@ impl Game<'_> {
                 _ => {}
             }
         }
+        log::debug!(
+            "Horizon: stage=remote_mob_tick active={} mobs={} interpolation_threads={} elapsed_us={}",
+            ticked_mob_count,
+            mob_count,
+            interpolation_threads,
+            mob_tick_started.elapsed().as_micros()
+        );
         for o in self.orbs.iter_mut().filter(|_| running) {
             o.previous = o.position;
             o.age += 1;
@@ -5200,6 +5541,7 @@ impl Game<'_> {
         }
         if let Some((i, distance)) = self.mob_hit()
             && self.before_block(distance)
+            && self.remote_mob_is_living(i)
         {
             let id = self.mobs[i].id as i32;
             self.send(S::Interact(play::Interact {
@@ -6079,6 +6421,7 @@ impl Game<'_> {
             self.reset_attack_strength();
         } else if let Some((i, distance)) = self.mob_hit()
             && self.before_block(distance)
+            && self.remote_mob_is_living(i)
         {
             self.send(S::Attack(play::Attack {
                 id: self.mobs[i].id as i32,
@@ -6579,6 +6922,7 @@ impl Game<'_> {
             self.remote_open_merchant(p.container, title);
             return;
         }
+        let mut open_name = menu.clone();
         let entity = match menu.as_str() {
             "minecraft:crafting" => None,
             "minecraft:furnace" | "minecraft:blast_furnace" | "minecraft:smoker" => {
@@ -6615,23 +6959,16 @@ impl Game<'_> {
                     .unwrap_or(3);
                 Some(BlockEntity::Chest(vec![None; rows * 9]))
             }
+            // A menu with no screen of its own: a grid of its slots, sized by
+            // the ContainerSetContent that follows; the server stays in charge.
             _ => {
-                // Unsupported menu: tell the server we closed it.
-                self.send(S::ContainerClose(play::ContainerClose {
-                    container: p.container,
-                }));
-                self.chat_line(
-                    horizon_client::text::Text::literal(format!(
-                        "(Horizon cannot show {menu} screens yet)"
-                    )),
-                    horizon_client::chat::ChatSource::Client,
-                );
-                return;
+                open_name = generic_menu_name(0);
+                Some(BlockEntity::Chest(Vec::new()))
             }
         };
         let title = menu_title(&p.title);
         if let Some(r) = self.remote.as_mut() {
-            r.menu = Some((p.container, menu.clone()));
+            r.menu = Some((p.container, open_name));
             r.menu_title = Some(title);
         }
         self.craft_size = if menu == "minecraft:crafting" { 3 } else { 2 };
@@ -6668,6 +7005,24 @@ impl Game<'_> {
             r.menu_title = None;
         }
     }
+    /// A generic menu's layout from what its contents hold (see
+    /// `generic_menu_layout_name`); the grid grows to the rows that show it.
+    fn remote_size_generic_menu(&mut self, container: i32, total: usize) {
+        if generic_menu_slots(&self.open_menu_name(container)).is_none() {
+            return;
+        }
+        let name = generic_menu_layout_name(total);
+        let slots = generic_menu_slots(&name).unwrap_or(0);
+        if let Some(r) = self.remote.as_mut() {
+            r.menu = Some((container, name));
+        }
+        if let Some(key) = self.container {
+            self.world.block_entities.insert(
+                key,
+                BlockEntity::Chest(vec![None; generic_menu_rows(slots) * 9]),
+            );
+        }
+    }
     /// The type of the menu a server opened (`MenuType`'s id).
     pub(super) fn remote_menu_type(&self) -> Option<&str> {
         Some(self.remote.as_ref()?.menu.as_ref()?.1.as_str())
@@ -6688,13 +7043,11 @@ impl Game<'_> {
     /// A server's chest-like menu (`MenuType.GENERIC_9xN`): its rows and title.
     pub(super) fn remote_chest_menu(&self) -> Option<(usize, horizon_client::text::Text)> {
         let r = self.remote.as_ref()?;
-        let rows = r
-            .menu
-            .as_ref()?
-            .1
-            .strip_prefix("minecraft:generic_9x")?
-            .parse()
-            .ok()?;
+        let name = &r.menu.as_ref()?.1;
+        let rows = match generic_menu_slots(name) {
+            Some(slots) => generic_menu_rows(slots),
+            None => name.strip_prefix("minecraft:generic_9x")?.parse().ok()?,
+        };
         Some((
             rows,
             r.menu_title
@@ -7363,8 +7716,293 @@ fn snapshot_value(s: &play::AttributeSnapshot) -> f64 {
     value
 }
 
+/// A 1.21.1 attribute name in 26.3's spelling: 1.21.2 dropped the
+/// `generic.`, `player.`, `zombie.` and `horse.` prefixes of the `minecraft:`
+/// attributes. Modded and already-plain names stay as they are.
+fn attribute_name_26(name: &str) -> std::borrow::Cow<'_, str> {
+    let Some(path) = name.strip_prefix("minecraft:") else {
+        return name.into();
+    };
+    for prefix in ["generic.", "player.", "zombie.", "horse."] {
+        if let Some(plain) = path.strip_prefix(prefix) {
+            return format!("minecraft:{plain}").into();
+        }
+    }
+    name.into()
+}
+
+/// The snapshots with each server attribute id (`server_name`) swapped for our
+/// registry id of the same name (`local_id`); an attribute we do not have
+/// (a modded one) is skipped and the rest kept.
+fn remap_attributes<'a>(
+    values: &[play::AttributeSnapshot],
+    server_name: impl Fn(i32) -> Option<&'a str>,
+    local_id: impl Fn(&str) -> Option<i32>,
+) -> Vec<play::AttributeSnapshot> {
+    values
+        .iter()
+        .filter_map(|s| {
+            let attribute = local_id(server_name(s.attribute)?)?;
+            Some(play::AttributeSnapshot {
+                attribute,
+                ..s.clone()
+            })
+        })
+        .collect()
+}
+
+const NO_MODEL_INVISIBLE: &[&str] = &[
+    "arrow",
+    "bolt",
+    "bullet",
+    "projectile",
+    "spell",
+    "fireball",
+    "orb",
+    "beam",
+    "effect",
+    "particle",
+    "cloud",
+    "area",
+    "marker",
+];
+const NO_MODEL_HUMANOID: &[&str] = &[
+    "zombie",
+    "skeleton",
+    "humanoid",
+    "human",
+    "npc",
+    "villager",
+    "knight",
+    "soldier",
+    "guard",
+    "bandit",
+    "warrior",
+    "mage",
+    "wizard",
+    "witch",
+    "cultist",
+    "ghoul",
+    "undead",
+    "pillager",
+    "raider",
+    "trader",
+    "merchant",
+    "priest",
+    "monk",
+    "miner",
+    "farmer",
+    "hunter",
+    "assassin",
+    "necromancer",
+    "lich",
+    "giant",
+];
+
+/// Words of modded entity types that are not living mobs: items, vehicles,
+/// seats, contraptions, displays. They get no stand-in and are never attacked
+/// (1.21.1 kicks a player who attacks an item entity).
+const NON_LIVING_WORDS: &[&str] = &[
+    "seat",
+    "boat",
+    "glue",
+    "contraption",
+    "carriage",
+    "display",
+    "item",
+    "backpack",
+    "block",
+    "minecart",
+    "cart_",
+    "_cart",
+    "chair",
+    "stool",
+    "bench",
+    "vehicle",
+    "bearing",
+    "platform",
+    "painting",
+    "frame",
+    "interaction",
+    "text",
+];
+
+/// Whether a modded entity type's name says it is not a living mob.
+fn non_living_name(kind: &str) -> bool {
+    if kind.starts_with("minecraft:") {
+        return false;
+    }
+    let name = kind.rsplit(':').next().unwrap_or(kind).to_ascii_lowercase();
+    NON_LIVING_WORDS.iter().any(|w| name.contains(w))
+}
+
+/// The vanilla mob drawn for a modded entity type that has no model of its own:
+/// a zombie for humanoid-sounding names, a pig otherwise; None for
+/// projectile/effect names and non-living types, which stay invisible.
+fn stand_in_mob(kind: &str) -> Option<&'static str> {
+    let name = kind.rsplit(':').next().unwrap_or(kind).to_ascii_lowercase();
+    if non_living_name(kind) || NO_MODEL_INVISIBLE.iter().any(|w| name.contains(w)) {
+        return None;
+    }
+    if NO_MODEL_HUMANOID.iter().any(|w| name.contains(w)) {
+        Some("minecraft:zombie")
+    } else {
+        Some("minecraft:pig")
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::{
+        MobInterpolationInput, generic_menu_layout_name, generic_menu_name, generic_menu_rows,
+        generic_menu_slots, interpolate_mob, non_living_name, remap_attributes, stand_in_mob,
+        terrain_wait_opens_death_screen,
+    };
+    use horizon_protocol::packets::play::AttributeSnapshot;
+    use horizon_world::stepped_interpolation::{Path, PosRot, SteppedInterpolation};
+
+    #[test]
+    fn mob_interpolation_without_a_handler_leaves_no_result() {
+        let mut out = MobInterpolationInput {
+            id: 4,
+            index: 0,
+            stepped: None,
+            at: None,
+        };
+        interpolate_mob(&mut out);
+        assert_eq!(out.id, 4);
+        assert!(out.at.is_none());
+    }
+
+    #[test]
+    fn mob_interpolation_results_match_across_worker_counts() {
+        let mut source = Vec::new();
+        for i in 0..48 {
+            let entity = PosRot {
+                position: [i as f64, 64.0, -3.0],
+                yaw: 170.0,
+                pitch: 12.0,
+            };
+            let mut stepped = SteppedInterpolation::new(3);
+            stepped.interpolate_to(
+                entity,
+                Some(Path::Linear([i as f64 + 3.0, 65.0, -2.0])),
+                Some((-170.0, 25.0)),
+            );
+            source.push(MobInterpolationInput {
+                id: i,
+                index: i as usize,
+                stepped: Some(stepped),
+                at: None,
+            });
+        }
+        let mut serial = source.clone();
+        for input in &mut serial {
+            interpolate_mob(input);
+        }
+        for threads in [1, 2, 6] {
+            let mut parallel = source.clone();
+            horizon_client::par::for_each_mut_with(threads, &mut parallel, interpolate_mob);
+            for (a, b) in serial.iter().zip(&parallel) {
+                assert_eq!(a.id, b.id);
+                assert_eq!(a.index, b.index);
+                assert_eq!(a.at, b.at);
+                assert_eq!(
+                    a.stepped.as_ref().unwrap().active(),
+                    b.stepped.as_ref().unwrap().active()
+                );
+                let mut next_a = a.stepped.clone().unwrap();
+                let mut next_b = b.stepped.clone().unwrap();
+                assert_eq!(next_a.interpolate(), next_b.interpolate());
+            }
+        }
+    }
+
+    #[test]
+    fn attributes_are_mapped_by_name_and_unknown_ones_skipped() {
+        let snap = |attribute| AttributeSnapshot {
+            attribute,
+            base: 1.0,
+            modifiers: Vec::new(),
+        };
+        let server = ["minecraft:armor", "mod:mana", "minecraft:max_health"];
+        let local = |name: &str| match name {
+            "minecraft:armor" => Some(3),
+            "minecraft:max_health" => Some(16),
+            _ => None,
+        };
+        let out = remap_attributes(
+            &[snap(0), snap(1), snap(2), snap(99)],
+            |id| server.get(id as usize).copied(),
+            local,
+        );
+        let ids: Vec<i32> = out.iter().map(|s| s.attribute).collect();
+        assert_eq!(ids, [3, 16]);
+    }
+
+    #[test]
+    fn server_attribute_names_are_mapped_to_26_names() {
+        use super::attribute_name_26;
+        assert_eq!(
+            attribute_name_26("minecraft:generic.max_health"),
+            "minecraft:max_health"
+        );
+        assert_eq!(
+            attribute_name_26("minecraft:player.block_interaction_range"),
+            "minecraft:block_interaction_range"
+        );
+        assert_eq!(
+            attribute_name_26("minecraft:zombie.spawn_reinforcements"),
+            "minecraft:spawn_reinforcements"
+        );
+        assert_eq!(
+            attribute_name_26("minecraft:horse.jump_strength"),
+            "minecraft:jump_strength"
+        );
+        assert_eq!(attribute_name_26("minecraft:scale"), "minecraft:scale");
+        assert_eq!(attribute_name_26("mod:generic.mana"), "mod:generic.mana");
+    }
+
+    #[test]
+    fn modded_entities_without_a_model_get_a_stand_in_unless_projectiles() {
+        assert_eq!(
+            stand_in_mob("mod:cave_zombie_lord"),
+            Some("minecraft:zombie")
+        );
+        assert_eq!(stand_in_mob("mod:wolf_beast"), Some("minecraft:pig"));
+        assert_eq!(stand_in_mob("mod:Fire_Bolt"), None);
+        assert_eq!(stand_in_mob("mod:poison_cloud"), None);
+        assert_eq!(stand_in_mob("mod:skeleton_arrow"), None);
+    }
+
+    #[test]
+    fn non_living_modded_entities_get_no_stand_in_and_are_not_attackable() {
+        for kind in [
+            "handcrafted:seat",
+            "sophisticatedbackpacks:everlasting_backpack_item",
+            "simulated:honey_glue",
+            "createbigcannons:pitch_contraption",
+            "aeronautics:propeller_bearing_contraption",
+            "biomesoplenty:boat",
+            "aether:skyroot_boat",
+            "ars_nouveau:flying_item",
+            "mod:block_display",
+        ] {
+            assert_eq!(stand_in_mob(kind), None, "{kind}");
+            assert!(non_living_name(kind), "{kind}");
+        }
+        assert!(!non_living_name("mod:cave_zombie_lord"));
+        assert!(!non_living_name("minecraft:item"));
+    }
+
+    #[test]
+    fn a_dead_player_waiting_for_terrain_gets_the_death_screen() {
+        assert!(terrain_wait_opens_death_screen(0.0, true, false));
+        assert!(!terrain_wait_opens_death_screen(0.0, true, true));
+        assert!(!terrain_wait_opens_death_screen(0.0, false, false));
+        assert!(!terrain_wait_opens_death_screen(1.0, true, false));
+    }
+
     /// An NPC plugin lists the NPC, spawns it, and takes the entry off the list:
     /// the entity keeps the skin it found; a player spawned before its entry
     /// arrives takes the entry once it comes.
@@ -7681,6 +8319,49 @@ mod tests {
             synced[37], None,
             "the helmet still differs, so the next tick sends it"
         );
+    }
+
+    #[test]
+    fn generic_menu_rows_round_up_and_names_round_trip() {
+        assert_eq!(generic_menu_rows(0), 0);
+        assert_eq!(generic_menu_rows(1), 1);
+        assert_eq!(generic_menu_rows(9), 1);
+        assert_eq!(generic_menu_rows(10), 2);
+        assert_eq!(generic_menu_slots(&generic_menu_name(13)), Some(13));
+        assert_eq!(generic_menu_slots("minecraft:hopper"), None);
+    }
+
+    #[test]
+    fn generic_menu_maps_its_slots_then_the_inventory() {
+        let menu = generic_menu_name(13);
+        assert_eq!(Game::menu_slot(&menu, 0), Some(300));
+        assert_eq!(Game::menu_slot(&menu, 12), Some(312));
+        assert_eq!(Game::menu_slot(&menu, 13), Some(9));
+        assert_eq!(Game::menu_slot(&menu, 48), Some(8));
+        assert_eq!(Game::menu_slot(&menu, 49), None);
+        let empty = generic_menu_name(0);
+        assert_eq!(Game::menu_slot(&empty, 0), Some(9));
+        assert_eq!(Game::menu_slot(&empty, 36), None);
+        assert_eq!(Game::menu_slot_index(&menu, 9), Some(13));
+    }
+
+    #[test]
+    fn a_generic_menu_only_maps_the_inventory_for_a_chest_like_layout() {
+        // 27 own + 36: the standard layout.
+        assert_eq!(generic_menu_layout_name(63), generic_menu_name(27));
+        assert_eq!(generic_menu_layout_name(90), generic_menu_name(54));
+        // Not a multiple of 9, too big, or too small: all slots are the menu's.
+        for total in [0, 13, 36, 40, 49, 100] {
+            let name = generic_menu_layout_name(total);
+            assert_eq!(generic_menu_slots(&name), Some(total), "{total}");
+            for slot in 0..total as i32 {
+                assert!(
+                    Game::menu_slot(&name, slot).is_some_and(|i| i >= 300),
+                    "{total}: slot {slot} must stay in the menu"
+                );
+            }
+            assert_eq!(Game::menu_slot(&name, total as i32), None);
+        }
     }
 
     #[test]

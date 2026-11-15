@@ -1267,7 +1267,7 @@ impl Game<'_> {
         state: BlockStateId,
         seed: i64,
         m: glam::Mat4,
-        light: impl Fn(&horizon_assets::bake::ModelQuad) -> u32,
+        light: impl Fn(&horizon_client::models::catalog::BakedQuad) -> u32,
         diffuse: bool,
         tint: impl Fn(i32) -> Option<u32>,
         out: &mut Vec<Vertex>,

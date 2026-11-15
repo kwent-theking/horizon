@@ -16,7 +16,7 @@
 //! changed level is copied into its layer.
 use super::upload::Uploads;
 use crate::mipmap::Settings;
-use crate::sprites::{FrameBlend, SpriteAnimation};
+use crate::sprites::{FrameBlend, SpriteAnimation, SpriteTiming};
 use wgpu::util::DeviceExt;
 
 /// Bytes of `animate.wgsl`'s `Job`.
@@ -25,7 +25,7 @@ const JOB_BYTES: usize = 20;
 const WORKGROUP: u32 = 8;
 
 struct Sprite {
-    animation: SpriteAnimation,
+    animation: SpriteTiming,
     /// What its layer shows (`None`: the frame the array was created with,
     /// rewritten on the first tick).
     shown: Option<FrameBlend>,
@@ -139,7 +139,7 @@ impl SpriteAnimator {
             });
             counts[group] += 1;
             sprites.push(Sprite {
-                animation: animation.clone(),
+                animation: animation.timing(),
                 shown: None,
                 layer: animation.layer % split,
                 frames: offsets,

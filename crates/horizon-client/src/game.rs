@@ -81,6 +81,7 @@ mod integrated;
 mod item_draw;
 mod item_particles;
 mod jukebox;
+mod kinetics;
 mod lan;
 mod lan_actions;
 mod lan_attributes;
@@ -168,6 +169,7 @@ mod sculk;
 mod sculk_fixture;
 mod server_links;
 mod server_packs;
+mod server_states;
 mod server_travel;
 mod shader_packs;
 mod shelf;
@@ -1332,6 +1334,8 @@ impl UiResources {
     /// From a resource root layering packs over `defaults`, the game's own
     /// resources (`root` itself when no pack is on).
     pub fn load(root: &std::path::Path, defaults: &std::path::Path) -> Result<Self> {
+        // The textures of the modded client's model dump (mobs/modded), if there is one.
+        horizon_client::hud::set_mod_entity_textures(horizon_client::mobs::modded::textures_dir());
         Ok(Self {
             atlas: HudAtlas::build_over(root, defaults)?,
             panorama: Arc::new(horizon_client::gfx::panorama::Faces::load(root)),
@@ -1366,13 +1370,61 @@ impl PackResources {
         facts: &BlockFacts,
         biomes: Arc<Biomes>,
         light: Arc<LightTables>,
+        threads: usize,
     ) -> Result<Self> {
-        let visibility = models::load_visibility(root, assets.registry)?;
-        let tables = Arc::new(MeshTables::new(&assets, &render, facts, visibility)?);
-        let item_renderer = horizon_client::item_render::ItemRenderer::load_with_library(
-            root,
-            render.model_library.clone(),
-        )?;
+        enum LoadedPackPart {
+            Tables(std::result::Result<Arc<MeshTables>, String>),
+            ItemRenderer(
+                std::result::Result<Arc<horizon_client::item_render::ItemRenderer>, String>,
+            ),
+            Names(Names),
+            Clouds((u32, u32, Vec<bool>)),
+            Forcefield((u32, u32, Vec<u8>)),
+        }
+        let jobs = [0_u8, 1, 2, 3, 4];
+        let worker_threads = threads.min(horizon_core::par::threads());
+        let parts = horizon_client_render::par::time("pack_tables", worker_threads, || {
+            horizon_core::par::par_map_with(worker_threads, &jobs, |job| match job {
+                0 => {
+                    let result = models::load_visibility(root, assets.registry)
+                        .and_then(|visibility| MeshTables::new(&assets, &render, facts, visibility))
+                        .map(Arc::new)
+                        .map_err(|e| e.to_string());
+                    LoadedPackPart::Tables(result)
+                }
+                1 => LoadedPackPart::ItemRenderer(
+                    horizon_client::item_render::ItemRenderer::load_with_library(
+                        root,
+                        render.model_library.clone(),
+                    )
+                    .map(Arc::new)
+                    .map_err(|e| e.to_string()),
+                ),
+                2 => LoadedPackPart::Names(Names::load(root)),
+                3 => LoadedPackPart::Clouds(load_clouds(root)),
+                _ => LoadedPackPart::Forcefield(load_forcefield(root)),
+            })
+        });
+        let mut tables = None;
+        let mut item_renderer = None;
+        let mut names = None;
+        let mut clouds = None;
+        let mut forcefield = None;
+        for part in parts {
+            match part {
+                LoadedPackPart::Tables(result) => tables = Some(result),
+                LoadedPackPart::ItemRenderer(result) => item_renderer = Some(result),
+                LoadedPackPart::Names(value) => names = Some(value),
+                LoadedPackPart::Clouds(value) => clouds = Some(value),
+                LoadedPackPart::Forcefield(value) => forcefield = Some(value),
+            }
+        }
+        let tables = tables
+            .expect("pack table job")
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        let item_renderer = item_renderer
+            .expect("item renderer job")
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
         Ok(Self {
             layer_names: Arc::new(
                 render
@@ -1390,10 +1442,10 @@ impl PackResources {
             }),
             assets,
             render,
-            item_renderer: Arc::new(item_renderer),
-            names: Arc::new(Names::load(root)),
-            clouds: Arc::new(load_clouds(root)),
-            forcefield: Arc::new(load_forcefield(root)),
+            item_renderer,
+            names: Arc::new(names.expect("names job")),
+            clouds: Arc::new(clouds.expect("clouds job")),
+            forcefield: Arc::new(forcefield.expect("forcefield job")),
         })
     }
 }
@@ -8672,6 +8724,7 @@ impl Game<'_> {
         }
         self.mark_entity(out.len(), "");
         self.moving_piston_geometry(camera, alpha, &mut out);
+        self.kinetic_geometry(camera, alpha, &mut out);
         self.mark_entity(out.len(), "minecraft:tnt");
         self.tnt_geometry(camera, alpha, &mut out);
         self.mark_entity(out.len(), "minecraft:painting");
@@ -12590,9 +12643,47 @@ impl Game<'_> {
                 .darken_amount(self.clock.fraction() as f32),
             menu_blur: self.menu_blur(),
         };
+        // Sable sub-levels: this frame's render offsets per plot, translation
+        // only. A sub-level's chunks are meshed at its parking-lot position;
+        // the renderer draws them at (parking + offset), offset = interpolated
+        // pose position - the plot's parking origin (blocks, y included).
+        // RU: суб-уровни Sable — смещения для рендера по плотам за этот кадр,
+        // только перенос. Чанки мешированы в «парковке»; рендерер рисует их в
+        // точке (парковка + offset), offset = позиция интерполированной позы
+        // минус origin «парковки» плота (в блоках, включая y).
+        let mut plot_offsets: Vec<((i32, i32), [f64; 3])> = Vec::new();
+        if let Some(remote) = &self.remote
+            && !remote.sublevels.levels.is_empty()
+        {
+            use horizon_client::sublevel::{LOG_PLOT_SIZE, PLOT_ORIGIN};
+            let manager = &remote.sublevels;
+            for (&id, level) in &manager.levels {
+                let Some(pose) = manager.interpolated_pose(id, alpha as f32) else {
+                    continue;
+                };
+                // The plot's parking-lot origin in block coordinates; the
+                // plot never offsets y, so its origin y is 0.
+                // RU: origin «парковки» плота в блочных координатах; плот не
+                // смещает y, поэтому origin по y = 0.
+                let parking = [
+                    f64::from((PLOT_ORIGIN + level.plot.0) << LOG_PLOT_SIZE) * 16.0,
+                    0.0,
+                    f64::from((PLOT_ORIGIN + level.plot.1) << LOG_PLOT_SIZE) * 16.0,
+                ];
+                plot_offsets.push((
+                    level.plot,
+                    [
+                        pose.position[0] - parking[0],
+                        pose.position[1] - parking[1],
+                        pose.position[2] - parking[2],
+                    ],
+                ));
+            }
+        }
         let result = match self.renderer.as_mut() {
             Some(renderer) => {
                 renderer.set_pass_timing(self.debug);
+                renderer.set_plot_offsets(plot_offsets);
                 horizon_client::spans::time("renderer", || renderer.render(&frame))
             }
             None => Err("renderer".into()),
@@ -12934,24 +13025,12 @@ impl Game<'_> {
                 if let Some(entity) = self.pick_entity_hit() {
                     // handlePickItemFromEntity: the entity's pick result.
                     if let Some(stack) = entity.and_then(|id| self.entity_pick_result(id)) {
-                        let infinite = self.creative;
-                        horizon_client::pick_item::pick(
-                            &mut self.inventory[..36],
-                            &mut self.selected,
-                            &stack,
-                            infinite,
-                        );
+                        self.pick_into_inventory(&stack);
                     }
                 } else if let Some(hit) = self.pick() {
                     let include_data = self.creative && self.has_control_down();
                     if let Some(stack) = self.picked_stack(hit.pos, include_data) {
-                        let infinite = self.creative;
-                        horizon_client::pick_item::pick(
-                            &mut self.inventory[..36],
-                            &mut self.selected,
-                            &stack,
-                            infinite,
-                        );
+                        self.pick_into_inventory(&stack);
                     }
                 }
             }
@@ -15040,6 +15119,10 @@ fn synchronous_startup(options: &Options) -> bool {
         || std::env::var_os("HORIZON_NET_REPORT").is_some()
 }
 
+fn log_memory(stage: &str) {
+    horizon_client::logging::process_memory(stage);
+}
+
 /// The synchronous launch loads both phases; an ordinary launch returns the
 /// core bundle while the rest worker keeps loading.
 fn load_resources(
@@ -15051,8 +15134,10 @@ fn load_resources(
     progress: &Progress,
     publish: &mut dyn FnMut(UiResources, &std::path::Path),
 ) -> Result<Loaded> {
+    log_memory("load resources: begin");
     let requested_root = root.clone();
     let threads = settings.horizon.worker_threads();
+    let parallel_threads = threads.min(horizon_core::par::threads());
     // Stage A: the menu bundle (atlas and panorama). With a loading screen it is
     // published at once so the title screen can appear while the world bundle
     // loads; the synchronous launch instead carries it in `Loaded`.
@@ -15085,6 +15170,11 @@ fn load_resources(
         ui_ready = true;
     }
     progress.set(0);
+    log::info!(
+        "load assets: content root ready {:.2}s",
+        started.elapsed().as_secs_f32()
+    );
+    log_memory("load assets: content root ready");
     let (assets, render) = match Assets::load(&root).and_then(|assets| {
         let render = assets.reload(&root)?;
         Ok((assets, render))
@@ -15124,6 +15214,7 @@ fn load_resources(
         }
     }
     log::info!("load assets: {:.2}s", started.elapsed().as_secs_f32());
+    log_memory("load assets");
     progress.set(1);
     let behaviour_json: serde_json::Value = serde_json::from_reader(std::io::BufReader::new(
         std::fs::File::open(root.join("block-behaviours.json"))?,
@@ -15137,31 +15228,68 @@ fn load_resources(
     };
     let load_biomes = || Biomes::load(&root).map_err(|e| e.to_string());
     let load_environment = || Environment::load(&root).map_err(|e| e.to_string());
-    let (facts, biomes, environment) = if threads > 1 {
-        std::thread::scope(|scope| {
-            let facts = scope.spawn(load_facts);
-            let biomes = scope.spawn(load_biomes);
-            let environment = scope.spawn(load_environment);
-            (
-                facts.join().unwrap(),
-                biomes.join().unwrap(),
-                environment.join().unwrap(),
+    enum LoadedCorePart {
+        Facts(
+            std::result::Result<
+                Box<(BlockFacts, Vec<horizon_client::blocks::GameplayProjection>)>,
+                String,
+            >,
+        ),
+        Biomes(std::result::Result<Box<Biomes>, String>),
+        Environment(std::result::Result<Box<Environment>, String>),
+    }
+    let core_jobs = [0_u8, 1, 2];
+    let core_parts =
+        horizon_client_render::par::time("core_resource_tables", parallel_threads, || {
+            horizon_client_render::par::par_map_with(
+                parallel_threads,
+                &core_jobs,
+                |job| match job {
+                    0 => LoadedCorePart::Facts(load_facts().map(Box::new)),
+                    1 => LoadedCorePart::Biomes(load_biomes().map(Box::new)),
+                    _ => LoadedCorePart::Environment(load_environment().map(Box::new)),
+                },
             )
-        })
-    } else {
-        (load_facts(), load_biomes(), load_environment())
-    };
-    let (facts, gameplay_projection) =
-        facts.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-    let biomes = Arc::new(biomes.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?);
-    let environment = environment.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        });
+    let mut facts = None;
+    let mut biomes = None;
+    let mut environment = None;
+    for part in core_parts {
+        match part {
+            LoadedCorePart::Facts(value) => facts = Some(value),
+            LoadedCorePart::Biomes(value) => biomes = Some(value),
+            LoadedCorePart::Environment(value) => environment = Some(value),
+        }
+    }
+    let (facts, gameplay_projection) = *facts
+        .expect("facts job")
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    let biomes = Arc::new(
+        *biomes
+            .expect("biomes job")
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?,
+    );
+    let environment = *environment
+        .expect("environment job")
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     log::info!("load facts: {:.2}s", started.elapsed().as_secs_f32());
+    log_memory("load facts");
     progress.set(2);
     log::info!("load biomes+env: {:.2}s", started.elapsed().as_secs_f32());
+    log_memory("load biomes+env");
     progress.set(3);
     let light = Arc::new(LightTables::load(&root, assets.registry, &facts)?);
-    let pack = PackResources::load(&root, assets.clone(), render, &facts, biomes.clone(), light)?;
+    let pack = PackResources::load(
+        &root,
+        assets.clone(),
+        render,
+        &facts,
+        biomes.clone(),
+        light,
+        parallel_threads,
+    )?;
     log::info!("load pack tables: {:.2}s", started.elapsed().as_secs_f32());
+    log_memory("load pack tables");
     progress.set(4);
     if !menu {
         horizon_client::ui::load_metadata(&root);
@@ -15177,6 +15305,7 @@ fn load_resources(
         "load collision+motion: {:.2}s",
         started.elapsed().as_secs_f32()
     );
+    log_memory("load collision+motion");
     progress.set(5);
     let resources = Resources {
         core: WorldCore {
@@ -15226,6 +15355,8 @@ fn load_resources(
                     started,
                 )
                 .map_err(|error| error.to_string())?;
+                drop(behaviour_json);
+                drop(gameplay_projection);
                 resources
                     .rest
                     .set(rest)
@@ -15236,6 +15367,7 @@ fn load_resources(
                     "Horizon: rest-ready after {} ms",
                     started.elapsed().as_millis()
                 );
+                log_memory("rest-ready");
                 Ok(())
             })?;
         Some(WorldRestLoader {
@@ -15256,6 +15388,9 @@ fn load_resources(
             .rest
             .set(rest)
             .map_err(|_| "world resources already loaded")?;
+        drop(behaviour_json);
+        drop(gameplay_projection);
+        log_memory("rest-ready");
         None
     };
     Ok(Loaded {
@@ -15281,70 +15416,186 @@ fn load_world_rest(
 ) -> Result<WorldRest> {
     let facts = resources.facts();
     let biomes = resources.biomes();
-    let threads = resources.threads();
+    let threads = resources.threads().min(horizon_core::par::threads());
     let registry_owner = assets;
     progress.set(6);
     let mob_data = horizon_client::mobs::MobData::load(root, facts);
     horizon_client::mobs::trial_spawner::load_registry(root);
 
-    let items = Items::load(root, assets.registry, facts)?;
-    log::info!("load items: {:.2}s", started.elapsed().as_secs_f32());
+    let items_started = Instant::now();
+    let items = horizon_client_render::par::time("items", horizon_core::par::threads(), || {
+        Items::load(root, assets.registry, facts)
+    })?;
+    log::info!("load items: {:.2}s", items_started.elapsed().as_secs_f32());
+    log_memory("load items");
     progress.set(7);
-    let recipes = Recipes::load(root, &items)?;
-    let transformers = horizon_client::block_transform::Transformers::load(root, assets.registry)?;
-    log::info!(
-        "Horizon: resources loaded in {:.1}s; {} block states, {} items, {} biomes; {} worker threads",
-        started.elapsed().as_secs_f32(),
-        facts.states.len(),
-        items.items.len(),
-        biomes.list.len(),
-        threads
-    );
-    progress.set(8);
+    let tail_started = Instant::now();
+    enum RestJob {
+        Recipes,
+        Transformers,
+        Animate,
+        BlockEntities,
+    }
+    enum LoadedRestPart {
+        Recipes(std::result::Result<Box<Recipes>, String>),
+        Transformers(
+            std::result::Result<Box<horizon_client::block_transform::Transformers>, String>,
+        ),
+        Animate(std::result::Result<Box<horizon_client::animate_tick::AnimateTables>, String>),
+        BlockEntities(
+            std::result::Result<
+                Box<horizon_client::block_entity_render::BlockEntityRenderer>,
+                String,
+            >,
+        ),
+    }
+    let rest_jobs = [
+        RestJob::Recipes,
+        RestJob::Transformers,
+        RestJob::Animate,
+        RestJob::BlockEntities,
+    ];
+    let rest_parts = horizon_client_render::par::time("post_items_tables", threads, || {
+        horizon_client_render::par::par_map_with(threads, &rest_jobs, |job| match job {
+            RestJob::Recipes => LoadedRestPart::Recipes(
+                Recipes::load(root, &items)
+                    .map(Box::new)
+                    .map_err(|e| e.to_string()),
+            ),
+            RestJob::Transformers => LoadedRestPart::Transformers(
+                horizon_client::block_transform::Transformers::load(root, assets.registry)
+                    .map(Box::new)
+                    .map_err(|e| e.to_string()),
+            ),
+            RestJob::Animate => LoadedRestPart::Animate(
+                horizon_client::animate_tick::AnimateTables::load_with_behaviour_json(
+                    root,
+                    registry_owner.registry,
+                    biomes,
+                    behaviour_json,
+                )
+                .map(Box::new)
+                .map_err(|e| e.to_string()),
+            ),
+            RestJob::BlockEntities => LoadedRestPart::BlockEntities(
+                horizon_client::block_entity_render::BlockEntityRenderer::load(
+                    root,
+                    registry_owner.registry,
+                )
+                .map(Box::new)
+                .map_err(|e| e.to_string()),
+            ),
+        })
+    });
+    let mut recipes = None;
+    let mut transformers = None;
+    let mut animate = None;
+    let mut block_entities = None;
+    for part in rest_parts {
+        match part {
+            LoadedRestPart::Recipes(value) => recipes = Some(value),
+            LoadedRestPart::Transformers(value) => transformers = Some(value),
+            LoadedRestPart::Animate(value) => animate = Some(value),
+            LoadedRestPart::BlockEntities(value) => block_entities = Some(value),
+        }
+    }
+    let recipes = recipes
+        .expect("recipes job")
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    let recipes = *recipes;
+    let transformers = transformers
+        .expect("transformers job")
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    let transformers = *transformers;
     let stations = horizon_client::stations::StationData::load(root, &items);
-    let animate =
-        horizon_client::animate_tick::AnimateTables::load(root, registry_owner.registry, biomes)?;
+    let animate = *animate
+        .expect("animate tables job")
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     let fog = horizon_client::fog::FogTables::load(root, biomes);
-    Ok(WorldRest {
-        stations,
-        items,
-        recipes,
-        transformers,
-        providers: Providers::load(root),
-        block_entity_render: horizon_client::block_entity_render::BlockEntityRenderer::load(
-            root,
-            registry_owner.registry,
-        )?,
-        animate,
-        fog,
-        music: horizon_client::music::MusicTables::load(root),
-        ambient: horizon_client::ambience::AmbientTables::load(root),
-        nether_environment: Environment::load_dimension(root, "the_nether", false)?,
-        end_environment: Environment::load_dimension(root, "the_end", false)?,
-        behaviours: Behaviours::load_with_gameplay(
+    let providers = Providers::load(root);
+    let block_entity_render = *block_entities
+        .expect("block entity renderer job")
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    let music = horizon_client::music::MusicTables::load(root);
+    let ambient = horizon_client::ambience::AmbientTables::load(root);
+    // Keep the large behaviour cache build separate from the model-loading
+    // wave. The small dimension tables are independent; commit errors in the
+    // original Nether/End order.
+    let environments = horizon_client_render::par::time("dimension_environments", threads, || {
+        horizon_client_render::par::par_map_with(threads, &["the_nether", "the_end"], |dimension| {
+            Environment::load_dimension(root, dimension, false).map_err(|e| e.to_string())
+        })
+    });
+    let mut environments = environments.into_iter();
+    let nether_environment = environments
+        .next()
+        .expect("Nether environment job")
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    let end_environment = environments
+        .next()
+        .expect("End environment job")
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    let behaviours = horizon_client_render::par::time("behaviour_tables", 1, || {
+        Behaviours::load_with_gameplay(
             registry_owner.registry,
             root,
             behaviour_json,
             gameplay_projection,
-        )?,
-        mob_types: MobTypes::load(root)?
-            .types
-            .into_iter()
-            .map(|(k, v)| (k, Arc::new(v)))
-            .collect(),
+        )
+    })?;
+    let rest = WorldRest {
+        stations,
+        items,
+        recipes,
+        transformers,
+        providers,
+        block_entity_render,
+        animate,
+        fog,
+        music,
+        ambient,
+        nether_environment,
+        end_environment,
+        behaviours,
+        mob_types: {
+            horizon_client::mobs::gecko::load(root);
+            horizon_client::mobs::modded::load();
+            horizon_client::player_anim::load(root);
+            MobTypes::load(root)?
+                .types
+                .into_iter()
+                .map(|(k, v)| (k, Arc::new(v)))
+                .collect()
+        },
         mob_data,
         player_type: perspective::player_type(root),
         player_arm: player_arms(root, "minecraft:player#main"),
         player_arm_slim: player_arms(root, "minecraft:player_slim#main"),
         spin_attack: horizon_client::mobs::load_model(root, "minecraft:spin_attack#main"),
-    })
+    };
+    log::info!(
+        "Horizon: stage=world_rest_tail threads={} elapsed_ms={}",
+        threads,
+        tail_started.elapsed().as_millis()
+    );
+    log::info!(
+        "Horizon: resources loaded in {:.1}s; {} block states, {} items, {} biomes; {} worker threads",
+        started.elapsed().as_secs_f32(),
+        facts.states.len(),
+        rest.items.items.len(),
+        biomes.list.len(),
+        resources.threads()
+    );
+    log_memory("resources loaded");
+    progress.set(8);
+    Ok(rest)
 }
 
 /// CPU mip chains for the block sprites and world border.
 fn prepare_renderer_textures(pack: &PackResources) -> horizon_client::gfx::PreparedTextures {
     let assets = &pack.render;
     horizon_client::gfx::PreparedTextures::new(
-        &assets.pixels,
+        &assets.pixels.decode(),
         assets.sprite_size,
         assets.texture_layers,
         &assets.sprite_mips,
@@ -15364,6 +15615,18 @@ fn build_renderer(
 ) -> Result<Renderer> {
     let assets = &pack.render;
     let atlas = &gui.atlas;
+    // The prepared mip chains already include level zero. Decode the CPU atlas
+    // only when rebuilding without prepared data (for example after device loss).
+    let pixels = if prepared.is_none() {
+        assets.pixels.decode()
+    } else {
+        std::borrow::Cow::Borrowed(&[][..])
+    };
+    let animations: Vec<_> = assets
+        .animations
+        .iter()
+        .map(|animation| animation.decode())
+        .collect();
     // The new renderer's atlas texture starts from `HudAtlas.pixels`, which
     // holds the textures but never a glyph rasterized at run time. The font's
     // cache still answers with the rects it drew into the previous renderer's
@@ -15375,12 +15638,12 @@ fn build_renderer(
     let mut renderer = pollster::block_on(Renderer::new(
         window,
         offscreen,
-        &assets.pixels,
+        &pixels,
         assets.sprite_size,
         assets.sprite_minimum_size,
         assets.texture_layers,
         &assets.sprite_mips,
-        &assets.animations,
+        &animations,
         (&atlas.pixels, atlas.width, atlas.height),
         (&atlas.glint.0, atlas.glint.1, atlas.glint.2),
         (
@@ -15394,11 +15657,14 @@ fn build_renderer(
         previous,
         api,
     ))?;
+    drop(animations);
+    drop(pixels);
     renderer.hud.sprite_animations = atlas
         .sprite_animations
         .iter()
         .map(|(rect, animation)| (*rect, animation.clone(), (usize::MAX, 0, 0)))
         .collect();
+    log_memory("renderer textures uploaded");
     Ok(renderer)
 }
 

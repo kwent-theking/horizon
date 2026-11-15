@@ -323,17 +323,17 @@ pub fn load_tags(root: &Path, kind: &str) -> Result<HashMap<String, HashSet<Stri
 }
 /// Every tag's contents in `TagLoader.tryBuildTag` order (a `LinkedHashSet`).
 pub(crate) fn load_tag_lists(root: &Path, kind: &str) -> Result<HashMap<String, Vec<String>>> {
-    let mut raw: HashMap<String, Vec<String>> = HashMap::new();
+    let mut files = Vec::new();
     fn walk(
         dir: &Path,
         base: &Path,
         namespace: &str,
-        raw: &mut HashMap<String, Vec<String>>,
+        files: &mut Vec<(String, std::path::PathBuf)>,
     ) -> Result<()> {
         for entry in fs::read_dir(dir)?.flatten() {
             let p = entry.path();
             if p.is_dir() {
-                walk(&p, base, namespace, raw)?;
+                walk(&p, base, namespace, files)?;
             } else if p.extension().is_some_and(|e| e == "json") {
                 let name = format!(
                     "{namespace}:{}",
@@ -342,14 +342,7 @@ pub(crate) fn load_tag_lists(root: &Path, kind: &str) -> Result<HashMap<String, 
                         .to_string_lossy()
                         .replace('\\', "/")
                 );
-                let v: Value = serde_json::from_slice(&fs::read(&p)?)?;
-                let values = v["values"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|e| e.as_str().or_else(|| e["id"].as_str()).map(str::to_owned))
-                    .collect();
-                raw.insert(name, values);
+                files.push((name, p));
             }
         }
         Ok(())
@@ -358,29 +351,90 @@ pub(crate) fn load_tag_lists(root: &Path, kind: &str) -> Result<HashMap<String, 
     for namespace in crate::content_namespaces::tag_namespaces(root) {
         let dir = root.join(format!("data/{namespace}/tags/{kind}"));
         if dir.exists() {
-            walk(&dir, &dir, &namespace, &mut raw)?;
+            walk(&dir, &dir, &namespace, &mut files)?;
         }
     }
-    fn resolve(name: &str, raw: &HashMap<String, Vec<String>>, out: &mut Vec<String>, depth: u32) {
-        if depth > 32 {
+    // Still enumerate and stat the sources: added, removed and edited tag files
+    // must invalidate the resolved table, including tags linked from the base.
+    let mut sources: Vec<&Path> = files.iter().map(|(_, path)| path.as_path()).collect();
+    sources.sort();
+    let cache = horizon_world::resource_cache::Cache::new(
+        root,
+        &format!("tags-{}-v1", kind.replace('/', "-")),
+        &sources,
+        kind.as_bytes(),
+    );
+    if let Some(tags) = cache.as_ref().and_then(|cache| cache.read_value()) {
+        return Ok(tags);
+    }
+    let mut raw: HashMap<String, Vec<String>> = HashMap::new();
+    horizon_core::par::try_map_batches_with(
+        horizon_core::par::threads(),
+        &files,
+        128,
+        |(name, path)| -> std::result::Result<_, String> {
+            let bytes = fs::read(path).map_err(|error| error.to_string())?;
+            let v: Value = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+            let values: Vec<String> = v["values"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|e| e.as_str().or_else(|| e["id"].as_str()).map(str::to_owned))
+                .collect();
+            Ok((name.clone(), values))
+        },
+        |(name, values)| {
+            raw.insert(name, values);
+        },
+    )?;
+    fn resolve<'a>(
+        name: &'a str,
+        raw: &'a HashMap<String, Vec<String>>,
+        out: &mut Vec<String>,
+        seen: &mut HashSet<&'a str>,
+        expanded: &mut HashSet<(&'a str, u32)>,
+        depth: u32,
+    ) {
+        // The same tag at the same depth emits the same leaves, which the
+        // first visit has already inserted. Keep depth in the key: a later,
+        // shallower visit can still reach leaves beyond the first depth limit.
+        if depth > 32 || !expanded.insert((name, depth)) {
             return;
         }
         for v in raw.get(name).into_iter().flatten() {
             if let Some(tag) = v.strip_prefix('#') {
-                resolve(tag, raw, out, depth + 1);
-            } else if !out.contains(v) {
+                resolve(tag, raw, out, seen, expanded, depth + 1);
+            } else if seen.insert(v.as_str()) {
                 out.push(v.clone());
             }
         }
     }
-    Ok(raw
-        .keys()
-        .map(|k| {
+    let names: Vec<_> = raw.keys().collect();
+    let mut lists = HashMap::new();
+    horizon_core::par::map_batches_with(
+        horizon_core::par::threads(),
+        names,
+        128,
+        |k| {
             let mut list = Vec::new();
-            resolve(k, &raw, &mut list, 0);
-            (k.clone(), list)
-        })
-        .collect())
+            resolve(
+                k,
+                &raw,
+                &mut list,
+                &mut HashSet::new(),
+                &mut HashSet::new(),
+                0,
+            );
+            ((*k).clone(), list)
+        },
+        |(name, values)| {
+            lists.insert(name, values);
+        },
+    );
+    if let Some(cache) = cache {
+        let _ = cache.write_value(&lists);
+    }
+    Ok(lists)
 }
 /// An entity type id or `#tag` as the set of entity type ids it names.
 fn entity_spec(tags: &HashMap<String, HashSet<String>>, spec: &str) -> HashSet<String> {
@@ -461,131 +515,154 @@ impl Items {
         let raw: BTreeMap<String, Value> =
             serde_json::from_slice(&fs::read(root.join("items.json"))?)?;
         let entity_tags = load_tags(root, "entity_type")?;
+        let (items, order) = Self::decode_records(
+            raw,
+            &entity_tags,
+            block_for_item,
+            horizon_core::par::threads(),
+        );
+        Self::load_tables(root, items, order)
+    }
+
+    fn decode_records(
+        raw: BTreeMap<String, Value>,
+        entity_tags: &HashMap<String, HashSet<String>>,
+        block_for_item: &HashMap<&str, BlockStateId>,
+        threads: usize,
+    ) -> (HashMap<Arc<str>, ItemInfo>, Vec<Arc<str>>) {
         let mut items = HashMap::new();
         let mut order = Vec::new();
-        for (name, c) in &raw {
-            let id: Arc<str> = Arc::from(name.as_str());
-            let tool = c["minecraft:tool"]["rules"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .map(|r| ToolRule {
-                    blocks: match &r["blocks"] {
-                        Value::String(s) => vec![s.clone()],
-                        Value::Array(a) => a
-                            .iter()
-                            .filter_map(|v| v.as_str().map(str::to_owned))
-                            .collect(),
-                        _ => vec![],
-                    },
-                    speed: r["speed"].as_f64().map(|v| v as f32),
-                    correct: r["correct_for_drops"].as_bool(),
-                })
-                .collect();
-            let modifier = |kind: &str| -> f32 {
-                c["minecraft:attribute_modifiers"]
+        // Consume the sorted source without copying component documents. Only
+        // one batch of records and decoded results overlaps the finished table.
+        horizon_core::par::map_batches_with(
+            threads,
+            raw,
+            128,
+            |(name, c)| {
+                let id: Arc<str> = Arc::from(name.as_str());
+                let tool = c["minecraft:tool"]["rules"]
                     .as_array()
                     .into_iter()
                     .flatten()
-                    .filter(|m| {
-                        m["type"].as_str() == Some(kind)
-                            && m["operation"].as_str() == Some("add_value")
+                    .map(|r| ToolRule {
+                        blocks: match &r["blocks"] {
+                            Value::String(s) => vec![s.clone()],
+                            Value::Array(a) => a
+                                .iter()
+                                .filter_map(|v| v.as_str().map(str::to_owned))
+                                .collect(),
+                            _ => vec![],
+                        },
+                        speed: r["speed"].as_f64().map(|v| v as f32),
+                        correct: r["correct_for_drops"].as_bool(),
                     })
-                    .filter_map(|m| m["amount"].as_f64())
-                    .sum::<f64>() as f32
-            };
-            let food = c.get("minecraft:food").map(|f| {
-                (
-                    f["nutrition"].as_u64().unwrap_or(0) as u32,
-                    f["saturation"].as_f64().unwrap_or(0.0) as f32,
-                )
-            });
-            let can_always_eat = c
-                .get("minecraft:food")
-                .and_then(|f| f.get("can_always_eat"))
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let mut consume_effects = Vec::new();
-            if let Some(effects) = c
-                .get("minecraft:consumable")
-                .and_then(|cons| cons.get("on_consume_effects"))
-                .and_then(|e| e.as_array())
-            {
-                for effect in effects {
-                    match effect.get("type").and_then(|t| t.as_str()) {
-                        Some("minecraft:apply_effects") => {
-                            let probability = effect
-                                .get("probability")
-                                .and_then(|p| p.as_f64())
-                                .map_or(1.0, |p| p as f32);
-                            let mut specs = Vec::new();
-                            if let Some(list) = effect.get("effects").and_then(|l| l.as_array()) {
-                                for e in list {
-                                    if let Some(id) = e.get("id").and_then(|i| i.as_str()) {
-                                        let duration =
-                                            e.get("duration").and_then(|d| d.as_i64()).unwrap_or(0)
+                    .collect();
+                let modifier = |kind: &str| -> f32 {
+                    c["minecraft:attribute_modifiers"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter(|m| {
+                            m["type"].as_str() == Some(kind)
+                                && m["operation"].as_str() == Some("add_value")
+                        })
+                        .filter_map(|m| m["amount"].as_f64())
+                        .sum::<f64>() as f32
+                };
+                let food = c.get("minecraft:food").map(|f| {
+                    (
+                        f["nutrition"].as_u64().unwrap_or(0) as u32,
+                        f["saturation"].as_f64().unwrap_or(0.0) as f32,
+                    )
+                });
+                let can_always_eat = c
+                    .get("minecraft:food")
+                    .and_then(|f| f.get("can_always_eat"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let mut consume_effects = Vec::new();
+                if let Some(effects) = c
+                    .get("minecraft:consumable")
+                    .and_then(|cons| cons.get("on_consume_effects"))
+                    .and_then(|e| e.as_array())
+                {
+                    for effect in effects {
+                        match effect.get("type").and_then(|t| t.as_str()) {
+                            Some("minecraft:apply_effects") => {
+                                let probability = effect
+                                    .get("probability")
+                                    .and_then(|p| p.as_f64())
+                                    .map_or(1.0, |p| p as f32);
+                                let mut specs = Vec::new();
+                                if let Some(list) = effect.get("effects").and_then(|l| l.as_array())
+                                {
+                                    for e in list {
+                                        if let Some(id) = e.get("id").and_then(|i| i.as_str()) {
+                                            let duration = e
+                                                .get("duration")
+                                                .and_then(|d| d.as_i64())
+                                                .unwrap_or(0)
                                                 as i32;
-                                        let amplifier = e
-                                            .get("amplifier")
-                                            .and_then(|a| a.as_i64())
-                                            .unwrap_or(0)
-                                            as i32;
-                                        specs.push(ConsumeEffectSpec {
-                                            id: id.to_string(),
-                                            duration,
-                                            amplifier,
-                                        });
-                                    }
-                                }
-                            }
-                            consume_effects.push(ConsumeEffect::ApplyEffects {
-                                effects: specs,
-                                probability,
-                            });
-                        }
-                        Some("minecraft:clear_all_effects") => {
-                            consume_effects.push(ConsumeEffect::ClearAllEffects);
-                        }
-                        Some("minecraft:remove_effects") => {
-                            let mut targets = Vec::new();
-                            if let Some(eff) = effect.get("effects") {
-                                if let Some(s) = eff.as_str() {
-                                    targets.push(s.to_string());
-                                } else if let Some(arr) = eff.as_array() {
-                                    for item in arr {
-                                        if let Some(s) = item.as_str() {
-                                            targets.push(s.to_string());
+                                            let amplifier = e
+                                                .get("amplifier")
+                                                .and_then(|a| a.as_i64())
+                                                .unwrap_or(0)
+                                                as i32;
+                                            specs.push(ConsumeEffectSpec {
+                                                id: id.to_string(),
+                                                duration,
+                                                amplifier,
+                                            });
                                         }
                                     }
                                 }
+                                consume_effects.push(ConsumeEffect::ApplyEffects {
+                                    effects: specs,
+                                    probability,
+                                });
                             }
-                            consume_effects.push(ConsumeEffect::RemoveEffects(targets));
-                        }
-                        Some("minecraft:teleport_randomly") => {
-                            consume_effects.push(ConsumeEffect::TeleportRandomly(
-                                horizon_world::teleport_consume::TeleportConsume {
-                                    diameter: effect
-                                        .get("diameter")
-                                        .and_then(Value::as_f64)
-                                        .map_or(16.0, |d| d as f32),
-                                    directional_particles: effect
-                                        .get("directional_particles")
-                                        .and_then(Value::as_bool)
-                                        .unwrap_or(true),
-                                },
-                            ));
-                        }
-                        Some("minecraft:play_sound") => {
-                            if let Some(sound) = effect.get("sound").and_then(|s| s.as_str()) {
-                                consume_effects.push(ConsumeEffect::PlaySound(sound.to_string()));
+                            Some("minecraft:clear_all_effects") => {
+                                consume_effects.push(ConsumeEffect::ClearAllEffects);
                             }
+                            Some("minecraft:remove_effects") => {
+                                let mut targets = Vec::new();
+                                if let Some(eff) = effect.get("effects") {
+                                    if let Some(s) = eff.as_str() {
+                                        targets.push(s.to_string());
+                                    } else if let Some(arr) = eff.as_array() {
+                                        for item in arr {
+                                            if let Some(s) = item.as_str() {
+                                                targets.push(s.to_string());
+                                            }
+                                        }
+                                    }
+                                }
+                                consume_effects.push(ConsumeEffect::RemoveEffects(targets));
+                            }
+                            Some("minecraft:teleport_randomly") => {
+                                consume_effects.push(ConsumeEffect::TeleportRandomly(
+                                    horizon_world::teleport_consume::TeleportConsume {
+                                        diameter: effect
+                                            .get("diameter")
+                                            .and_then(Value::as_f64)
+                                            .map_or(16.0, |d| d as f32),
+                                        directional_particles: effect
+                                            .get("directional_particles")
+                                            .and_then(Value::as_bool)
+                                            .unwrap_or(true),
+                                    },
+                                ));
+                            }
+                            Some("minecraft:play_sound") => {
+                                if let Some(sound) = effect.get("sound").and_then(|s| s.as_str()) {
+                                    consume_effects
+                                        .push(ConsumeEffect::PlaySound(sound.to_string()));
+                                }
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 }
-            }
-            items.insert(
-                id.clone(),
                 ItemInfo {
                     fire_resistant: c["minecraft:damage_resistant"]["types"].as_str()
                         == Some("#minecraft:is_fire"),
@@ -640,11 +717,11 @@ impl Items {
                         .as_bool()
                         .unwrap_or(true),
                     equip_allowed: match &c["minecraft:equippable"]["allowed_entities"] {
-                        Value::String(spec) => Some(entity_spec(&entity_tags, spec)),
+                        Value::String(spec) => Some(entity_spec(entity_tags, spec)),
                         Value::Array(list) => Some(
                             list.iter()
                                 .filter_map(Value::as_str)
-                                .flat_map(|spec| entity_spec(&entity_tags, spec))
+                                .flat_map(|spec| entity_spec(entity_tags, spec))
                                 .collect(),
                         ),
                         _ => None,
@@ -717,10 +794,21 @@ impl Items {
                         .map(str::to_owned),
                     attack_damage: modifier("minecraft:attack_damage"),
                     attack_speed: modifier("minecraft:attack_speed"),
-                },
-            );
-            order.push(id);
-        }
+                }
+            },
+            |info| {
+                order.push(info.id.clone());
+                items.insert(info.id.clone(), info);
+            },
+        );
+        (items, order)
+    }
+
+    fn load_tables(
+        root: &Path,
+        items: HashMap<Arc<str>, ItemInfo>,
+        order: Vec<Arc<str>>,
+    ) -> Result<Self> {
         let mut loot = HashMap::new();
         // Every loot table, keyed by its id (blocks/stone, entities/sheep/white,
         // gameplay/chicken_lay, shearing/sheep/red...).
@@ -730,9 +818,14 @@ impl Items {
             namespace: &str,
             loot: &mut HashMap<String, Value>,
         ) -> Result<()> {
+            // Keep directory traversal and error selection in the original
+            // depth-first order. Flush file batches before descending, so a
+            // later directory error cannot hide an earlier malformed file.
+            let mut files = Vec::new();
             for entry in fs::read_dir(dir)?.flatten() {
                 let p = entry.path();
                 if p.is_dir() {
+                    read_loot(&mut files, loot)?;
                     walk_loot(&p, base, namespace, loot)?;
                 } else if p.extension().is_some_and(|e| e == "json") {
                     let id = p
@@ -740,13 +833,32 @@ impl Items {
                         .with_extension("")
                         .to_string_lossy()
                         .replace('\\', "/");
-                    loot.insert(
-                        format!("{namespace}:{id}"),
-                        serde_json::from_slice(&fs::read(&p)?)?,
-                    );
+                    files.push((format!("{namespace}:{id}"), p));
+                    if files.len() == 128 {
+                        read_loot(&mut files, loot)?;
+                    }
                 }
             }
-            Ok(())
+            read_loot(&mut files, loot)
+        }
+        fn read_loot(
+            files: &mut Vec<(String, std::path::PathBuf)>,
+            loot: &mut HashMap<String, Value>,
+        ) -> Result<()> {
+            horizon_core::par::try_map_batches_with(
+                horizon_core::par::threads(),
+                files.drain(..),
+                128,
+                |(id, path)| -> std::result::Result<_, String> {
+                    let bytes = fs::read(path).map_err(|e| e.to_string())?;
+                    let value: Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+                    Ok((id.clone(), value))
+                },
+                |(id, value)| {
+                    loot.insert(id, value);
+                },
+            )
+            .map_err(Into::into)
         }
         let loot_root = root.join("data/minecraft/loot_table");
         walk_loot(&loot_root, &loot_root, "minecraft", &mut loot)?;
@@ -758,13 +870,18 @@ impl Items {
             }
         }
         let registry_order = registry_order(root, &order);
+        let item_tag_order = load_tag_lists(root, "item")?;
+        let item_tags = item_tag_order
+            .iter()
+            .map(|(k, v)| (k.clone(), v.iter().cloned().collect()))
+            .collect();
         Ok(Self {
             items,
             order,
             registry_order,
             block_tags: load_tags(root, "block")?,
-            item_tags: load_tags(root, "item")?,
-            item_tag_order: load_tag_lists(root, "item")?,
+            item_tags,
+            item_tag_order,
             loot,
             songs: load_songs(root),
             enchantments: Arc::new(crate::enchant::Enchantments::load(root)),
@@ -777,13 +894,18 @@ impl Items {
     /// station rules and loot functions are built from), for tools that need
     /// tag membership.
     pub fn tags_only(root: &Path) -> Result<Self> {
+        let item_tag_order = load_tag_lists(root, "item")?;
+        let item_tags = item_tag_order
+            .iter()
+            .map(|(k, v)| (k.clone(), v.iter().cloned().collect()))
+            .collect();
         Ok(Self {
             items: HashMap::new(),
             order: Vec::new(),
             registry_order: Vec::new(),
             block_tags: load_tags(root, "block")?,
-            item_tags: load_tags(root, "item")?,
-            item_tag_order: load_tag_lists(root, "item")?,
+            item_tags,
+            item_tag_order,
             loot: HashMap::new(),
             songs: HashMap::new(),
             enchantments: Arc::new(crate::enchant::Enchantments::load(root)),
@@ -1793,6 +1915,139 @@ mod tests {
     use super::*;
     use horizon_core::random::LegacyRandom;
     use serde_json::json;
+
+    #[test]
+    fn parallel_records_preserve_catalog_order_mapping_and_components() {
+        let raw: BTreeMap<String, Value> = (0..259)
+            .rev()
+            .map(|i| (format!("fixture:item_{i:03}"), json!({
+                "minecraft:max_stack_size": i % 64 + 1,
+                "minecraft:max_damage": i * 3,
+                "minecraft:item_model": format!("fixture:model_{i}"),
+                "minecraft:equippable": {"slot": "head", "allowed_entities": "#fixture:wearers"},
+                "minecraft:tool": {"rules": [{"blocks": ["fixture:block"], "speed": 2.5}]},
+                "minecraft:food": {"nutrition": 3, "saturation": 0.5},
+                "minecraft:attribute_modifiers": [{"type": "minecraft:attack_damage", "amount": i}],
+                "minecraft:cooking_fuel": {"burn_time": i, "speed_multiplier": 1.0}
+            })))
+            .collect();
+        let tags = HashMap::from([(
+            "fixture:wearers".into(),
+            HashSet::from(["fixture:mob".into()]),
+        )]);
+        let blocks = HashMap::from([("fixture:item_003", BlockStateId(42))]);
+        let (expected, order) = Items::decode_records(raw.clone(), &tags, &blocks, 1);
+        assert_eq!(&*order[0], "fixture:item_000");
+        assert_eq!(&*order[258], "fixture:item_258");
+        assert_eq!(expected["fixture:item_003"].block, Some(BlockStateId(42)));
+        for threads in [2, 4, 6] {
+            let (actual, actual_order) =
+                Items::decode_records(raw.clone(), &tags, &blocks, threads);
+            assert_eq!(actual_order, order);
+            for id in &order {
+                let (a, e) = (&actual[id], &expected[id]);
+                assert_eq!(a.id, e.id);
+                assert_eq!(a.block, e.block);
+                assert_eq!(a.max_stack, e.max_stack);
+                assert_eq!(a.max_damage, e.max_damage);
+                assert_eq!(a.components, e.components);
+                assert_eq!(a.model, e.model);
+                assert_eq!(a.equip_allowed, e.equip_allowed);
+                assert_eq!(a.food, e.food);
+                assert_eq!(a.modifiers, e.modifiers);
+                assert_eq!(a.attack_damage, e.attack_damage);
+                assert_eq!(a.fuel, e.fuel);
+                assert_eq!(a.tool.len(), e.tool.len());
+                assert_eq!(a.tool[0].blocks, e.tool[0].blocks);
+                assert_eq!(a.tool[0].speed, e.tool[0].speed);
+            }
+        }
+    }
+
+    #[test]
+    fn nested_tags_keep_first_occurrence_order_and_bound_cycles() {
+        let root =
+            std::env::temp_dir().join(format!("horizon-item-tag-order-{}", std::process::id()));
+        let dir = root.join("data/minecraft/tags/item");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(root.join("horizon-mod-content.stamp"), "fixture").unwrap();
+        fs::write(
+            dir.join("a.json"),
+            r##"{"values":["minecraft:first","#minecraft:b","minecraft:last","minecraft:first"]}"##,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("b.json"),
+            r##"{"values":["minecraft:second","minecraft:first","#minecraft:a"]}"##,
+        )
+        .unwrap();
+        let lists = load_tag_lists(&root, "item").unwrap();
+        assert_eq!(lists, load_tag_lists(&root, "item").unwrap());
+        assert_eq!(
+            lists["minecraft:a"],
+            ["minecraft:first", "minecraft:second", "minecraft:last"]
+        );
+        assert_eq!(
+            lists["minecraft:b"],
+            ["minecraft:second", "minecraft:first", "minecraft:last"]
+        );
+        // Two references to a cycle used to expand a binary tree to depth 32.
+        fs::write(
+            dir.join("branch.json"),
+            r##"{"values":["#minecraft:branch","#minecraft:branch","minecraft:leaf"]}"##,
+        )
+        .unwrap();
+        assert_eq!(
+            load_tag_lists(&root, "item").unwrap()["minecraft:branch"],
+            ["minecraft:leaf"]
+        );
+        // A tag reached at the depth limit must still expand on a later,
+        // shallower visit. Keep the old walk's leaf order as well as membership.
+        for i in 0..31 {
+            let next = if i == 30 {
+                "tail".to_owned()
+            } else {
+                format!("chain{}", i + 1)
+            };
+            fs::write(
+                dir.join(format!("chain{i}.json")),
+                format!(r##"{{"values":["#minecraft:{next}"]}}"##),
+            )
+            .unwrap();
+        }
+        fs::write(
+            dir.join("tail.json"),
+            r##"{"values":["#minecraft:deep","minecraft:tail"]}"##,
+        )
+        .unwrap();
+        fs::write(dir.join("deep.json"), r#"{"values":["minecraft:deep"]}"#).unwrap();
+        fs::write(
+            dir.join("root.json"),
+            r##"{"values":["#minecraft:chain0","#minecraft:tail"]}"##,
+        )
+        .unwrap();
+        assert_eq!(
+            load_tag_lists(&root, "item").unwrap()["minecraft:root"],
+            ["minecraft:tail", "minecraft:deep"]
+        );
+        fs::write(dir.join("a.json"), r#"{"values":["minecraft:edited"]}"#).unwrap();
+        assert_eq!(
+            load_tag_lists(&root, "item").unwrap()["minecraft:a"],
+            ["minecraft:edited"]
+        );
+        fs::write(dir.join("new.json"), r#"{"values":["minecraft:added"]}"#).unwrap();
+        assert_eq!(
+            load_tag_lists(&root, "item").unwrap()["minecraft:new"],
+            ["minecraft:added"]
+        );
+        fs::remove_file(dir.join("new.json")).unwrap();
+        assert!(
+            !load_tag_lists(&root, "item")
+                .unwrap()
+                .contains_key("minecraft:new")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 
     fn ctx<'a>(
         items: &'a Items,

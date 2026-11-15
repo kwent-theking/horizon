@@ -2,6 +2,7 @@
 //! This supplies identities and default properties, not block behavior.
 mod facts;
 mod json;
+mod table_cache;
 use crate::{DATA_VERSION, chunk::BlockState, compression::invalid, nbt::Tag};
 pub use json::BlockStateJsonCodec;
 pub(crate) use json::java_integer;
@@ -23,6 +24,7 @@ pub struct BlockRegistry {
     /// States whose hash an earlier state already took (none in vanilla).
     collided: BTreeMap<BlockState, BlockStateId>,
     defaults: BTreeMap<String, BlockStateId>,
+    cache_identity: std::sync::OnceLock<[u8; 32]>,
 }
 /// The hash [`BlockRegistry`] indexes states by (fixed keys: the same in
 /// every process).
@@ -91,6 +93,7 @@ impl BlockRegistry {
             ids: HashMap::with_capacity(states.len()),
             collided: BTreeMap::new(),
             defaults: BTreeMap::new(),
+            cache_identity: std::sync::OnceLock::new(),
         };
         for (i, state) in states.into_iter().enumerate() {
             if result.id(&state).is_some() {
@@ -147,6 +150,11 @@ impl BlockRegistry {
     }
     pub fn default_state(&self, name: &str) -> Option<BlockStateId> {
         self.defaults.get(name).copied()
+    }
+    /// Stable digest of the complete state identity list, computed once for
+    /// derived resource caches. Defaults are deliberately not part of it.
+    pub fn cache_identity(&self) -> &[u8; 32] {
+        table_cache::identity(self)
     }
 
     /// The values `property` takes on `block`, in `Property.getPossibleValues`
@@ -261,8 +269,18 @@ pub struct BlockTableFile<'r> {
 impl<'r> BlockTableFile<'r> {
     /// [`Self::read`] of the file at `path`.
     pub fn open(path: &std::path::Path, registry: &'r BlockRegistry) -> io::Result<Self> {
+        let cache = table_cache::cache(path, registry);
+        if let Some(tag) = cache.as_ref().and_then(table_cache::read) {
+            return Ok(Self { tag, registry });
+        }
         let bytes = std::fs::read(path)?;
-        Self::read(&bytes, registry).map_err(|e| invalid(format!("{}: {e}", path.display())))
+        let file = Self::read(&bytes, registry)
+            .map_err(|e| invalid(format!("{}: {e}", path.display())))?;
+        drop(bytes);
+        if let Some(cache) = cache {
+            table_cache::write(&cache, &file.tag);
+        }
+        Ok(file)
     }
     /// Reads `bytes`, checking every `states` list of the root compound and
     /// of the compounds directly under it against `registry`.

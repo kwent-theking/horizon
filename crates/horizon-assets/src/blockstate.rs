@@ -73,7 +73,30 @@ fn ordered_object(raw: &RawValue) -> Result<Vec<(String, &RawValue)>> {
     }
     Ok(serde_json::Deserializer::from_str(raw.get()).deserialize_map(Ordered)?)
 }
+impl VariantSet {
+    fn replace_models(&mut self, replace: &mut impl FnMut(&str) -> Option<String>) {
+        let mut apply = |variant: &mut Variant| {
+            if let Some(model) = replace(&variant.model) {
+                variant.model = model;
+            }
+        };
+        match self {
+            Self::Single(variant) => apply(variant),
+            Self::Weighted(list) => list.iter_mut().for_each(|(variant, _)| apply(variant)),
+        }
+    }
+}
 impl BlockStateDefinition {
+    /// Point variants at other models: `replace` returns the new model of a
+    /// variant, or `None` to keep it.
+    pub fn replace_models(&mut self, mut replace: impl FnMut(&str) -> Option<String>) {
+        for (_, set) in self.variants.iter_mut().flatten() {
+            set.replace_models(&mut replace);
+        }
+        for selector in self.multipart.iter_mut().flatten() {
+            selector.variant.replace_models(&mut replace);
+        }
+    }
     pub fn from_json(text: &str) -> Result<Self> {
         let raw: &RawValue = serde_json::from_str(text.strip_prefix('\u{feff}').unwrap_or(text))?;
         validate_number_tokens(raw)?;

@@ -25,52 +25,22 @@ pub(super) fn content_root(
     enabled: &std::collections::BTreeSet<String>,
     dev: &[std::path::PathBuf],
 ) -> std::path::PathBuf {
-    use horizon_client::mod_content::{self, ContentMod};
-    use horizon_mods::{Capability, Content, Package};
+    use horizon_client::mod_content;
+    super::log_memory("mod content: begin");
     let here = std::env::current_dir().unwrap_or_default();
     let mut paths = horizon_mods::find(&here.join(mod_list::DIR));
     paths.retain(|p| !dev.contains(p));
     paths.extend(dev.iter().cloned());
-    let mut mods: Vec<ContentMod> = Vec::new();
-    for path in &paths {
-        let Ok(package) = Package::read(path) else {
-            continue;
-        };
-        let m = &package.manifest;
-        let on = enabled.contains(&m.id) || dev.contains(path);
-        if !on
-            || !m.capabilities.contains(&Capability::Registries)
-            || mods.iter().any(|c| c.id == m.id)
-        {
-            continue;
-        }
-        let content = Content::read(path, m).and_then(|content| {
-            // The first of two mods owning one namespace stays on.
-            let own = (m.id.as_str(), content.namespaces.as_slice());
-            match mods
-                .iter()
-                .find_map(|c| horizon_mods::content::clash((&c.id, &c.content.namespaces), own))
-            {
-                Some(e) => Err(e),
-                None => Ok(content),
-            }
-        });
-        match content {
-            Ok(content) => mods.push(ContentMod {
-                id: m.id.clone(),
-                content,
-            }),
-            Err(e) => log::warn!("Horizon: mod {} content not loaded: {e}", m.id),
-        }
-    }
-    match mod_content::resource_root(root, &mods, &here.join(".horizon-cache")) {
+    let content = match mod_content::installed_resource_root(
+        root,
+        &paths,
+        enabled,
+        dev,
+        &here.join(".horizon-cache"),
+    ) {
         Ok(out) => {
             if out != root {
-                log::info!(
-                    "Horizon: content from {} mod(s) in {}",
-                    mods.len(),
-                    out.display()
-                );
+                log::info!("Horizon: content in {}", out.display());
             }
             out
         }
@@ -78,7 +48,9 @@ pub(super) fn content_root(
             log::warn!("Horizon: content mods not loaded: {e}");
             root.to_owned()
         }
-    }
+    };
+    super::log_memory("mod content: ready");
+    content
 }
 
 /// A WebAssembly code mod's row on the Mods page.

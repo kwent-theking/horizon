@@ -321,10 +321,24 @@ impl Content {
                 ));
             }
         }
+        // One reader for every declaration: opening the archive per file re-reads its whole
+        // central directory (minutes for a mod with thousands of blocks).
+        let (blocks, items) = {
+            let mut reader = self.reader()?;
+            let mut read = |list: Vec<(String, String)>| -> Result<Vec<(String, String, Vec<u8>)>, String> {
+                let mut out = Vec::with_capacity(list.len());
+                for (id, name) in list {
+                    let bytes = reader.read(&name)?;
+                    out.push((id, name, bytes));
+                }
+                Ok(out)
+            };
+            (read(blocks)?, read(items)?)
+        };
         let mut ids = BTreeSet::new();
-        for (block, name) in blocks {
+        for (block, name, bytes) in blocks {
             let file: BlockFile =
-                serde_json::from_slice(&self.file(&name)?).map_err(|e| format!("{name}: {e}"))?;
+                serde_json::from_slice(&bytes).map_err(|e| format!("{name}: {e}"))?;
             check_block(&file).map_err(|e| format!("{name}: {e}"))?;
             if file.item {
                 ids.insert(block.clone());
@@ -336,9 +350,9 @@ impl Content {
                 item: file.item,
             });
         }
-        for (item, name) in items {
+        for (item, name, bytes) in items {
             let file: ItemFile =
-                serde_json::from_slice(&self.file(&name)?).map_err(|e| format!("{name}: {e}"))?;
+                serde_json::from_slice(&bytes).map_err(|e| format!("{name}: {e}"))?;
             if !vanilla_id(&file.template) {
                 return Err(format!(
                     "{name}: template {:?} is not a vanilla item (minecraft:...)",

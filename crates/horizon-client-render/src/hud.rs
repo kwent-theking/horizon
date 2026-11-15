@@ -151,6 +151,61 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
         }
     }
 }
+/// The folder a modded client's model dump copied its mobs' textures to
+/// (`<ns>/textures/...png`, horizon_client::mobs::modded); the full atlas packs
+/// them like the textures of mods with GeckoLib models.
+static MOD_ENTITY_TEXTURES: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+/// The longest side of a dumped texture the atlas takes: longer ones are
+/// animation strips or sheets.
+const MOD_ENTITY_TEXTURE_SIDE: u32 = 512;
+/// The texels of dumped textures the atlas takes at most (64 MiB of RGBA): an
+/// atlas that doesn't fit rolls the whole resource load back to the defaults.
+const MOD_ENTITY_TEXEL_BUDGET: u64 = 16 * 1024 * 1024;
+/// Where the model dump's textures are; set once, before the first atlas.
+pub fn set_mod_entity_textures(dir: PathBuf) {
+    let _ = MOD_ENTITY_TEXTURES.set(dir);
+}
+/// The dumped textures under `dir` within the limits, but not vanilla's own
+/// (the atlas has them) nor those the content root already gave `files`.
+fn dumped_entity_textures(dir: &Path, assets: &Path, files: &mut Vec<PathBuf>) {
+    let Ok(namespaces) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut found = Vec::new();
+    for ns in namespaces.flatten() {
+        if ns.file_name() != "minecraft" {
+            walk(&ns.path().join("textures"), &mut found);
+        }
+    }
+    found.sort();
+    let have: HashSet<PathBuf> = files.iter().cloned().collect();
+    let mut texels = 0u64;
+    for path in found {
+        let Ok(rel) = path.strip_prefix(dir) else {
+            continue;
+        };
+        let Some((w, h)) = png_size(&path) else {
+            continue;
+        };
+        if have.contains(&assets.join(rel))
+            || w > MOD_ENTITY_TEXTURE_SIDE
+            || h > MOD_ENTITY_TEXTURE_SIDE
+        {
+            continue;
+        }
+        texels += u64::from(w) * u64::from(h);
+        if texels > MOD_ENTITY_TEXEL_BUDGET {
+            log::warn!(
+                "Horizon: the modded entity textures in {} pass the atlas budget; the rest from {} \
+                 are left out",
+                dir.display(),
+                path.display()
+            );
+            break;
+        }
+        files.push(path);
+    }
+}
 /// A packed atlas image: sprite name, size and RGBA pixels.
 type PackedImage = (String, u32, u32, Vec<u8>);
 /// A frame of an animated strip at `x, y`, nearest-resampled to the longer
@@ -413,18 +468,58 @@ impl HudAtlas {
         for folder in folders {
             walk(&textures.join(folder), &mut files);
         }
+        // The entity textures of mods with GeckoLib models (assets/<ns>/geo),
+        // as `ns:entity/...` sprites: the mob renderer draws them from here.
+        let assets = root.join("assets");
+        if full && let Ok(namespaces) = fs::read_dir(&assets) {
+            for ns in namespaces.flatten() {
+                if ns.file_name() != "minecraft" && ns.path().join("geo").is_dir() {
+                    // Both folder spellings mods use (`gecko::resolve::TEXTURE_DIRS`).
+                    for folder in ["entity", "entities"] {
+                        walk(&ns.path().join("textures").join(folder), &mut files);
+                    }
+                }
+            }
+        }
+        // The textures a modded client's model dump copied for its Java-modelled
+        // mobs, as `ns:entity/...` sprites too.
+        let dumped = MOD_ENTITY_TEXTURES.get().filter(|_| full);
+        if let Some(dir) = dumped {
+            dumped_entity_textures(dir, &assets, &mut files);
+        }
+        // The sprites of mods' particle definitions (assets/<ns>/particles), as
+        // `ns:particle/...`; an oversized texture stays out of the atlas.
+        if full {
+            files.extend(
+                crate::particle_defs::texture_files(root)
+                    .into_iter()
+                    .filter(|p| png_size(p).is_some_and(|(w, h)| w <= 256 && h <= 256)),
+            );
+        }
         files.retain(|p| {
             let s = p.to_string_lossy();
             !s.contains("title/background") && !s.contains("realms") && !s.contains("presets")
         });
         type Decoded = (PackedImage, Option<TextureFlags>, Option<(u32, u32)>, bool);
         let decode_one = |path: &PathBuf| -> Option<Decoded> {
-            let name = path
-                .strip_prefix(&textures)
-                .ok()?
-                .with_extension("")
-                .to_string_lossy()
-                .replace('\\', "/");
+            let name = match path.strip_prefix(&textures) {
+                Ok(rel) => rel.with_extension("").to_string_lossy().replace('\\', "/"),
+                // assets/<ns>/textures/<rest> (or <ns>/textures/<rest> of the
+                // model dump's folder): a mod's sprite, `ns:<rest>`.
+                Err(_) => {
+                    let rel = path
+                        .strip_prefix(&assets)
+                        .ok()
+                        .or_else(|| dumped.and_then(|dir| path.strip_prefix(dir).ok()))?;
+                    let mut parts = rel.components();
+                    let ns = parts.next()?.as_os_str().to_string_lossy().into_owned();
+                    let rest = parts.as_path().strip_prefix("textures").ok()?;
+                    format!(
+                        "{ns}:{}",
+                        rest.with_extension("").to_string_lossy().replace('\\', "/")
+                    )
+                }
+            };
             let (mut w, mut h, pixels) = decode(path).ok()?;
             let mcmeta = fs::read_to_string(path.with_extension("png.mcmeta")).ok();
             let animation = mcmeta
@@ -1889,6 +1984,26 @@ mod tests {
         // The first frame is the left 16x16, not the whole row.
         assert_eq!(rect.texels((atlas.width, atlas.height)), (16, 16));
         assert_eq!(texel_at(&atlas, rect, 0, 0), [0, 255, 0, 255]);
+    }
+    #[test]
+    fn geckolib_mod_textures_under_entity_and_entities_both_reach_the_atlas() {
+        let root = std::env::temp_dir().join(format!("horizon-atlas-gecko-{}", std::process::id()));
+        let ns = root.join("assets/testmod");
+        for folder in ["entity", "entities"] {
+            fs::create_dir_all(ns.join("textures").join(folder)).unwrap();
+            write_strip(
+                &ns.join("textures").join(folder).join("beast.png"),
+                16,
+                16,
+                &[[9, 9, 9, 255]],
+                None,
+            );
+        }
+        fs::create_dir_all(ns.join("geo")).unwrap();
+        let atlas = HudAtlas::build(&root).unwrap();
+        let _ = fs::remove_dir_all(&root);
+        assert!(atlas.sprites.contains_key("testmod:entity/beast"));
+        assert!(atlas.sprites.contains_key("testmod:entities/beast"));
     }
     /// `count` images of `w x h`; layout reads only their sizes.
     fn sized(count: usize, w: u32, h: u32) -> Vec<PackedImage> {

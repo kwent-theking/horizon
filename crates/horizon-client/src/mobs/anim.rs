@@ -68,6 +68,10 @@ pub enum Anim {
     Ghast,
     Blaze,
     Strider,
+    /// A GeckoLib mob from a ported mod, posed by its own clips (mobs/gecko).
+    Gecko,
+    /// A mod's Java-modelled mob from a modded client's model dump (mobs/modded).
+    Modded,
     /// The humanoid model of the earlier simple renderer.
     Humanoid {
         zombie_arms: bool,
@@ -635,8 +639,18 @@ fn swim(p: &mut Poses, pos: f32, h: &Hum) {
         lerp(amount, x, 0.3 * (pos * 0.333_333_34).mcos()),
     );
 }
-/// Apply the mob's model animation to `p`.
+/// Apply the mob's model animation to `p`, then a player's animation overlay
+/// (`player_anim`: Iron's Spells casts, Better Combat attacks).
 pub fn setup(
+    m: &Mob,
+    s: &State,
+    p: &mut Poses,
+    w_anims: &HashMap<String, super::keyframes::Animation>,
+) {
+    setup_vanilla(m, s, p, w_anims);
+    crate::player_anim::apply_to_poses(m, s, p);
+}
+fn setup_vanilla(
     m: &Mob,
     s: &State,
     p: &mut Poses,
@@ -646,6 +660,8 @@ pub fn setup(
         return;
     }
     match m.kind.anim {
+        Anim::Gecko => super::gecko::animate(m, s, p),
+        Anim::Modded => super::modded::animate(m, s, p),
         Anim::Camel => super::camel::anim(m, s, p, w_anims),
         Anim::Breeze => super::breeze::anim(m, s, p, w_anims),
         Anim::Sniffer => super::sniffer::anim(m, s, p, w_anims),

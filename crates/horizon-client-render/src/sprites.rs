@@ -15,6 +15,42 @@ pub struct SpriteAnimation {
     frames: Arc<Vec<Vec<u8>>>,
     clip: Arc<AnimationClip>,
 }
+/// Pixel-free playback state, after frame mip chains have been uploaded.
+pub(crate) struct SpriteTiming {
+    pub layer: u32,
+    clip: Arc<AnimationClip>,
+}
+/// All original frames retained losslessly for renderer recreation.
+pub struct PackedSpriteAnimation {
+    layer: u32,
+    clip: Arc<AnimationClip>,
+    frames: Vec<crate::compact_bytes::CompactBytes>,
+}
+impl PackedSpriteAnimation {
+    pub fn new(animation: SpriteAnimation) -> Self {
+        Self {
+            layer: animation.layer,
+            clip: animation.clip,
+            frames: animation
+                .frames
+                .iter()
+                .map(|frame| crate::compact_bytes::CompactBytes::new(frame.clone()))
+                .collect(),
+        }
+    }
+    pub fn decode(&self) -> SpriteAnimation {
+        SpriteAnimation {
+            layer: self.layer,
+            clip: self.clip.clone(),
+            frames: Arc::new(
+                self.frames
+                    .iter()
+                    .map(|frame| frame.decode().into_owned())
+                    .collect(),
+            ),
+        }
+    }
+}
 /// What an animated sprite shows: `frame`, mixed `millis` thousandths of the
 /// way towards `next` (0 for a single frame).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,21 +67,12 @@ impl SpriteAnimation {
     /// `interpolate` mixes the frame with the next one by
     /// `(int)(subFrame / time * 1000)` thousandths; others show the frame.
     pub fn blend(&self, tick: u64) -> FrameBlend {
-        let sample = self.clip.sample(tick);
-        let frame = sample.frame as usize;
-        let next = sample.next_frame as usize;
-        if self.clip.interpolates() && sample.interpolation_millis > 0 && next != frame {
-            FrameBlend {
-                frame,
-                next,
-                millis: sample.interpolation_millis,
-            }
-        } else {
-            FrameBlend {
-                frame,
-                next: frame,
-                millis: 0,
-            }
+        blend(&self.clip, tick)
+    }
+    pub(crate) fn timing(&self) -> SpriteTiming {
+        SpriteTiming {
+            layer: self.layer,
+            clip: self.clip.clone(),
         }
     }
     pub fn resized_pixels(&self, frame: usize, width: u32, height: u32) -> Vec<u8> {
@@ -65,6 +92,29 @@ impl SpriteAnimation {
     }
     pub fn frame_count(&self) -> usize {
         self.frames.len()
+    }
+}
+impl SpriteTiming {
+    pub fn blend(&self, tick: u64) -> FrameBlend {
+        blend(&self.clip, tick)
+    }
+}
+fn blend(clip: &AnimationClip, tick: u64) -> FrameBlend {
+    let sample = clip.sample(tick);
+    let frame = sample.frame as usize;
+    let next = sample.next_frame as usize;
+    if clip.interpolates() && sample.interpolation_millis > 0 && next != frame {
+        FrameBlend {
+            frame,
+            next,
+            millis: sample.interpolation_millis,
+        }
+    } else {
+        FrameBlend {
+            frame,
+            next: frame,
+            millis: 0,
+        }
     }
 }
 
@@ -88,7 +138,7 @@ pub struct Sprites {
     /// Still textures by their pixels and mip settings: mods copy vanilla's
     /// textures under their own names, and one layer serves them all (the
     /// GPU's array may hold as few as 2048).
-    still: std::collections::HashMap<(Vec<u8>, u32, [u32; 2], [bool; 4]), u32>,
+    still: std::collections::HashMap<(Arc<Vec<Vec<u8>>>, u32, [u32; 2], [bool; 4]), u32>,
     /// Decoded textures kept on disk between launches ([`Sprites::with_disk_cache`]).
     disk: Option<crate::sprite_cache::SpriteCache>,
 }
@@ -166,16 +216,31 @@ impl Sprites {
         while size > SPRITE_SIZE && layers * u64::from(size * size) * 4 > MAX_ARRAY_BYTES {
             size /= 2;
         }
-        let mut resized = Vec::with_capacity(self.native.len());
         self.pixels.clear();
-        for (from, frames, initial) in &self.native {
-            let frames: Arc<Vec<Vec<u8>>> =
-                Arc::new(frames.iter().map(|f| resample(f, *from, size)).collect());
+        self.pixels
+            .reserve(self.native.len() * (size * size * 4) as usize);
+        let animations: BTreeMap<u32, usize> = self
+            .animations
+            .iter()
+            .enumerate()
+            .map(|(i, animation)| (animation.layer, i))
+            .collect();
+        for (layer, (from, frames, initial)) in self.native.iter().enumerate() {
+            // Native-size frames already have exactly the atlas texels. The
+            // cache, dedup key and animation can all share this immutable data.
+            let frames = if *from == size {
+                frames.clone()
+            } else if animations.contains_key(&(layer as u32)) {
+                Arc::new(frames.iter().map(|f| resample(f, *from, size)).collect())
+            } else {
+                // Only the initial frame of a nonanimated strip is ever drawn.
+                self.pixels.extend(resample(&frames[*initial], *from, size));
+                continue;
+            };
             self.pixels.extend_from_slice(&frames[*initial]);
-            resized.push(frames);
-        }
-        for animation in &mut self.animations {
-            animation.frames = resized[animation.layer as usize].clone();
+            if let Some(&i) = animations.get(&(layer as u32)) {
+                self.animations[i].frames = frames;
+            }
         }
         self.size = size;
     }
@@ -213,6 +278,27 @@ impl Sprites {
                 self.layers.insert(name.to_owned(), layer);
                 self.native.push((SPRITE_SIZE, Arc::new(vec![frame]), 0));
                 Ok(layer)
+            }
+        }
+    }
+    /// Decode the textures `names` that the disk cache lacks, in parallel,
+    /// into the cache. Failures are left for [`Sprites::insert`] to report.
+    pub fn prefetch<'a>(&mut self, root: &Path, names: impl IntoIterator<Item = &'a str>) {
+        const CHUNK: usize = 64;
+        let Some(disk) = &mut self.disk else {
+            return;
+        };
+        let mut seen = std::collections::HashSet::new();
+        let missing: Vec<&str> = names
+            .into_iter()
+            .filter(|name| disk.get(name).is_none() && seen.insert(*name))
+            .collect();
+        for chunk in missing.chunks(CHUNK) {
+            let decoded = crate::par::par_map(chunk, |name| Self::decode(root, name).ok());
+            for (name, decoded) in chunk.iter().zip(decoded) {
+                if let Some(decoded) = decoded {
+                    disk.insert(name, decoded);
+                }
             }
         }
     }
@@ -304,7 +390,7 @@ impl Sprites {
         let texture = texture_section(metadata.as_ref());
         Ok(crate::sprite_cache::Decoded {
             side,
-            frames,
+            frames: Arc::new(frames),
             animation: animation_text,
             strategy: texture
                 .as_ref()
@@ -353,7 +439,7 @@ impl Sprites {
         };
         let still = (animation.is_none() && frames.len() == 1).then(|| {
             (
-                frames[0].clone(),
+                frames.clone(),
                 side,
                 [
                     settings.strategy as u32,
@@ -369,7 +455,6 @@ impl Sprites {
         if let Some(key) = still {
             self.still.insert(key, layer);
         }
-        let frames = Arc::new(frames);
         let mut initial = 0;
         if let Some(clip) = animation
             .as_ref()
@@ -437,6 +522,108 @@ pub(crate) fn sprite_mipmap_limit(requested: u32, size: u32, minimum: u32, avail
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_animation_restores_all_frames_and_timings_without_retaining_raw_pixels() {
+        for interpolate in [false, true] {
+            let metadata =
+                format!(r#"{{"interpolate":{interpolate},"frames":[{{"index":1,"time":3}},0,1]}}"#);
+            let original = test_frames(
+                7,
+                vec![vec![0; 16 * 16 * 4], vec![255; 16 * 16 * 4]],
+                &metadata,
+            );
+            let expected_blends: Vec<_> = (0..30).map(|tick| original.blend(tick)).collect();
+            let weak = Arc::downgrade(&original.frames);
+            let timing = original.timing();
+            let packed = PackedSpriteAnimation::new(original);
+            assert!(weak.upgrade().is_none());
+            assert!(
+                packed
+                    .frames
+                    .iter()
+                    .all(|frame| frame.stored_len() < frame.len())
+            );
+            for _ in 0..2 {
+                let decoded = packed.decode();
+                assert_eq!(decoded.layer, 7);
+                assert_eq!(decoded.frame_count(), 2);
+                assert_eq!(decoded.pixels(0), vec![0; 16 * 16 * 4]);
+                assert_eq!(decoded.pixels(1), vec![255; 16 * 16 * 4]);
+                for (tick, expected) in expected_blends.iter().enumerate() {
+                    assert_eq!(decoded.blend(tick as u64), *expected);
+                    assert_eq!(timing.blend(tick as u64), *expected);
+                }
+            }
+        }
+    }
+
+    fn decoded(frames: Arc<Vec<Vec<u8>>>, animation: Option<&str>) -> crate::sprite_cache::Decoded {
+        crate::sprite_cache::Decoded {
+            side: 16,
+            frames,
+            animation: animation.map(str::to_owned),
+            strategy: crate::mipmap::Strategy::default(),
+            alpha_cutoff_bias: 0.0,
+            has_transparent: false,
+            opaque: true,
+            translucent: false,
+        }
+    }
+
+    #[test]
+    fn cache_registration_and_still_keys_share_pixels() {
+        let frames = Arc::new(vec![vec![255; 16 * 16 * 4]]);
+        let cache_entry = decoded(frames.clone(), None);
+        let mut sprites = Sprites::default();
+        sprites
+            .register("test:block/a", cache_entry.clone())
+            .unwrap();
+        assert!(Arc::ptr_eq(&frames, &sprites.native[0].1));
+        assert!(Arc::ptr_eq(
+            &frames,
+            &sprites.still.keys().next().unwrap().0
+        ));
+        // Equality is by texels, not Arc identity, even for separately decoded copies.
+        let copy = decoded(Arc::new((*frames).clone()), None);
+        assert_eq!(sprites.register("test:block/b", copy).unwrap(), 0);
+        sprites.finish();
+        assert_eq!(sprites.pixels, frames[0]);
+        assert_eq!(cache_entry.frames[0], frames[0]);
+    }
+
+    #[test]
+    fn finish_shares_native_animations_and_resamples_without_changing_frames() {
+        let frames = Arc::new(vec![vec![10; 16 * 16 * 4], vec![20; 16 * 16 * 4]]);
+        let mut sprites = Sprites::default();
+        sprites
+            .register(
+                "test:block/animated",
+                decoded(
+                    frames.clone(),
+                    Some(r#"{"frames":[1,0],"frametime":3,"interpolate":true}"#),
+                ),
+            )
+            .unwrap();
+        sprites.finish();
+        assert!(Arc::ptr_eq(&frames, &sprites.animations[0].frames));
+        assert_eq!(sprites.pixels, frames[1]);
+        // Adding a larger layer changes only resolution; frame order, timings,
+        // and every nearest-sampled texel remain those of the original frames.
+        sprites
+            .native
+            .push((32, Arc::new(vec![vec![30; 32 * 32 * 4]]), 0));
+        sprites.finish();
+        let animation = &sprites.animations[0];
+        for frame in 0..2 {
+            assert_eq!(animation.pixels(frame), resample(&frames[frame], 16, 32));
+        }
+        assert_eq!(animation.frame(0), 1);
+        assert_eq!(animation.frame(3), 0);
+        assert_eq!(animation.blend(1).millis, 333);
+        assert_eq!(&sprites.pixels[..32 * 32 * 4], animation.pixels(1));
+    }
+
     #[test]
     fn mipmap_option_keeps_real_16px_reductions() {
         for levels in 0..=4 {

@@ -68,8 +68,10 @@ pub(crate) fn prepare_with_models(
     sprites: &mut Sprites,
     models: &crate::model_library::ParsedModels,
 ) -> Result<PreparedModels> {
-    let facts: std::collections::BTreeMap<String, Value> =
-        serde_json::from_slice(&std::fs::read(root.join("model-states.json"))?)?;
+    let facts: std::collections::BTreeMap<String, crate::models::catalog::RawFact> =
+        serde_json::from_reader(std::io::BufReader::new(std::fs::File::open(
+            root.join("model-states.json"),
+        )?))?;
     let blocks: Vec<&str> = facts
         .keys()
         .filter(|name| registry.default_state(name).is_some())
@@ -122,6 +124,7 @@ pub fn load_visibility(
     use std::{collections::BTreeMap, fs};
     let file = BlockTableFile::open(&root.join("occlusion.nbt"), registry)?;
     let occlusion = CachedCollisionRegistry::from_table(file.table("occlusion")?)?;
+    drop(file);
     let raw: BTreeMap<String, Value> =
         serde_json::from_slice(&fs::read(root.join("render-definitions.json"))?)?;
     let definitions = raw

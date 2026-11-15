@@ -716,7 +716,7 @@ pub fn resources(tag: &str) -> PathBuf {
     resources_at(&version_dir(tag))
 }
 
-fn resources_at(dir: &Path) -> PathBuf {
+pub(crate) fn resources_at(dir: &Path) -> PathBuf {
     dir.join(".local/horizon-client").join(game_version_at(dir))
 }
 
@@ -1596,6 +1596,8 @@ pub enum MinecraftFrom {
     Install,
     /// Mojang, for the signed-in account that owns the game ("Download and prepare").
     Mojang,
+    /// An existing install only; never download Minecraft as a fallback.
+    LocalInstall,
 }
 
 /// Checks what the preparation needs and picks how to run it. PLAY.txt describes the same
@@ -1609,8 +1611,18 @@ pub fn preparer(
     from: MinecraftFrom,
     log: &dyn Fn(String),
 ) -> Result<(Preparer, PathBuf), String> {
-    let version = game_version(tag);
-    let dir = version_dir(tag);
+    preparer_at(&version_dir(tag), minecraft, from, log)
+}
+
+/// The same preparation for an isolated friends snapshot, outside the normal version list.
+pub(crate) fn preparer_at(
+    dir: &Path,
+    minecraft: &Path,
+    from: MinecraftFrom,
+    log: &dyn Fn(String),
+) -> Result<(Preparer, PathBuf), String> {
+    let version = game_version_at(dir);
+    let dir = dir.to_path_buf();
     let reused = horizon_prepare::artifacts::reuse_imported(&dir, &|line| log(line.to_string()))?;
     let chosen = minecraft.to_path_buf();
     // Resolved even when the game files are reused: the assets still come from the install.
@@ -1648,6 +1660,9 @@ pub fn preparer(
                     sources::Resolved::Folder(dir) => dir,
                     sources::Resolved::NotFound(checked) => {
                         let not_found = sources::not_found(&version, &checked, minecraft);
+                        if from == MinecraftFrom::LocalInstall {
+                            return Err(not_found);
+                        }
                         download_for_owner(&pins, &own, &fetch, log).map_err(|e| not_found + &e)?;
                         own
                     }

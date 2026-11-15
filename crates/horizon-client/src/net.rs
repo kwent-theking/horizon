@@ -1,4 +1,3 @@
-
 //! Multiplayer session: a network thread that connects to a server, logs in,
 //! runs the configuration phase and then forwards decoded play packets to the
 //! game thread. Keep-alives are answered on the network thread; pings wait for
@@ -7,6 +6,8 @@
 //! Online-mode servers need the Microsoft account the launcher signed in
 //! (crate::auth): the login joins the server through the session service and
 //! encrypts the connection (ClientHandshakePacketListenerImpl.handleHello).
+pub mod probe;
+
 use crate::auth::AuthSession;
 use horizon_protocol::{
     PROTOCOL_VERSION,
@@ -24,11 +25,26 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
-        mpsc::{Receiver, Sender, channel},
+        mpsc::{Receiver, Sender, SyncSender, channel, sync_channel},
     },
     thread::JoinHandle,
     time::Duration,
 };
+
+// The game keeps its unbounded queue; probes apply backpressure to cap retained events.
+trait EventSender: Send {
+    fn send(&self, event: Event) -> Result<(), std::sync::mpsc::SendError<Event>>;
+}
+impl EventSender for Sender<Event> {
+    fn send(&self, event: Event) -> Result<(), std::sync::mpsc::SendError<Event>> {
+        Sender::send(self, event)
+    }
+}
+impl EventSender for std::sync::mpsc::SyncSender<Event> {
+    fn send(&self, event: Event) -> Result<(), std::sync::mpsc::SendError<Event>> {
+        std::sync::mpsc::SyncSender::send(self, event)
+    }
+}
 
 /// `CommonListenerCookie.serverCookies`: cookies the server asked the client
 /// to store (`ClientboundStoreCookiePacket`), answered to
@@ -81,6 +97,11 @@ pub enum Event {
     /// `horizon:modsync` channel during configuration (how many).
     /// Phase 1 reports them; the game thread decides what to do.
     ModSync(usize),
+    /// Sable: a decoded sub-level pose snapshot from `sable:snapshot_packet`.
+    /// RU: декодированный снапшот поз суб-уровней Sable.
+    SableSnapshot(crate::sable::SableSnapshot),
+    /// A decoded player-animation payload (Iron's Spells, Better Combat).
+    PlayerAnim(crate::player_anim::AnimationNetEvent),
     /// The connection ended. `from_server`: the server gave the reason (or
     /// the connection was refused for good), rather than the connection
     /// failing (auto-reconnect retries only failures and shutdowns).
@@ -92,7 +113,7 @@ pub enum Event {
 
 pub struct Session {
     events: Receiver<Event>,
-    writer: Arc<Mutex<Option<ConnWriter>>>,
+    writer: Arc<Mutex<Option<NetworkWriter>>>,
     /// The connection is in configuration (else in play). Changed only
     /// with `writer` locked, as the packet that switches is sent.
     configuring: Arc<AtomicBool>,
@@ -115,6 +136,67 @@ pub struct Session {
     /// HORIZON_NET_DEBUG=1 logs every packet sent from the game thread.
     debug: bool,
 }
+
+enum WriterRequest {
+    Send(Vec<u8>, Sender<std::result::Result<(), String>>),
+    Shutdown(Sender<()>),
+}
+
+/// Synchronous FIFO proxy: callers retain their existing lock and completion
+/// semantics, while translation, framing and socket writes stay off the game
+/// thread. The zero-capacity queue bounds retained packets to the in-flight
+/// request and keeps ordering across every producer.
+struct NetworkWriter {
+    requests: SyncSender<WriterRequest>,
+    thread_id: std::thread::ThreadId,
+}
+
+impl NetworkWriter {
+    fn start(mut writer: ConnWriter) -> std::result::Result<Self, String> {
+        let (requests, inbox) = sync_channel(0);
+        let thread = std::thread::Builder::new()
+            .name("horizon-net-writer".into())
+            .spawn(move || {
+                while let Ok(request) = inbox.recv() {
+                    match request {
+                        WriterRequest::Send(body, reply) => {
+                            let _ = reply.send(writer.send(&body).map_err(|e| e.to_string()));
+                        }
+                        WriterRequest::Shutdown(reply) => {
+                            writer.shutdown();
+                            let _ = reply.send(());
+                            break;
+                        }
+                    }
+                }
+            })
+            .map_err(|e| e.to_string())?;
+        let thread_id = thread.thread().id();
+        drop(thread);
+        Ok(Self {
+            requests,
+            thread_id,
+        })
+    }
+
+    fn send(&mut self, body: &[u8]) -> std::result::Result<(), String> {
+        debug_assert_ne!(std::thread::current().id(), self.thread_id);
+        let (reply, result) = channel();
+        self.requests
+            .send(WriterRequest::Send(body.to_vec(), reply))
+            .map_err(|_| "network writer stopped".to_owned())?;
+        result
+            .recv()
+            .map_err(|_| "network writer stopped".to_owned())?
+    }
+
+    fn shutdown(&self) {
+        let (reply, result) = channel();
+        if self.requests.send(WriterRequest::Shutdown(reply)).is_ok() {
+            let _ = result.recv();
+        }
+    }
+}
 impl Session {
     /// Start connecting in the background, as `auth`'s account when there is one.
     pub fn connect(
@@ -134,6 +216,7 @@ impl Session {
             None,
             None,
             resources,
+            None,
         )
     }
     /// `ConnectScreen.startConnecting` for a `transfer`: the cookies the
@@ -156,6 +239,7 @@ impl Session {
             None,
             Some(cookies),
             resources,
+            None,
         )
     }
     /// Join an integrated server through memory (`Connection.connectToLocalServer`).
@@ -175,6 +259,7 @@ impl Session {
             Some(pipe),
             None,
             resources,
+            None,
         )
     }
     fn start(
@@ -186,8 +271,15 @@ impl Session {
         local: Option<horizon_protocol::connection::Pipe>,
         cookies: Option<Cookies>,
         resources: PathBuf,
+        probe: Option<Arc<Mutex<probe::Summary>>>,
     ) -> Self {
-        let (send, events) = channel();
+        let (send, events): (Box<dyn EventSender>, Receiver<Event>) = if probe.is_some() {
+            let (send, events) = std::sync::mpsc::sync_channel(32);
+            (Box::new(send), events)
+        } else {
+            let (send, events) = channel();
+            (Box::new(send), events)
+        };
         let writer = Arc::new(Mutex::new(None));
         let configuring = Arc::new(AtomicBool::new(true));
         let counters = Arc::new(Mutex::new(None));
@@ -214,7 +306,7 @@ impl Session {
                     if let Some((protocol, name)) = probe_server_version(&address_owned) {
                         *thread_probed.lock().unwrap() = Some((protocol, name.clone()));
                         status(
-                            &send,
+                            &*send,
                             &format!(
                                 "ViaHorizonPlus: server runs {name} (protocol {protocol}), \
                                  Horizon speaks 26.3 (777). Translation is being prepared."
@@ -222,6 +314,10 @@ impl Session {
                         );
                     }
                 }
+                // Read before the call: a guard made in its arguments would
+                // hold the lock for the whole connection, and the game's own
+                // reads of `probed` (server_states) would block forever.
+                let probed_protocol = thread_probed.lock().unwrap().as_ref().map(|&(p, _)| p);
                 let result = run(
                     local,
                     &address_owned,
@@ -229,7 +325,7 @@ impl Session {
                     auth.as_deref(),
                     view_distance,
                     &lang,
-                    &send,
+                    &*send,
                     &thread_writer,
                     &thread_configuring,
                     &thread_counters,
@@ -238,8 +334,9 @@ impl Session {
                     // Speak the server's protocol in the handshake, as
                     // ViaHorizonPlus does: fake our version to match the probe.
                     // RU: подмена версии в handshake на пробленную протокол-версию.
-                    thread_probed.lock().unwrap().as_ref().map(|&(p, _)| p),
+                    probed_protocol,
                     &resources,
+                    probe.as_deref(),
                 );
                 let from_server = result.is_ok();
                 let reason = result.unwrap_or_else(|e| e);
@@ -291,11 +388,12 @@ impl Session {
         if self.configuring.load(Ordering::Relaxed) {
             return;
         }
-        // No id rewrite here: ConnWriter.send routes every packet through
-        // the active translation (see horizon_protocol::translation).
-        /// / RU: id здесь не трогаем - ConnWriter.send пропускает каждый
-        /// пакет через активную трансляцию.
-        if let Some(w) = writer.as_mut() && w.send(&packet.encode()).is_err() {
+        // The writer worker routes every body through the active translation
+        // before framing it. Completion remains synchronous to preserve phase
+        // gating and the existing lock ordering.
+        if let Some(w) = writer.as_mut()
+            && w.send(&packet.encode()).is_err()
+        {
             w.shutdown();
         }
     }
@@ -396,7 +494,7 @@ pub fn save_friends_relay(relay: &str) {
 
 /// Reach the friend's world from the code (directly, or through a relay)
 /// and open the tunnel: the loopback address to connect to.
-fn join_friend(code: &str, send: &Sender<Event>) -> Result<(String, u16), String> {
+fn join_friend(code: &str, send: &dyn EventSender) -> Result<(String, u16), String> {
     use horizon_friends::{
         PathMode,
         guest::{self, GuestConfig},
@@ -422,7 +520,7 @@ fn join_friend(code: &str, send: &Sender<Event>) -> Result<(String, u16), String
     Ok(("127.0.0.1".to_owned(), port))
 }
 
-fn status(send: &Sender<Event>, text: &str) {
+fn status(send: &dyn EventSender, text: &str) {
     let _ = send.send(Event::Status(text.to_owned()));
 }
 
@@ -443,14 +541,15 @@ fn run(
     auth: Option<&AuthSession>,
     view_distance: i8,
     lang: &Language,
-    send: &Sender<Event>,
-    shared_writer: &Mutex<Option<ConnWriter>>,
+    send: &dyn EventSender,
+    shared_writer: &Mutex<Option<NetworkWriter>>,
     configuring: &AtomicBool,
     shared_counters: &Mutex<Option<Arc<Counters>>>,
     cookies: &Cookies,
     transferred: bool,
     probed_protocol: Option<i32>,
     resources: &Path,
+    probe: Option<&Mutex<probe::Summary>>,
 ) -> Result<String, String> {
     let (host, port, mut c) = if let Some(pipe) = local {
         (address.to_owned(), 0, Connection::local(pipe))
@@ -512,6 +611,7 @@ fn run(
     .map_err(e)?;
     let profile = loop {
         let (id, payload) = c.recv().map_err(e)?;
+        probe::received(probe, horizon_protocol::State::Login, id);
         // 767 (1.21.x) login success is [uuid][name][properties], while
         // 26.x writes [name][uuid][properties][session uuid]: decode the
         // old order by hand when we speak the probed 767 protocol.
@@ -534,6 +634,7 @@ fn run(
         }
         let len = payload.len();
         let decoded_login = login::Clientbound::decode(id, &payload).map_err(|err| {
+            probe::decode_error(probe, horizon_protocol::State::Login, id, &err.to_string());
             let msg = format!("login packet {id} ({len} bytes): {err}");
             e(horizon_protocol::Error::new(msg))
         })?;
@@ -548,6 +649,9 @@ fn run(
                 let reason = serde_json::from_str::<serde_json::Value>(&p.reason_json)
                     .map(|v| json_text(&v, lang))
                     .unwrap_or(p.reason_json);
+                if let Some(summary) = probe {
+                    summary.lock().unwrap().kick(reason.clone());
+                }
                 return Ok(reason);
             }
             login::Clientbound::Hello(hello) => {
@@ -626,6 +730,9 @@ fn run(
         }
     };
     status(send, "Joining world...");
+    if probed_protocol == Some(767) {
+        load_server_codec_trees();
+    }
     let mut info_packet =
         cfg::Serverbound::ClientInformation(cfg::ClientInformation::new(view_distance)).encode();
     if probed_protocol == Some(767) {
@@ -646,7 +753,7 @@ fn run(
     )
     .map_err(e)?;
     let (mut reader, writer) = c.split();
-    *shared_writer.lock().unwrap() = Some(writer);
+    *shared_writer.lock().unwrap() = Some(NetworkWriter::start(writer)?);
     let registries = configure(
         &mut reader,
         shared_writer,
@@ -656,6 +763,7 @@ fn run(
         cookies,
         resources,
         probed_protocol,
+        probe,
     )?;
     let _ = send.send(Event::Joined {
         registries: Arc::new(registries),
@@ -687,27 +795,59 @@ fn run(
         cookies,
         resources,
         probed_protocol,
+        probe,
     )
 }
 
 fn receive_play(
     reader: &mut ConnReader,
-    shared_writer: &Mutex<Option<ConnWriter>>,
+    shared_writer: &Mutex<Option<NetworkWriter>>,
     configuring: &AtomicBool,
     lang: &Language,
-    send: &Sender<Event>,
+    send: &dyn EventSender,
     cookies: &Cookies,
     resources: &Path,
     probed_protocol: Option<i32>,
+    probe: Option<&Mutex<probe::Summary>>,
 ) -> Result<String, String> {
     let mut register_sent = false;
+    // Packet decoding already runs on this network thread. Keep a low-noise
+    // aggregate available for profiling before considering more concurrency.
+    // Averages and maxima are reported every ten seconds only when requested.
+    let timing = std::env::var_os("HORIZON_NET_TIMING").is_some();
+    let mut timing_window = std::time::Instant::now();
+    let mut decode_count = 0u64;
+    let mut decode_total = Duration::ZERO;
+    let mut decode_max = Duration::ZERO;
     loop {
         let (id, payload) = reader.recv().map_err(|e| e.to_string())?;
         // The id is already native: the ingress gateway in ConnReader.recv
         // applied the active translation when the frame was split.
         /// / RU: id уже родной - входящий шлюз в ConnReader.recv применил
         /// активную трансляцию при разборе кадра.
-        let packet = match play::Clientbound::decode(id, &payload) {
+        probe::received(probe, horizon_protocol::State::Play, id);
+        let decode_started = timing.then(std::time::Instant::now);
+        let decoded = play::Clientbound::decode(id, &payload);
+        if let Some(started) = decode_started {
+            let elapsed = started.elapsed();
+            decode_count += 1;
+            decode_total += elapsed;
+            decode_max = decode_max.max(elapsed);
+            if timing_window.elapsed() >= Duration::from_secs(10) {
+                if decode_count != 0 {
+                    log::debug!(
+                        "Horizon net decode: {decode_count} packets, avg {:?}, max {:?} in 10s",
+                        decode_total / decode_count.min(u32::MAX as u64) as u32,
+                        decode_max
+                    );
+                }
+                timing_window = std::time::Instant::now();
+                decode_count = 0;
+                decode_total = Duration::ZERO;
+                decode_max = Duration::ZERO;
+            }
+        }
+        let packet = match decoded {
             Ok(p) => p,
             Err(err) => {
                 let name = horizon_protocol::ids::name(
@@ -716,6 +856,7 @@ fn receive_play(
                     id,
                 )
                 .unwrap_or("?");
+                probe::decode_error(probe, horizon_protocol::State::Play, id, &err.to_string());
                 let _ = send.send(Event::DecodeError(format!("{name}: {err}")));
                 if name == "level_chunk_with_light" {
                     log::warn!("ViaHorizonPlus: chunk body transform failed: {err}");
@@ -723,6 +864,9 @@ fn receive_play(
                 continue;
             }
         };
+        if let Some(summary) = probe {
+            summary.lock().unwrap().play(&packet);
+        }
         let reply = |p: play::Serverbound| {
             if let Some(w) = shared_writer.lock().unwrap().as_mut() {
                 let _ = w.send(&p.encode());
@@ -738,7 +882,7 @@ fn receive_play(
         /// конфигурации и рвала соединение).
         if !register_sent {
             register_sent = true;
-            let channels = format!("{}\0", crate::modsync::CHANNEL);
+            let channels = format!("{}\0{}\0", crate::modsync::CHANNEL, crate::sable::CHANNEL);
             let body = play::Serverbound::CustomPayload(cfg::CustomPayload {
                 channel: "minecraft:register".into(),
                 data: channels.into_bytes(),
@@ -794,10 +938,14 @@ fn receive_play(
                 /// to wire 8 directly; the normal reply path is correct.
                 /// / RU: egress-таблица теперь переводит 777 id 11 в wire 8;
                 /// обычный путь ответа корректен.
-                reply(play::Serverbound::ChunkBatchReceived(play::ChunkBatchReceived {
-                    chunks_per_tick: 25.0,
-                }));
-                log::info!("ViaHorizonPlus: chunk batch finished - acknowledged (25 chunks/tick, raw wire 8)");
+                reply(play::Serverbound::ChunkBatchReceived(
+                    play::ChunkBatchReceived {
+                        chunks_per_tick: 25.0,
+                    },
+                ));
+                log::info!(
+                    "ViaHorizonPlus: chunk batch finished - acknowledged (25 chunks/tick, raw wire 8)"
+                );
             }
             play::Clientbound::BundleDelimiter(_) => {}
             play::Clientbound::ResourcePackPush(p) => {
@@ -829,6 +977,7 @@ fn receive_play(
                     cookies,
                     resources,
                     probed_protocol,
+                    probe,
                 )?;
                 // Back in play: the translation takes over again.
                 // / RU: снова play - трансляция включается.
@@ -899,15 +1048,50 @@ fn receive_play(
             play::Clientbound::CustomPayload(p) if p.channel == "minecraft:brand" => {
                 receive_brand(&p, send);
             }
+            // Sable snapshot: sub-level pose updates (position, rotation, pivot).
+            // RU: снапшоты Sable — позы суб-уровней (позиция, вращение, пивот).
+            play::Clientbound::CustomPayload(p) if p.channel == crate::sable::CHANNEL => {
+                match crate::sable::decode_snapshot(&p.data) {
+                    Ok(snap) => {
+                        log::info!(
+                            "Sable snapshot: tick={}, {} entries",
+                            snap.interpolation_tick,
+                            snap.entries.len()
+                        );
+                        let _ = send.send(Event::SableSnapshot(snap));
+                    }
+                    Err(e) => {
+                        log::warn!("Sable snapshot decode failed: {e}");
+                    }
+                }
+            }
+            play::Clientbound::CustomPayload(p)
+                if crate::player_anim::is_animation_channel(&p.channel) =>
+            {
+                match crate::player_anim::decode(&p.channel, &p.data) {
+                    Ok(Some(event)) => {
+                        let _ = send.send(Event::PlayerAnim(event));
+                    }
+                    Ok(None) => {}
+                    Err(e) => log::warn!("Player animation payload: {e}"),
+                }
+            }
             play::Clientbound::CustomPayload(p) => {
-                log::info!("CustomPayload(diag): channel {} ({} bytes)", p.channel, p.data.len());
+                log::info!(
+                    "CustomPayload(diag): channel {} ({} bytes)",
+                    p.channel,
+                    p.data.len()
+                );
             }
             // ModSync in the play state: Paper's plugin messenger delivers
             // server->client plugin messages here, so the same binary format
             // as the configuration-phase channel is parsed again.
             // RU: ModSync в play-фазе — Paper-мессенджер шлёт сюда.
             play::Clientbound::CustomPayload(p) if p.channel == crate::modsync::CHANNEL => {
-                log::info!("ModSync: play-state payload received ({} bytes)", p.data.len());
+                log::info!(
+                    "ModSync: play-state payload received ({} bytes)",
+                    p.data.len()
+                );
                 match crate::modsync::decode(&p.data) {
                     Ok(sync) => {
                         let names: Vec<String> = sync
@@ -924,8 +1108,8 @@ fn receive_play(
                         let _ = send.send(Event::ModSync(sync.blocks.len()));
                     }
                     Err(e) => {
-                        let _ = send
-                            .send(Event::Status(format!("ModSync: malformed payload ({e})")));
+                        let _ =
+                            send.send(Event::Status(format!("ModSync: malformed payload ({e})")));
                     }
                 }
             }
@@ -936,22 +1120,33 @@ fn receive_play(
                 // RU: Paper шлёт store cookie с configuration-id в play.
                 if let play::Clientbound::Unknown(id, payload) = &other {
                     if *id == horizon_protocol::ids::configuration::clientbound::STORE_COOKIE {
-                        if let Ok(p) = <cfg::StoreCookie as horizon_protocol::buf::Codec<cfg::StoreCookie>>::read(
-                            &mut horizon_protocol::buf::Reader::new(payload),
+                        if let Ok(p) = <cfg::StoreCookie as horizon_protocol::buf::Codec<
+                            cfg::StoreCookie,
+                        >>::read(
+                            &mut horizon_protocol::buf::Reader::new(payload)
                         ) {
                             if p.key == crate::modsync::CHANNEL {
-                                log::info!("ModSync: config-id StoreCookie received ({} bytes)", p.payload.len());
+                                log::info!(
+                                    "ModSync: config-id StoreCookie received ({} bytes)",
+                                    p.payload.len()
+                                );
                                 match crate::modsync::decode(&p.payload) {
                                     Ok(sync) => {
-                                        let names: Vec<String> = sync.blocks.iter().take(10)
-                                            .map(|(ns, path, _)| format!("{ns}:{path}")).collect();
+                                        let names: Vec<String> = sync
+                                            .blocks
+                                            .iter()
+                                            .take(10)
+                                            .map(|(ns, path, _)| format!("{ns}:{path}"))
+                                            .collect();
                                         let _ = send.send(Event::Status(format!(
                                             "ModSync: received {} content blocks from the server ({})",
                                             sync.blocks.len(), names.join(", "))));
                                         let _ = send.send(Event::ModSync(sync.blocks.len()));
                                     }
                                     Err(e) => {
-                                        let _ = send.send(Event::Status(format!("ModSync: malformed payload ({e})")));
+                                        let _ = send.send(Event::Status(format!(
+                                            "ModSync: malformed payload ({e})"
+                                        )));
                                     }
                                 }
                             }
@@ -959,6 +1154,16 @@ fn receive_play(
                             continue;
                         }
                     }
+                }
+                if probe.is_some()
+                    && !matches!(
+                        other,
+                        play::Clientbound::PlayerPosition(_)
+                            | play::Clientbound::Ping(_)
+                            | play::Clientbound::Login(_)
+                    )
+                {
+                    continue;
                 }
                 if send.send(Event::Packet(Box::new(other))).is_err() {
                     return Ok("Disconnected".into());
@@ -972,13 +1177,14 @@ fn receive_play(
 /// server finishes it (ClientConfigurationPacketListenerImpl).
 fn configure(
     reader: &mut ConnReader,
-    writer: &Mutex<Option<ConnWriter>>,
+    writer: &Mutex<Option<NetworkWriter>>,
     configuring: &AtomicBool,
     lang: &Language,
-    send: &Sender<Event>,
+    send: &dyn EventSender,
     cookies: &Cookies,
     resources: &Path,
     probed: Option<i32>,
+    probe: Option<&Mutex<probe::Summary>>,
 ) -> Result<Dynamic, String> {
     let mut registries = Dynamic::default();
     let reply = |p: cfg::Serverbound| -> Result<(), String> {
@@ -991,11 +1197,15 @@ fn configure(
     loop {
         let (id, payload) = reader.recv().map_err(|e| e.to_string())?;
         // 767 configuration packet ids differ from 777 from transfer on:
-        // 767 has no post_effects, so every id >= 0x0B (transfer) is one less
+        // 767 has no post_effects, so every id >= 0x0A (store_cookie) is one less
         // than the 777 id. Remap before decoding with the 777 tables.
-        // / RU: id 767 начиная с transfer сдвинуты на один - у 767 нет
+        // / RU: id 767 начиная с store_cookie сдвинуты на один - у 767 нет
         // post_effects. Ремапим перед декодом 777-таблицами.
-        let id = if probed == Some(767) && id >= 0x0B { id + 1 } else { id };
+        let id = if probed == Some(767) && id >= 0x0A {
+            id + 1
+        } else {
+            id
+        };
         // The live 265 wire puts the configuration ping on id 3 (4 bytes,
         /// [Int 0]) and a keep-alive-looking long packet on id 2; neither
         /// maps through the 777 tables. Answer both so the server's
@@ -1003,9 +1213,16 @@ fn configure(
         /// / RU: живой 265 шлёт конфиг-пинг на id 3 ([Int 0]) и
         /// keep-alive-подобный пакет на id 2 - отвечаем на оба, иначе
         /// рукопожатие сервера встаёт.
+        probe::received(probe, horizon_protocol::State::Configuration, id);
         let decoded = match cfg::Clientbound::decode(id, &payload) {
             Ok(p) => p,
             Err(err) => {
+                probe::decode_error(
+                    probe,
+                    horizon_protocol::State::Configuration,
+                    id,
+                    &err.to_string(),
+                );
                 log::warn!(
                     "ViaHorizonPlus: skipped undecodable config packet {id}: {err}; head {:02X?}",
                     payload.iter().take(16)
@@ -1016,6 +1233,9 @@ fn configure(
         match decoded {
             cfg::Clientbound::KeepAlive(k) => reply(cfg::Serverbound::KeepAlive(k))?,
             cfg::Clientbound::CustomPayload(p) if p.channel == crate::content_identity::CHANNEL => {
+                if probe.is_some() {
+                    return Err("server requires prepared content identity; asset-free probe cannot provide it".into());
+                }
                 let hash = crate::content_identity::identity(resources)
                     .map_err(|_| crate::content_identity::MISMATCH.to_string())?;
                 reply(cfg::Serverbound::CustomPayload(cfg::CustomPayload {
@@ -1043,7 +1263,8 @@ fn configure(
                         let _ = send.send(Event::ModSync(payload.blocks.len()));
                     }
                     Err(e) => {
-                        let _ = send.send(Event::Status(format!("ModSync: malformed payload ({e})")));
+                        let _ =
+                            send.send(Event::Status(format!("ModSync: malformed payload ({e})")));
                     }
                 }
             }
@@ -1078,7 +1299,8 @@ fn configure(
                     buf_ext::write_varint_out(count, &mut data);
                     for _c in 0..count {
                         let id = buf_ext::read_string_at(q, &mut pos).unwrap_or_default();
-                        let version = buf_ext::read_string_at(q, &mut pos).unwrap_or_else(|| "1".into());
+                        let version =
+                            buf_ext::read_string_at(q, &mut pos).unwrap_or_else(|| "1".into());
                         buf_ext::write_varint_out(id.len() as i32, &mut data);
                         data.extend_from_slice(id.as_bytes());
                         buf_ext::write_varint_out(version.len() as i32, &mut data);
@@ -1101,7 +1323,9 @@ fn configure(
                     data,
                 }))?;
             }
-            cfg::Clientbound::CustomPayload(p) if p.channel == "neoforge:known_registry_data_maps" => {
+            cfg::Clientbound::CustomPayload(p)
+                if p.channel == "neoforge:known_registry_data_maps" =>
+            {
                 // Mirror every data map the server listed (mandatory ones
                 // included) back as known: the Horizon client learns the
                 // maps from the server payload itself, so the check passes.
@@ -1140,9 +1364,11 @@ fn configure(
                     data,
                 }))?;
             }
-            cfg::Clientbound::CustomPayload(p) if p.channel == "bettercombat:config_sync"
-                || p.channel == "bettercombat:weapon_registry" =>
+            cfg::Clientbound::CustomPayload(p)
+                if p.channel == "bettercombat:config_sync"
+                    || p.channel == "bettercombat:weapon_registry" =>
             {
+                crate::player_anim::retain_better_combat_config(&p.channel, &p.data);
                 // Better Combat handshake: every config payload is answered
                 // with an Ack on `bettercombat:ack` whose code is the
                 // channel that was received - that is what completes the
@@ -1187,7 +1413,34 @@ fn configure(
                     p.data.len()
                 );
             }
-            cfg::Clientbound::CustomPayload(p) if p.channel == "neoforge:frozen_registry_sync_completed" => {
+            cfg::Clientbound::CustomPayload(p) if p.channel == "neoforge:frozen_registry" => {
+                // NeoForge frozen registry sync: one packet per registry.
+                // Append each to the dump file for offline analysis.
+                // RU: синхронизация frozen-реестров NeoForge: один пакет на
+                // реестр. Дописываем каждый в дамп-файл для оффлайн-анализа.
+                if probe.is_some() {
+                    continue;
+                }
+                let dump_path = std::path::Path::new("frozen_registry_dump.bin");
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(dump_path)
+                {
+                    let len = p.data.len() as u32;
+                    let _ = f.write_all(&len.to_le_bytes());
+                    let _ = f.write_all(&p.data);
+                    log::info!(
+                        "frozen_registry dumped: {} bytes (total file: {})",
+                        p.data.len(),
+                        std::fs::metadata(dump_path).map(|m| m.len()).unwrap_or(0)
+                    );
+                }
+            }
+            cfg::Clientbound::CustomPayload(p)
+                if p.channel == "neoforge:frozen_registry_sync_completed" =>
+            {
                 // The real NeoForge client applies the frozen registry
                 // snapshots and answers with the same empty payload to
                 // finish the SyncRegistries task. Horizon keeps the data for
@@ -1265,12 +1518,24 @@ fn configure(
                 });
                 return Err(tr(lang, "disconnect.transfer"));
             }
-            cfg::Clientbound::Disconnect(d) => return Err(plain(&d.reason, lang)),
+            cfg::Clientbound::Disconnect(d) => {
+                if let Some(summary) = probe {
+                    summary.lock().unwrap().kick(plain(&d.reason, lang));
+                }
+                return Err(plain(&d.reason, lang));
+            }
             cfg::Clientbound::FinishConfiguration(_) => {
                 let mut w = writer.lock().unwrap();
                 let w = w.as_mut().ok_or("Disconnected")?;
                 w.send(&cfg::Serverbound::FinishConfiguration(Empty).encode())
                     .map_err(|e| e.to_string())?;
+                // Activate under the writer lock, before play sends are
+                // released: a send in this window would go out untranslated.
+                if probed == Some(767) {
+                    horizon_protocol::translation::activate(
+                        horizon_protocol::translation::p767::translation(),
+                    );
+                }
                 configuring.store(false, Ordering::Relaxed);
                 return Ok(registries);
             }
@@ -1279,7 +1544,7 @@ fn configure(
     }
 }
 
-fn receive_brand(payload: &cfg::CustomPayload, send: &Sender<Event>) {
+fn receive_brand(payload: &cfg::CustomPayload, send: &dyn EventSender) {
     if payload.channel == "minecraft:brand"
         && let Ok(brand) = horizon_protocol::buf::Reader::new(&payload.data).string(32767)
     {
@@ -1415,6 +1680,37 @@ pub fn ping(address: &str, timeout: Duration) -> Result<(serde_json::Value, u128
     Ok((json, start.elapsed().as_millis()))
 }
 
+/// Where the dev oracle's tables of a modded NeoForge 1.21.1 server are (mods/horizon/src/
+/// neoforge-oracle, `-Dhorizon.oracle.stateids=FILE`): `HORIZON_SERVER_STATES`, else
+/// `server-states/server-states.tsv` in the game's folder; its other tables sit next to it.
+pub fn server_states_path() -> PathBuf {
+    std::env::var_os("HORIZON_SERVER_STATES")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("server-states").join("server-states.tsv"))
+}
+
+/// The oracle's trees of the server's codecs for its mods' item components, entity data
+/// serializers and particles (`*.codecs.tsv`), handed to the 767 translation before it reads
+/// play packets, so it reads past the values it can't rewrite instead of dropping what holds
+/// them. Without the table nothing changes.
+fn load_server_codec_trees() {
+    let path = server_states_path().with_extension("codecs.tsv");
+    match std::fs::read_to_string(&path) {
+        Ok(text) => {
+            let loaded = horizon_protocol::codec_tree::set_server_codecs(&text);
+            log::info!(
+                "Horizon: server codec trees from {}: {} usable, {} with a codec the oracle \
+                 couldn't describe, {} unreadable lines",
+                path.display(),
+                loaded.usable,
+                loaded.unknown,
+                loaded.bad
+            );
+        }
+        Err(e) => log::info!("Horizon: no server codec table at {}: {e}", path.display()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1432,7 +1728,7 @@ mod tests {
         let expected = crate::content_identity::identity(&root).unwrap();
         let (client, server) = horizon_protocol::connection::Pipe::pair();
         let (mut reader, writer) = Connection::local(client).split();
-        let writer = Mutex::new(Some(writer));
+        let writer = Mutex::new(Some(NetworkWriter::start(writer).unwrap()));
         let thread = std::thread::spawn(move || {
             let (send, _events) = channel();
             configure(
@@ -1443,6 +1739,7 @@ mod tests {
                 &send,
                 &Cookies::default(),
                 &root,
+                None,
                 None,
             )
         });
@@ -1491,7 +1788,7 @@ mod tests {
     fn modsync_payloads_are_reported_and_malformed_ones_do_not_disconnect() {
         let (client, server) = horizon_protocol::connection::Pipe::pair();
         let (mut reader, writer) = Connection::local(client).split();
-        let writer = Mutex::new(Some(writer));
+        let writer = Mutex::new(Some(NetworkWriter::start(writer).unwrap()));
         let (send, events) = channel();
         let thread = std::thread::spawn(move || {
             configure(
@@ -1502,6 +1799,7 @@ mod tests {
                 &send,
                 &Cookies::default(),
                 Path::new("."),
+                None,
                 None,
             )
         });
@@ -1515,19 +1813,23 @@ mod tests {
         good.string("ruby_ore");
         good.byte_array(br#"{"template":"minecraft:stone"}"#);
         server
-            .send(&cfg::Clientbound::CustomPayload(cfg::CustomPayload {
-                channel: crate::modsync::CHANNEL.into(),
-                data: good.data,
-            })
-            .encode())
+            .send(
+                &cfg::Clientbound::CustomPayload(cfg::CustomPayload {
+                    channel: crate::modsync::CHANNEL.into(),
+                    data: good.data,
+                })
+                .encode(),
+            )
             .unwrap();
         // A malformed one right after: bad magic.
         server
-            .send(&cfg::Clientbound::CustomPayload(cfg::CustomPayload {
-                channel: crate::modsync::CHANNEL.into(),
-                data: b"BAD!".to_vec(),
-            })
-            .encode())
+            .send(
+                &cfg::Clientbound::CustomPayload(cfg::CustomPayload {
+                    channel: crate::modsync::CHANNEL.into(),
+                    data: b"BAD!".to_vec(),
+                })
+                .encode(),
+            )
             .unwrap();
         server
             .send(&cfg::Clientbound::FinishConfiguration(Empty).encode())
@@ -1549,10 +1851,16 @@ mod tests {
         }
         assert_eq!(counts, vec![1]);
         assert!(
-            statuses.iter().any(|s| s.starts_with("ModSync: received 1 content blocks")
-                && s.contains("demo:ruby_ore"))
+            statuses
+                .iter()
+                .any(|s| s.starts_with("ModSync: received 1 content blocks")
+                    && s.contains("demo:ruby_ore"))
         );
-        assert!(statuses.iter().any(|s| s.starts_with("ModSync: malformed payload")));
+        assert!(
+            statuses
+                .iter()
+                .any(|s| s.starts_with("ModSync: malformed payload"))
+        );
     }
 
     #[test]
@@ -1562,7 +1870,7 @@ mod tests {
         for explicit_disconnect in [true, false] {
             let (client, _server) = horizon_protocol::connection::Pipe::pair();
             let (_reader, writer) = Connection::local(client).split();
-            let writer = Arc::new(Mutex::new(Some(writer)));
+            let writer = Arc::new(Mutex::new(Some(NetworkWriter::start(writer).unwrap())));
             let (_send, events) = channel();
             let (release, stalled) = channel();
             let (finished, completed) = channel();
@@ -1614,13 +1922,76 @@ mod tests {
     }
 
     #[test]
+    fn network_writer_preserves_fifo_order_on_worker_in_native_phase() {
+        assert!(!horizon_protocol::translation::is_active());
+        let (client, server) = horizon_protocol::connection::Pipe::pair();
+        let (_, writer) = Connection::local(client).split();
+        let mut writer = NetworkWriter::start(writer).unwrap();
+        assert_ne!(writer.thread_id, std::thread::current().id());
+
+        let packets = [
+            play::Serverbound::MovePlayerPos(play::MovePlayerPos {
+                x: 1.0,
+                y: 2.0,
+                z: 3.0,
+                flags: 0,
+            })
+            .encode(),
+            play::Serverbound::MovePlayerPosRot(play::MovePlayerPosRot {
+                x: 4.0,
+                y: 5.0,
+                z: 6.0,
+                yaw: 7.0,
+                pitch: 8.0,
+                flags: 0,
+            })
+            .encode(),
+        ];
+        let expected_ids: Vec<_> = packets
+            .iter()
+            .map(|body| {
+                let mut reader = horizon_protocol::buf::Reader::new(body);
+                reader.varint().unwrap()
+            })
+            .collect();
+        for body in &packets {
+            writer.send(body).unwrap();
+        }
+        let mut server = Connection::local(server);
+        let actual: Vec<_> = (0..2).map(|_| server.recv().unwrap().0).collect();
+        assert_eq!(actual, expected_ids);
+        writer.shutdown();
+    }
+
+    #[test]
     fn pings_wait_behind_teleports_but_keepalives_do_not_wait_for_the_game() {
+        struct RecordingSender {
+            sender: Sender<Event>,
+            packet_threads: Arc<Mutex<Vec<std::thread::ThreadId>>>,
+        }
+        impl EventSender for RecordingSender {
+            fn send(&self, event: Event) -> Result<(), std::sync::mpsc::SendError<Event>> {
+                if matches!(&event, Event::Packet(_)) {
+                    self.packet_threads
+                        .lock()
+                        .unwrap()
+                        .push(std::thread::current().id());
+                }
+                self.sender.send(event)
+            }
+        }
         let (client, server) = horizon_protocol::connection::Pipe::pair();
         let (mut reader, writer) = Connection::local(client).split();
-        let writer = Arc::new(Mutex::new(Some(writer)));
+        let writer = Arc::new(Mutex::new(Some(NetworkWriter::start(writer).unwrap())));
         let (send, events) = channel();
+        let packet_threads = Arc::new(Mutex::new(Vec::new()));
+        let recorded_threads = packet_threads.clone();
         let thread_writer = writer.clone();
         let thread = std::thread::spawn(move || {
+            let send = RecordingSender {
+                sender: send,
+                packet_threads: recorded_threads,
+            };
             receive_play(
                 &mut reader,
                 &thread_writer,
@@ -1629,6 +2000,7 @@ mod tests {
                 &send,
                 &Cookies::default(),
                 Path::new("."),
+                None,
                 None,
             )
         });
@@ -1662,6 +2034,11 @@ mod tests {
         assert!(
             matches!(events.recv_timeout(timeout).unwrap(), Event::Packet(p) if *p == play::Clientbound::Ping(cfg::Ping { id: 7 }))
         );
+        assert_eq!(
+            *packet_threads.lock().unwrap(),
+            vec![thread.thread().id(), thread.thread().id()],
+            "decoded packet events must be emitted in order by the network worker"
+        );
         writer.lock().unwrap().take().unwrap().shutdown();
         assert!(thread.join().unwrap().is_err());
     }
@@ -1673,7 +2050,7 @@ mod tests {
         let (send, events) = channel();
         let session = Session {
             events,
-            writer: Arc::new(Mutex::new(Some(writer))),
+            writer: Arc::new(Mutex::new(Some(NetworkWriter::start(writer).unwrap()))),
             configuring: Arc::new(AtomicBool::new(false)),
             thread: None,
             address: "local".into(),
@@ -1694,6 +2071,7 @@ mod tests {
                 &send,
                 &Cookies::default(),
                 Path::new("."),
+                None,
                 None,
             )
         });
@@ -1729,7 +2107,7 @@ mod tests {
     fn play_answers_cookie_requests_from_stored_cookies_and_follows_transfers() {
         let (client, server) = horizon_protocol::connection::Pipe::pair();
         let (mut reader, writer) = Connection::local(client).split();
-        let writer = Arc::new(Mutex::new(Some(writer)));
+        let writer = Arc::new(Mutex::new(Some(NetworkWriter::start(writer).unwrap())));
         let (send, events) = channel();
         let cookies = Cookies::default();
         let (thread_writer, thread_cookies) = (writer.clone(), cookies.clone());
@@ -1742,6 +2120,7 @@ mod tests {
                 &send,
                 &thread_cookies,
                 Path::new("."),
+                None,
                 None,
             )
         });

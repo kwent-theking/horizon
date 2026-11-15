@@ -64,6 +64,26 @@ public final class FactsExporter {
 
     private void started(ServerStartedEvent event) {
         MinecraftServer server = event.getServer();
+        String stateIds = System.getProperty("horizon.oracle.stateids");
+        if (stateIds != null) {
+            try {
+                StateIds.write(Path.of(stateIds));
+            } catch (Throwable e) {
+                e.printStackTrace();
+                System.exit(3);
+            }
+            System.out.println("horizon-oracle: wrote state ids to " + stateIds);
+            // Apart, so a codec the describer chokes on can't cost the state ids.
+            try {
+                Path codecs = StateIds.sibling(Path.of(stateIds), "codecs");
+                CodecTrees.write(codecs, server.registryAccess());
+                System.out.println("horizon-oracle: wrote codec trees to " + codecs);
+            } catch (Throwable e) {
+                e.printStackTrace();
+            }
+            server.halt(false);
+            return;
+        }
         Path out = Path.of(System.getProperty("horizon.oracle.out", "horizon-oracle.json"));
         Set<String> namespaces =
                 new TreeSet<>(Arrays.asList(System.getProperty("horizon.oracle.namespaces", "").split(",")));

@@ -150,6 +150,14 @@ pub fn body(m: &Mob) -> (String, String) {
             s.to_owned()
         }
     };
+    if m.kind.anim == super::anim::Anim::Gecko {
+        // A GeckoLib mob: its one model (MobType.model) and texture.
+        return ("gecko#main".into(), m.kind.texture.clone());
+    }
+    if m.kind.anim == super::anim::Anim::Modded {
+        // A dumped Java-modelled mob, likewise (mobs/modded).
+        return ("modded#main".into(), m.kind.texture.clone());
+    }
     if avatar(m) {
         // AvatarRenderer: PlayerModel's slim layer for a slim skin.
         return (
@@ -463,7 +471,12 @@ pub fn body_color(m: &Mob, alpha: f32) -> u32 {
 pub fn layers(m: &Mob) -> Vec<Layer> {
     use Species as S;
     let mut v = Vec::new();
-    if avatar(m) {
+    if avatar(m)
+        || matches!(
+            m.kind.anim,
+            super::anim::Anim::Gecko | super::anim::Anim::Modded
+        )
+    {
         return v;
     }
     let white = 0xFFFF_FFFF;
@@ -995,6 +1008,7 @@ pub fn base_transform_at(m: &Mob, alpha: f32, origin: glam::Mat4) -> glam::Mat4 
             base *= glam::Mat4::from_translation(glam::Vec3::new(0.0, -1.0, 0.3));
         }
     }
+    base *= crate::player_anim::root_transform(m, alpha);
     base *= species_rotations(m, alpha);
     base *= glam::Mat4::from_scale(glam::Vec3::new(-1.0, -1.0, 1.0));
     base *= species_scale(m, alpha);
@@ -1715,6 +1729,86 @@ pub fn held_item_transform(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parallel_bodies_preserve_pose_vertices_and_entity_order() {
+        use horizon_core::geometry::Vec3;
+        use std::sync::Arc;
+        let mut kind = (*super::super::sensor_scan_tests::kind()).clone();
+        let face = serde_json::json!({
+            "polygons": [[[0,0,0,0,0], [1,0,0,1,0], [1,1,0,1,1], [0,1,0,0,1]]],
+            "normals": [[0,0,1]]
+        });
+        kind.model = Arc::new(Part::parse(
+            "root",
+            &serde_json::json!({
+                "children": {"body": face, "head": face}
+            }),
+        ));
+        let kind = Arc::new(kind);
+        let mobs: Vec<_> = (0..65)
+            .map(|id| {
+                let mut mob = Mob::new(
+                    id,
+                    kind.clone(),
+                    Vec3::new(f64::from(id), 2.0, 3.0),
+                    id as f32,
+                );
+                mob.previous = Vec3::new(f64::from(id) - 0.25, 1.5, 2.5);
+                mob.age = id * 3;
+                mob.head_pitch = id as f32;
+                mob.limb_position = id as f32 * 0.3;
+                mob.limb_speed = 0.5;
+                mob.previous_limb_speed = 0.25;
+                mob.hurt_time = (id % 3) as i32;
+                mob
+            })
+            .collect();
+        let data = MobData {
+            states: Vec::new(),
+            placements: Default::default(),
+            heightmaps: Default::default(),
+            animations: Default::default(),
+            villager_hats: Default::default(),
+            biome_tags: Default::default(),
+            entity_tags: Default::default(),
+            pois: Default::default(),
+        };
+        let camera = glam::DVec3::new(0.125, 1.0, -3.0);
+        let mut serial = Vec::new();
+        for mob in &mobs {
+            render_with(
+                mob,
+                0.375,
+                camera,
+                &|_| Some([0.0, 0.0, 1.0, 1.0]),
+                0xf070,
+                &data,
+                &[],
+                &mut serial,
+            );
+        }
+        assert!(!serial.is_empty());
+        for threads in [1, 2, 6] {
+            let mut parallel = Vec::new();
+            crate::par::map_batches_with(
+                threads,
+                &mobs,
+                16,
+                |mob| {
+                    let mut body = Vec::new();
+                    let lookup = |_: &str| Some([0.0, 0.0, 1.0, 1.0]);
+                    render_with(mob, 0.375, camera, &lookup, 0xf070, &data, &[], &mut body);
+                    body
+                },
+                |body| parallel.extend(body),
+            );
+            assert_eq!(
+                bytemuck::cast_slice::<Vertex, u8>(&parallel),
+                bytemuck::cast_slice::<Vertex, u8>(&serial)
+            );
+        }
+    }
 
     /// VillagerProfessionLayer's textures (type, or baby for a baby;
     /// profession; level) of every villager and zombie villager are in the

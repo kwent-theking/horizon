@@ -28,6 +28,7 @@ use std::{io, path::Path, sync::Arc};
 pub fn load<'r>(root: &Path, registry: &'r BlockRegistry) -> Result<BlockCollisionRegistry<'r>> {
     let file = BlockTableFile::open(&root.join("cached-collision.nbt"), registry)?;
     let cached = CachedCollisionRegistry::from_table(file.table("collision")?)?;
+    drop(file);
     if !cached.has_canonical_identities() {
         return Err("scene collisions require canonical shape identities".into());
     }

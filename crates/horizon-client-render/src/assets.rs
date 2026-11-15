@@ -84,14 +84,14 @@ pub struct Assets {
 pub struct RenderAssets {
     pub sprite_size: u32,
     pub sprite_minimum_size: u32,
-    pub pixels: Vec<u8>,
+    pub pixels: crate::compact_bytes::CompactBytes,
     pub texture_layers: u32,
     pub model_catalog: crate::models::StateModels,
-    /// Shared parsed resources; item-only validation errors surface at item preparation.
+    /// Compact immutable source snapshots; item-only validation errors surface at item preparation.
     pub model_library: std::result::Result<Arc<horizon_assets::resolve::ModelLibrary>, String>,
     pub model_placements: Vec<(horizon_core::position::BlockPos, BlockStateId)>,
     pub model_gallery: Vec<Value>,
-    pub animations: Vec<crate::sprites::SpriteAnimation>,
+    pub animations: Vec<crate::sprites::PackedSpriteAnimation>,
     pub sprite_layers: std::collections::BTreeMap<String, u32>,
     pub translucent_layers: Vec<bool>,
     /// Each layer's `MipmapGenerator` settings.
@@ -196,13 +196,27 @@ impl Assets {
 impl RenderAssets {
     pub fn load(root: &Path, assets: &Assets) -> Result<Self> {
         let registry = assets.registry;
+        let timer = std::time::Instant::now();
         let mut sprites = crate::sprites::Sprites::with_disk_cache(root);
+        log::info!("load assets: sprites {:.1}s", timer.elapsed().as_secs_f32());
+        crate::logging::process_memory("load assets: sprites");
         for name in MATERIALS {
             sprites.insert(root, &format!("minecraft:block/{name}"))?;
         }
         let parsed = crate::model_library::ParsedModels::load(root);
+        log::info!(
+            "load assets: parsed models {:.1}s",
+            timer.elapsed().as_secs_f32()
+        );
+        crate::logging::process_memory("load assets: parsed models");
         let models = crate::models::prepare_with_models(root, registry, &mut sprites, &parsed)?;
+        log::info!(
+            "load assets: prepared models {:.1}s",
+            timer.elapsed().as_secs_f32()
+        );
+        crate::logging::process_memory("load assets: prepared models");
         let model_library = parsed.into_item_library();
+        crate::logging::process_memory("load assets: source models released");
         // Fluids are drawn by the fluid renderer, not block models; breaking
         // progress uses the destroy-stage overlays.
         for name in [
@@ -219,18 +233,29 @@ impl RenderAssets {
         }
         sprites.save_disk_cache();
         sprites.finish();
-        // `finish` grows the buffer by doubling: keep only the bytes in use.
+        let texture_layers = u32::try_from(sprites.count())?;
+        // Keep only atlas texels, even if a previous allocation had spare capacity.
         sprites.pixels.shrink_to_fit();
+        let pixels = crate::compact_bytes::CompactBytes::new(sprites.pixels);
+        log::info!(
+            "load assets: atlas CPU backing {} -> {} bytes",
+            pixels.len(),
+            pixels.stored_len()
+        );
         Ok(Self {
             sprite_size: sprites.size,
             sprite_minimum_size: sprites.minimum_size,
-            texture_layers: u32::try_from(sprites.count())?,
-            pixels: sprites.pixels,
+            texture_layers,
+            pixels,
             model_catalog: models.catalog,
             model_library,
             model_placements: models.placements,
             model_gallery: models.states,
-            animations: sprites.animations,
+            animations: sprites
+                .animations
+                .into_iter()
+                .map(crate::sprites::PackedSpriteAnimation::new)
+                .collect(),
             sprite_layers: sprites.layers,
             translucent_layers: sprites.translucent,
             sprite_mips: sprites.mips,

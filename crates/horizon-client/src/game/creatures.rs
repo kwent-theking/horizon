@@ -4659,81 +4659,110 @@ impl Game<'_> {
             }
         }
     }
-    /// Mob models and projectiles for the entity pass.
-    pub(super) fn mob_geometry(&self, camera: glam::DVec3, alpha: f64, out: &mut Vec<Vertex>) {
-        let atlas = &self.gui.atlas;
-        let lookup = |name: &str| atlas.sprites.get(name).map(|r| [r.u0, r.v0, r.u1, r.v1]);
-        let scale = self.view_scale();
-        for mob in &self.mobs {
-            let entity_start = out.len();
-            let outline = self.mob_outline(mob);
-            // Entity.DATA_SHARED_FLAGS_ID invisible: only the name tag draws (and
-            // the outline of a glowing mob, LivingEntityRenderer.getRenderType).
-            if mob.invisible && outline.is_none() {
-                continue;
-            }
-            let d = glam::DVec3::new(mob.position.x, mob.position.y, mob.position.z) - camera;
-            // Entity.shouldRenderAtSqrDistance: 64 times the bounding box's
-            // mean edge, scaled by the view scale. RemotePlayer's box counts
-            // ten times.
-            let (w, h, _) = mob.dims();
-            let edge = (w + h + w) / 3.0
-                * if &*mob.kind.id == "minecraft:player" {
-                    10.0
-                } else {
-                    1.0
-                };
-            let range = edge * 64.0 * scale;
-            if d.length_squared() >= range * range {
-                continue;
-            }
-            // EntityRenderer.shouldRender: the culling box, grown by 0.5
-            // (GuardianRenderer also draws while its beam is out).
-            if let Some(view) = &self.view_frustum
-                && horizon_client::mobs::guardian::beam(mob, alpha as f32).is_none()
-            {
-                let lo =
-                    d.as_vec3() - glam::Vec3::new(w as f32 / 2.0 + 0.5, 0.5, w as f32 / 2.0 + 0.5);
-                let hi = d.as_vec3()
-                    + glam::Vec3::new(w as f32 / 2.0 + 0.5, h as f32 + 0.5, w as f32 / 2.0 + 0.5);
-                if !view.intersects(lo, hi) {
-                    continue;
-                }
-            }
-            self.mark_entity(entity_start, &mob.kind.id);
-            let light = self.world.light(
-                mob.position.x.floor() as i32,
-                (mob.position.y + mob.eye_height()).floor() as i32,
-                mob.position.z.floor() as i32,
-            );
-            let mut packed = (u32::from(light >> 4) * 16) | ((u32::from(light & 15) * 16) << 8);
-            if mob.fire_ticks > 0 || matches!(mob.species(), Species::Blaze | Species::MagmaCube) {
-                packed = (15 * 16) | ((15 * 16) << 8);
-            }
-            // GlowSquidRenderer.getBlockLightLevel: the body brightens as the
-            // dark ticks run out (the block light is the second byte).
-            if mob.species() == Species::GlowSquid {
-                let lit = (packed >> 12) & 15;
-                let block = horizon_client::mobs::aquatic::glow_squid_block_light(mob, lit);
-                packed = (packed & 0xFF) | ((block * 16) << 8);
-            }
-            if mob.species() == Species::SulfurCube
-                && !horizon_client::mobs::trader::is_invisible(mob)
-            {
-                self.sulfur_cube_body_geometry(
-                    mob,
-                    alpha as f32,
-                    horizon_client::mobs::render::base_transform(mob, alpha as f32, camera),
-                    packed,
-                    out,
-                );
-            }
-            // Other players on a server: PlayerRenderer's HumanoidArmorLayer.
-            let armor = if &*mob.kind.id == "minecraft:player" {
-                self.worn_armor_layers(mob)
+    /// Whether this mob should reach pose setup and mesh generation.
+    fn mob_visible_for_geometry(
+        &self,
+        mob: &horizon_client::mobs::Mob,
+        camera: glam::DVec3,
+        alpha: f64,
+        scale: f64,
+        outline: Option<u32>,
+    ) -> bool {
+        if mob.invisible && outline.is_none() {
+            return false;
+        }
+        let d = glam::DVec3::new(mob.position.x, mob.position.y, mob.position.z) - camera;
+        let (w, h, _) = mob.dims();
+        let edge = (w + h + w) / 3.0
+            * if &*mob.kind.id == "minecraft:player" {
+                10.0
             } else {
-                Vec::new()
+                1.0
             };
+        let range = edge * 64.0 * scale;
+        if d.length_squared() >= range * range {
+            return false;
+        }
+        let (cull_w, cull_h, _) =
+            super::entity_culling::drawn_extent(&mob.kind.id, w, h, mob.extra.model_scale);
+        let beam = horizon_client::mobs::guardian::beam(mob, alpha as f32);
+        if let Some(view) = &self.view_frustum
+            && beam.is_none()
+        {
+            let lo = d.as_vec3()
+                - glam::Vec3::new(
+                    cull_w as f32 / 2.0 + 0.5,
+                    if cull_h > h { cull_h as f32 + 0.5 } else { 0.5 },
+                    cull_w as f32 / 2.0 + 0.5,
+                );
+            let hi = d.as_vec3()
+                + glam::Vec3::new(
+                    cull_w as f32 / 2.0 + 0.5,
+                    cull_h as f32 + 0.5,
+                    cull_w as f32 / 2.0 + 0.5,
+                );
+            if !view.intersects(lo, hi) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn mob_hidden_for_geometry(
+        &self,
+        mob: &horizon_client::mobs::Mob,
+        alpha: f64,
+        outline: Option<u32>,
+    ) -> bool {
+        if outline.is_some() || horizon_client::mobs::guardian::beam(mob, alpha as f32).is_some() {
+            return false;
+        }
+        let (width, height, _) = mob.dims();
+        let (cull_width, cull_height, model_unknown) =
+            super::entity_culling::drawn_extent(&mob.kind.id, width, height, mob.extra.model_scale);
+        !model_unknown
+            && self.mob_hidden_before_pose(
+                super::entity_culling::at(mob.previous)
+                    .lerp(super::entity_culling::at(mob.position), alpha),
+                cull_width,
+                cull_height,
+            )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_mob_entity(
+        &self,
+        mob: &horizon_client::mobs::Mob,
+        outline: Option<u32>,
+        camera: glam::DVec3,
+        alpha: f64,
+        packed: u32,
+        armor: &[(&horizon_client::mobs::Part, [f32; 4], u32, u32)],
+        body: Option<Vec<Vertex>>,
+        out: &mut Vec<Vertex>,
+    ) -> bool {
+        // Keep the early occlusion test in entity order: it shares the same
+        // bounded Culler budget as the post-mesh test below.
+        if self.mob_hidden_for_geometry(mob, alpha, outline) {
+            return false;
+        }
+        let entity_start = out.len();
+        self.mark_entity(entity_start, &mob.kind.id);
+        if mob.species() == Species::SulfurCube && !horizon_client::mobs::trader::is_invisible(mob)
+        {
+            self.sulfur_cube_body_geometry(
+                mob,
+                alpha as f32,
+                horizon_client::mobs::render::base_transform(mob, alpha as f32, camera),
+                packed,
+                out,
+            );
+        }
+        if let Some(body) = body {
+            out.extend(body);
+        } else {
+            let atlas = &self.gui.atlas;
+            let lookup = |name: &str| atlas.sprites.get(name).map(|r| [r.u0, r.v0, r.u1, r.v1]);
             horizon_client::mobs::render::render_with(
                 mob,
                 alpha as f32,
@@ -4741,37 +4770,33 @@ impl Game<'_> {
                 &lookup,
                 packed,
                 self.res.mob_data(),
-                &armor,
+                armor,
                 out,
             );
-            if &*mob.kind.id == "minecraft:player" {
-                // PlayerRenderer's CapeLayer, WingsLayer and SpinAttackEffectLayer.
-                let chest = mob.extra.chest.as_deref();
-                self.player_cape_geometry(mob, chest, camera, alpha as f32, packed, out);
-                self.player_elytra_geometry(mob, chest, camera, alpha as f32, packed, out);
-                self.spin_attack_geometry(mob, camera, alpha as f32, packed, out);
+        }
+        if &*mob.kind.id == "minecraft:player" {
+            let chest = mob.extra.chest.as_deref();
+            self.player_cape_geometry(mob, chest, camera, alpha as f32, packed, out);
+            self.player_elytra_geometry(mob, chest, camera, alpha as f32, packed, out);
+            self.spin_attack_geometry(mob, camera, alpha as f32, packed, out);
+        }
+        self.mob_block_geometry(mob, camera, alpha, packed, out);
+        if let Some(rgb) = outline {
+            self.mark_outline(&out[entity_start..], rgb);
+            if mob.invisible {
+                out.truncate(entity_start);
+                return true;
             }
-            // CustomHeadLayer (a pumpkin, skull or head item) included.
-            self.mob_block_geometry(mob, camera, alpha, packed, out);
-            if let Some(rgb) = outline {
-                self.mark_outline(&out[entity_start..], rgb);
-                if mob.invisible {
-                    out.truncate(entity_start);
-                    continue;
-                }
-            }
-            // Glowing outlines and a guardian's beam remain visible independently
-            // of whether the body is hidden behind terrain.
-            if outline.is_none()
-                && horizon_client::mobs::guardian::beam(mob, alpha as f32).is_none()
-            {
-                self.cull_entity_vertices(out, entity_start);
-            }
-            // GuardianRenderer: the laser to the locked target.
-            if let Some((time, scale)) = horizon_client::mobs::guardian::beam(mob, alpha as f32)
-                && let Some(target) = self.beam_target(mob.ai.target, alpha)
-                && let Some(uv) = lookup("entity/guardian/guardian_beam")
-            {
+        }
+        if outline.is_none() && horizon_client::mobs::guardian::beam(mob, alpha as f32).is_none() {
+            self.cull_entity_vertices(out, entity_start);
+        }
+        if let Some((time, scale)) = horizon_client::mobs::guardian::beam(mob, alpha as f32)
+            && let Some(target) = self.beam_target(mob.ai.target, alpha)
+        {
+            let atlas = &self.gui.atlas;
+            if let Some(r) = atlas.sprites.get("entity/guardian/guardian_beam") {
+                let uv = [r.u0, r.v0, r.u1, r.v1];
                 let a = alpha;
                 let eye = glam::DVec3::new(
                     mob.previous.x + (mob.position.x - mob.previous.x) * a,
@@ -4787,6 +4812,157 @@ impl Game<'_> {
                     out,
                 );
             }
+        }
+        true
+    }
+
+    /// Mob models and projectiles for the entity pass.
+    pub(super) fn mob_geometry(&self, camera: glam::DVec3, alpha: f64, out: &mut Vec<Vertex>) {
+        let atlas = &self.gui.atlas;
+        let scale = self.view_scale();
+        const MIN_PARALLEL_MOBS: usize = 16;
+        const MOB_RENDER_BATCH: usize = 32;
+
+        // Gather render inputs while Game and its RefCell-backed state stay on
+        // the frame thread. Workers only read immutable mobs/resources and
+        // build one body's vertices into a private vector.
+        let started = std::time::Instant::now();
+        let mut render_inputs = Vec::new();
+        for mob in &self.mobs {
+            let outline = self.mob_outline(mob);
+            if !self.mob_visible_for_geometry(mob, camera, alpha, scale, outline) {
+                continue;
+            }
+            let light = self.world.light(
+                mob.position.x.floor() as i32,
+                (mob.position.y + mob.eye_height()).floor() as i32,
+                mob.position.z.floor() as i32,
+            );
+            let mut packed = (u32::from(light >> 4) * 16) | ((u32::from(light & 15) * 16) << 8);
+            if mob.fire_ticks > 0 || matches!(mob.species(), Species::Blaze | Species::MagmaCube) {
+                packed = (15 * 16) | ((15 * 16) << 8);
+            }
+            if mob.species() == Species::GlowSquid {
+                let lit = (packed >> 12) & 15;
+                let block = horizon_client::mobs::aquatic::glow_squid_block_light(mob, lit);
+                packed = (packed & 0xFF) | ((block * 16) << 8);
+            }
+            let armor = if &*mob.kind.id == "minecraft:player" {
+                self.worn_armor_layers(mob)
+            } else {
+                Vec::new()
+            };
+            render_inputs.push((mob, outline, packed, armor));
+        }
+        let worker_count = horizon_client::par::frame_threads(
+            horizon_client::par::threads(),
+            render_inputs.len(),
+            MIN_PARALLEL_MOBS,
+        );
+        if worker_count == 1 {
+            let mut drawn = 0;
+            for (mob, outline, packed, armor) in render_inputs {
+                drawn += usize::from(
+                    self.render_mob_entity(mob, outline, camera, alpha, packed, &armor, None, out),
+                );
+            }
+            log::debug!(
+                "Horizon: stage=mob_render visible={} threads={} elapsed_us={}",
+                drawn,
+                worker_count,
+                started.elapsed().as_micros()
+            );
+        } else {
+            let sprites = &atlas.sprites;
+            let mob_data = self.res.mob_data();
+            let mut drawn = 0;
+            let probe_end = MIN_PARALLEL_MOBS.min(render_inputs.len());
+            let probe = &render_inputs[..probe_end];
+            let bodies = horizon_client::par::par_map_with(
+                worker_count,
+                probe,
+                |(mob, _, packed, armor)| {
+                    let lookup = |name: &str| sprites.get(name).map(|r| [r.u0, r.v0, r.u1, r.v1]);
+                    let mut vertices = Vec::new();
+                    horizon_client::mobs::render::render_with(
+                        mob,
+                        alpha as f32,
+                        camera,
+                        &lookup,
+                        *packed,
+                        mob_data,
+                        armor,
+                        &mut vertices,
+                    );
+                    vertices
+                },
+            );
+            for ((mob, outline, packed, armor), body) in probe.iter().zip(bodies) {
+                drawn += usize::from(self.render_mob_entity(
+                    mob,
+                    *outline,
+                    camera,
+                    alpha,
+                    *packed,
+                    armor,
+                    Some(body),
+                    out,
+                ));
+            }
+            let mut start = probe_end;
+            let mut keep_parallel = drawn >= MIN_PARALLEL_MOBS;
+            while keep_parallel && start < render_inputs.len() {
+                let end = (start + MOB_RENDER_BATCH).min(render_inputs.len());
+                let batch = &render_inputs[start..end];
+                let bodies = horizon_client::par::par_map_with(
+                    worker_count,
+                    batch,
+                    |(mob, _, packed, armor)| {
+                        let lookup =
+                            |name: &str| sprites.get(name).map(|r| [r.u0, r.v0, r.u1, r.v1]);
+                        let mut vertices = Vec::new();
+                        horizon_client::mobs::render::render_with(
+                            mob,
+                            alpha as f32,
+                            camera,
+                            &lookup,
+                            *packed,
+                            mob_data,
+                            armor,
+                            &mut vertices,
+                        );
+                        vertices
+                    },
+                );
+                let mut batch_drawn = 0;
+                for ((mob, outline, packed, armor), body) in batch.iter().zip(bodies) {
+                    let visible = self.render_mob_entity(
+                        mob,
+                        *outline,
+                        camera,
+                        alpha,
+                        *packed,
+                        armor,
+                        Some(body),
+                        out,
+                    );
+                    batch_drawn += usize::from(visible);
+                }
+                drawn += batch_drawn;
+                keep_parallel = batch_drawn >= MIN_PARALLEL_MOBS;
+                start = end;
+            }
+            for (mob, outline, packed, armor) in &render_inputs[start..] {
+                drawn += usize::from(
+                    self.render_mob_entity(mob, *outline, camera, alpha, *packed, armor, None, out),
+                );
+            }
+            log::debug!(
+                "Horizon: stage=mob_render visible={} threads={} elapsed_us={}",
+                drawn,
+                worker_count,
+                started.elapsed().as_micros()
+            );
         }
         self.elder_apparition_geometry(alpha, out);
         self.spawner_geometry(camera, alpha, out);

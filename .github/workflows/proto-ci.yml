@@ -1,0 +1,85 @@
+name: proto-ci
+on:
+  push:
+    branches: [ci/proto, ci/proto-b]
+  workflow_dispatch:
+env:
+  CARGO_TERM_COLOR: never
+  RUST_BACKTRACE: "1"
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev pkg-config
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: build and run the touched tests
+        shell: bash
+        run: |
+          set +e
+          fail=0
+          run() {
+            echo "::group::$*"
+            "$@"
+            s=$?
+            echo "::endgroup::"
+            echo "RESULT $s: $*" | tee -a summary.txt
+            if [ $s -ne 0 ]; then fail=1; fi
+          }
+          run cargo test -p horizon-client --lib --bins --no-run
+          run cargo test -p horizon-protocol --lib
+          run cargo test -p horizon-assets --lib
+          run cargo test -p horizon-mods --lib
+          run cargo test -p horizon-client-render --lib model_library
+          run cargo test -p horizon-client-render --lib particle_defs
+          run cargo test -p horizon-client-render --lib hud
+          run cargo test -p horizon-client --lib mobs::gecko
+          run cargo test -p horizon-client --lib mod_content
+          run cargo test -p horizon-client --lib pick_item
+          run cargo test -p horizon-client --lib player_anim
+          run cargo test -p horizon-client --bin horizon-client -- server_states terrain stand_in attribute generic entity_culling non_living living drawn_extent kinetic
+          cat summary.txt
+          exit $fail
+  windows-exe:
+    runs-on: windows-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: build the client
+        run: cargo build --profile fast -p horizon-client --bin horizon-client --bin horizon-probe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: horizon-client-exe
+          path: |
+            target/fast/horizon-client.exe
+            target/fast/horizon-probe.exe
+          retention-days: 7
+  launcher:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: launcher
+          cache-on-failure: true
+      - name: friends launcher tests and build
+        shell: bash
+        run: |
+          cd launcher
+          cargo test --lib friends
+          cargo build --release --bin horizon-friends-launcher
+      - uses: actions/upload-artifact@v4
+        with:
+          name: horizon-friends-launcher
+          path: launcher/target/release/horizon-friends-launcher.exe
+          retention-days: 7

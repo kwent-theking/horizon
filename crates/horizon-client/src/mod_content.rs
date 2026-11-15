@@ -13,7 +13,8 @@
 //! - additions to tags merged into the tag files and bundles.
 //!
 //! The loaders need no mod code, vanilla state ids never move, and with no
-//! content mod the root is the base root itself.
+//! content mod the root is the base root itself. With a modded server's
+//! state table, the server's blocks no mod declares follow (`mod_content_server.rs`).
 use crate::{Result, blocks::MAP_COLORS};
 use horizon_mods::content::{Block, Content, Rarity};
 use horizon_world::nbt::{self, JavaString, Limits, Tag};
@@ -21,9 +22,15 @@ use serde::{Deserialize, Serialize, de};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt, fs,
+    io::{BufWriter, Write},
     ops::Range,
     path::{Path, PathBuf},
 };
+
+mod reuse;
+#[path = "mod_content_server.rs"]
+mod server;
+pub use reuse::installed_resource_root;
 
 /// A content mod to put in the root: its id and content.
 pub struct ContentMod {
@@ -41,6 +48,8 @@ enum J {
     Str(String),
     Arr(Vec<J>),
     Obj(Vec<(String, J)>),
+    /// JSON text written as it is: rows added, never read back.
+    Raw(String),
 }
 impl<'de> Deserialize<'de> for J {
     fn deserialize<D: de::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
@@ -119,6 +128,10 @@ impl Serialize for J {
                 }
                 map.end()
             }
+            J::Raw(text) => match serde_json::value::RawValue::from_string(text.clone()) {
+                Ok(raw) => raw.serialize(s),
+                Err(e) => Err(serde::ser::Error::custom(e)),
+            },
         }
     }
 }
@@ -243,6 +256,20 @@ struct NewItem {
     components: Vec<(String, J)>,
 }
 
+/// What a per-state table's rows are, for the server blocks' copies.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Rows {
+    /// `facts.json`: the state's name and properties.
+    Facts,
+    /// `gameplay-facts.json`, compact.
+    Gameplay,
+    /// `block-behaviours.json`: sturdy faces and flags.
+    Behaviours,
+    /// `structure-blocks.json`'s `full_block`.
+    FullBlock,
+    Other,
+}
+
 struct Plan<'a> {
     blocks: Vec<NewBlock<'a>>,
     items: Vec<NewItem>,
@@ -252,6 +279,13 @@ struct Plan<'a> {
     defaults: BTreeMap<String, u32>,
     /// The gameplay rows' sound objects, by block, for `sounds` overrides.
     sounds: BTreeMap<String, J>,
+    /// The server's blocks no mod declares, after the declared ones.
+    server: Vec<server::ServerBlock>,
+    /// The state ids of [`server::TEMPLATE`] and [`server::OPEN`].
+    template: u32,
+    open: u32,
+    /// Server blocks left out, for the log.
+    warnings: Vec<String>,
 }
 
 /// An item's component patch on its entry; `known` holds every type a vanilla item has, so typos fail.
@@ -279,7 +313,9 @@ fn read_json(path: &Path) -> Result<J> {
 }
 
 impl<'a> Plan<'a> {
-    fn new(base: &Path, mods: &'a [ContentMod]) -> Result<Self> {
+    /// The plan, with the blocks of the server's state table at
+    /// `server_table` that no mod declares after the declared ones.
+    fn new(base: &Path, mods: &'a [ContentMod], server_table: Option<&Path>) -> Result<Self> {
         let mut facts = read_json(&base.join("facts.json"))?;
         let names: Vec<String> = match facts.at("states") {
             Some(J::Arr(states)) => states
@@ -356,6 +392,29 @@ impl<'a> Plan<'a> {
             )
             .into());
         }
+        // Vanilla's and the declared ids never move: the server's blocks come after.
+        let (template, open) = (
+            defaults.get(server::TEMPLATE).copied(),
+            defaults.get(server::OPEN).copied(),
+        );
+        let (mut server, warnings) = match (server_table, template, open) {
+            (Some(table), Some(_), Some(_)) => {
+                let declared: BTreeSet<&str> = blocks.iter().map(|b| b.decl.id.as_str()).collect();
+                let known = |name: &str| defaults.contains_key(name) || declared.contains(name);
+                server::blocks(base, mods, table, known, next)?
+            }
+            _ => (Vec::new(), Vec::new()),
+        };
+        // A server block that is no cube takes the shapes of the vanilla block it looks like.
+        if let Some(J::Arr(fact_rows)) = facts.at("states") {
+            server::pick_donors(&mut server, |name| {
+                let default = *defaults.get(name)?;
+                let states = range(name)?
+                    .map(|id| (id, server::state_properties(&fact_rows[id as usize])))
+                    .collect();
+                Some(server::VanillaBlock { default, states })
+            });
+        }
         // Block items copy the template block's item.
         let gameplay = read_json(&base.join("gameplay-facts.json"))?;
         let rows = match gameplay.get("states") {
@@ -410,6 +469,10 @@ impl<'a> Plan<'a> {
             states: names.len(),
             defaults,
             sounds,
+            server,
+            template: template.unwrap_or(0),
+            open: open.unwrap_or(0),
+            warnings,
         })
     }
 
@@ -427,15 +490,35 @@ impl<'a> Plan<'a> {
     }
 
     /// Appends each new block's copies of the template's states to `list`;
-    /// `gameplay` rows get their index and the declared overrides.
-    fn states(&self, list: &mut Vec<J>, ids: bool, gameplay: bool) -> Result<()> {
-        if list.len() != self.states {
-            return Err(format!("{} states, not {}", list.len(), self.states).into());
+    /// gameplay rows get their index and the declared overrides. The server
+    /// blocks' rows follow.
+    fn states(&self, list: &mut Vec<J>, ids: bool, rows: Rows) -> Result<()> {
+        let mut added = Vec::new();
+        self.emit_states(list, ids, rows, |row| {
+            added.push(row);
+            Ok(())
+        })?;
+        list.append(&mut added);
+        Ok(())
+    }
+
+    /// Templates and shape donors are vanilla state IDs, so the output
+    /// never needs to look up an added row.
+    fn emit_states(
+        &self,
+        vanilla: &[J],
+        ids: bool,
+        rows: Rows,
+        mut emit: impl FnMut(J) -> Result<()>,
+    ) -> Result<()> {
+        if vanilla.len() != self.states {
+            return Err(format!("{} states, not {}", vanilla.len(), self.states).into());
         }
+        let gameplay = rows == Rows::Gameplay;
         for b in &self.blocks {
             let renames = self.renames(b);
             for (i, id) in b.rename.states.clone().enumerate() {
-                let mut row = list[id as usize].clone();
+                let mut row = vanilla[id as usize].clone();
                 for r in &renames {
                     row.rename(r, ids);
                 }
@@ -446,7 +529,61 @@ impl<'a> Plan<'a> {
                     }
                     self.override_gameplay(b, &mut row);
                 }
-                list.push(row);
+                emit(row)?;
+            }
+        }
+        self.emit_server_states(vanilla, ids, rows, emit)
+    }
+
+    /// Appends each server block's rows: the template's per state, with its
+    /// own id, name and properties as `rows` holds them.
+    fn emit_server_states(
+        &self,
+        vanilla: &[J],
+        ids: bool,
+        rows: Rows,
+        mut emit: impl FnMut(J) -> Result<()>,
+    ) -> Result<()> {
+        if self.server.is_empty() {
+            return Ok(());
+        }
+        let template = vanilla
+            .get(self.template as usize)
+            .cloned()
+            .ok_or("no server block template row")?;
+        for b in &self.server {
+            let gameplay = match rows {
+                Rows::Gameplay => server::gameplay_row(&template, b.cube)?,
+                _ => String::new(),
+            };
+            for (index, (id, text)) in b.ids().zip(&b.states).enumerate() {
+                let donor = b.donor(index).and_then(|d| vanilla.get(d as usize));
+                let row = match (rows, donor) {
+                    (Rows::Gameplay, Some(donor)) => {
+                        server::with_id(&server::gameplay_row_like(&template, donor)?, id)
+                    }
+                    (Rows::Gameplay, None) => server::with_id(&gameplay, id),
+                    (Rows::FullBlock, Some(donor)) => donor.clone(),
+                    (Rows::FullBlock, None) if !b.cube => J::Bool(false),
+                    _ => {
+                        let mut row = template.clone();
+                        let mut rename = Rename::new(server::TEMPLATE, &b.name);
+                        rename.states = self.template..self.template + 1;
+                        rename.first = id;
+                        row.rename(&rename, ids);
+                        match rows {
+                            Rows::Facts => server::set_state_properties(&mut row, &b.name, text),
+                            Rows::Behaviours => match donor {
+                                Some(donor) => server::donor_behaviour(&mut row, donor),
+                                None if !b.cube => server::open_behaviour(&mut row),
+                                None => {}
+                            },
+                            _ => {}
+                        }
+                        row
+                    }
+                };
+                emit(row)?;
             }
         }
         Ok(())
@@ -489,6 +626,38 @@ impl<'a> Plan<'a> {
                 }
                 map.set(&b.decl.id, v);
             }
+        }
+    }
+
+    /// Adds each server block's copy of the template's entry to a map by name.
+    fn server_names(&self, map: &mut J) {
+        let Some(entry) = map.get(server::TEMPLATE).cloned() else {
+            return;
+        };
+        for b in &self.server {
+            let mut v = entry.clone();
+            v.rename(&Rename::new(server::TEMPLATE, &b.name), false);
+            map.set(&b.name, v);
+        }
+    }
+
+    /// Each server block's render definition: the template's over its own
+    /// states. One that is no cube hides nothing behind it.
+    fn server_render(&self, doc: &mut J) {
+        let Some(entry) = doc.get(server::TEMPLATE).cloned() else {
+            return;
+        };
+        for b in &self.server {
+            let mut v = entry.clone();
+            v.set("default", J::Num(b.first.into()));
+            v.set(
+                "states",
+                J::Arr(b.ids().map(|id| J::Num(id.into())).collect()),
+            );
+            if !b.cube {
+                v.set("can_occlude", J::Bool(false));
+            }
+            doc.set(&b.name, v);
         }
     }
 
@@ -535,25 +704,28 @@ impl<'a> Plan<'a> {
 
     /// One JSON table, rewritten.
     fn json(&self, name: &str, doc: &mut J) -> Result<()> {
-        let states = |doc: &mut J, path: &str, ids: bool, gameplay: bool| -> Result<()> {
+        let states = |doc: &mut J, path: &str, ids: bool, rows: Rows| -> Result<()> {
             match doc.at(path) {
-                Some(J::Arr(a)) => self.states(a, ids, gameplay),
+                Some(J::Arr(a)) => self.states(a, ids, rows),
                 _ => Err(format!("no list at /{path}").into()),
             }
         };
         match name {
             "facts.json" => {
-                states(doc, "states", false, false)?;
+                states(doc, "states", false, Rows::Facts)?;
                 let defaults = doc.at("defaults").ok_or("no defaults")?;
                 for b in &self.blocks {
                     let default = self.defaults[&b.decl.template];
                     let id = b.rename.id(default).ok_or("a default outside its block")?;
                     defaults.set(&b.decl.id, J::Num(id.into()));
                 }
+                // The server does not say which state is a block's default: its first.
+                for b in &self.server {
+                    defaults.set(&b.name, J::Num(b.first.into()));
+                }
             }
-            "gameplay-facts.json" => states(doc, "states", false, true)?,
             "block-behaviours.json" => {
-                states(doc, "states", false, false)?;
+                states(doc, "states", false, Rows::Behaviours)?;
                 let Some(J::Arr(blocks)) = doc.at("blocks") else {
                     return Err("no blocks".into());
                 };
@@ -571,20 +743,47 @@ impl<'a> Plan<'a> {
                         blocks.push(v);
                     }
                 }
+                // One entry per block, in registry order, as the loaders check.
+                if !self.server.is_empty() {
+                    let template = blocks
+                        .iter()
+                        .find(|x| matches!(x.get("name"), Some(J::Str(n)) if n == server::TEMPLATE))
+                        .cloned()
+                        .ok_or("no server block template")?;
+                    for b in &self.server {
+                        let mut v = template.clone();
+                        v.rename(&Rename::new(server::TEMPLATE, &b.name), false);
+                        v.set("item", J::Str("minecraft:air".into()));
+                        blocks.push(v);
+                    }
+                }
                 self.items(doc.at("items").ok_or("no items")?, false)?;
                 for odds in ["fire/burnOdds", "fire/igniteOdds"] {
                     if let Some(map) = doc.at(odds) {
                         self.names(map, false);
+                        self.server_names(map);
                     }
                 }
             }
-            "model-states.json"
-            | "landing-definitions.json"
-            | "worldgen/blocks/survival-rules.json" => self.names(doc, false),
-            "render-definitions.json" => self.names(doc, true),
+            "model-states.json" => {
+                self.names(doc, false);
+                // The server's states, so each binds its own blockstate as there.
+                for b in &self.server {
+                    doc.set(&b.name, server::model_states(b));
+                }
+            }
+            "landing-definitions.json" | "worldgen/blocks/survival-rules.json" => {
+                self.names(doc, false);
+                self.server_names(doc);
+            }
+            "render-definitions.json" => {
+                self.names(doc, true);
+                self.server_render(doc);
+            }
             "worldgen/blocks/survival-extra-definitions.json" => {
                 if let Some(map) = doc.at("ignition_odds") {
                     self.names(map, false);
+                    self.server_names(map);
                 }
             }
             "items.json" => self.items(doc, true)?,
@@ -592,7 +791,11 @@ impl<'a> Plan<'a> {
                 // Network ids: the game and its server map items and blocks through
                 // this report, so new ones get the ids after vanilla's, in plan order.
                 let new_items = self.items.iter().map(|i| i.rename.to.clone());
-                let new_blocks = self.blocks.iter().map(|b| b.decl.id.clone());
+                let new_blocks = self
+                    .blocks
+                    .iter()
+                    .map(|b| b.decl.id.clone())
+                    .chain(self.server.iter().map(|b| b.name.clone()));
                 for (registry, names) in [
                     ("minecraft:item", new_items.collect::<Vec<_>>()),
                     ("minecraft:block", new_blocks.collect()),
@@ -620,9 +823,16 @@ impl<'a> Plan<'a> {
                 }
             }
             "command-registries.json" => {
-                self.names(doc.at("blocks").ok_or("no blocks")?, false);
+                let blocks = doc.at("blocks").ok_or("no blocks")?;
+                self.names(blocks, false);
+                self.server_names(blocks);
                 let new_items = || self.items.iter().map(|i| J::Str(i.rename.to.clone()));
-                let new_blocks = || self.blocks.iter().map(|b| J::Str(b.decl.id.clone()));
+                let new_blocks = || {
+                    self.blocks
+                        .iter()
+                        .map(|b| J::Str(b.decl.id.clone()))
+                        .chain(self.server.iter().map(|b| J::Str(b.name.clone())))
+                };
                 let Some(J::Arr(items)) = doc.at("items") else {
                     return Err("no items".into());
                 };
@@ -635,14 +845,23 @@ impl<'a> Plan<'a> {
                     ids.extend(new_blocks());
                 }
             }
-            "mob-data.json" => states(doc, "states", false, false)?,
-            "worldgen/block_flags.json" => states(doc, "", false, false)?,
+            "mob-data.json" => states(doc, "states", false, Rows::Other)?,
+            "worldgen/block_flags.json" => states(doc, "", false, Rows::Other)?,
             "worldgen/blocks/structure-blocks.json" => {
+                // A server block rotates and mirrors onto itself.
                 for key in ["rotate", "mirror", "full_block"] {
-                    states(doc, key, true, false)?;
+                    let rows = match key {
+                        "full_block" => Rows::FullBlock,
+                        _ => Rows::Other,
+                    };
+                    states(doc, key, true, rows)?;
                 }
                 let added: usize = self.blocks.iter().map(|b| b.rename.states.len()).sum();
-                doc.set("states", J::Num(((self.states + added) as u64).into()));
+                let server: usize = self.server.iter().map(|b| b.states.len()).sum();
+                doc.set(
+                    "states",
+                    J::Num(((self.states + added + server) as u64).into()),
+                );
             }
             _ => return Err("no rule for this table".into()),
         }
@@ -667,12 +886,37 @@ impl<'a> Plan<'a> {
                             list.push(state);
                         }
                     }
+                    if let Some(template) = list.get(self.template as usize).cloned() {
+                        for b in &self.server {
+                            for text in &b.states {
+                                let mut state = template.clone();
+                                server::set_nbt_state(&mut state, &b.name, text);
+                                list.push(state);
+                            }
+                        }
+                    }
                 }
                 ("cached_shapes", Tag::IntArray(a)) if a.len() == self.states => {
                     for b in &self.blocks {
                         let r = &b.rename.states;
                         let copy = a[r.start as usize..r.end as usize].to_vec();
                         a.extend(copy);
+                    }
+                    // A block that is no cube takes the shapes of the vanilla
+                    // block it looks like, else air's: nothing to collide
+                    // with, stand on or hide behind.
+                    if !self.server.is_empty() {
+                        let (cube, open) = (a[self.template as usize], a[self.open as usize]);
+                        for b in &self.server {
+                            let shapes: Vec<_> = (0..b.states.len())
+                                .map(|i| match b.donor(i) {
+                                    Some(donor) => a[donor as usize],
+                                    None if b.cube => cube,
+                                    None => open,
+                                })
+                                .collect();
+                            a.extend(shapes);
+                        }
                     }
                 }
                 ("blocks", Tag::Compound(map)) => {
@@ -689,6 +933,11 @@ impl<'a> Plan<'a> {
                             *slot = Tag::Float(f.to_bits());
                         }
                         map.insert(b.decl.id.as_str().into(), v);
+                    }
+                    if let Some(v) = map.get(&JavaString::from(server::TEMPLATE)).cloned() {
+                        for b in &self.server {
+                            map.insert(b.name.as_str().into(), v.clone());
+                        }
                     }
                 }
                 (_, inner @ Tag::Compound(_)) => self.nbt(inner),
@@ -898,7 +1147,7 @@ impl Overlay<'_> {
         }
         Ok(())
     }
-    fn write(&self, rel: &str, bytes: &[u8]) -> Result<()> {
+    fn create(&self, rel: &str) -> Result<fs::File> {
         let rel = Path::new(rel);
         if let Some(parent) = rel.parent() {
             self.dir(parent)?;
@@ -907,7 +1156,10 @@ impl Overlay<'_> {
         if fs::symlink_metadata(&path).is_ok() {
             fs::remove_file(&path)?;
         }
-        fs::write(path, bytes)?;
+        Ok(fs::File::create(path)?)
+    }
+    fn write(&self, rel: &str, bytes: &[u8]) -> Result<()> {
+        self.create(rel)?.write_all(bytes)?;
         Ok(())
     }
 }
@@ -927,7 +1179,39 @@ fn link(target: &Path, at: &Path) -> std::io::Result<()> {
         }
         Ok(())
     } else {
-        fs::copy(target, at).map(|_| ())
+        fs::copy(target, at)?;
+        // Keep the source mtime: the sprite cache key is size + mtime.
+        // Best effort: `fs::copy` already keeps the time, and a read-only
+        // source's copy cannot be reopened for writing.
+        let modified = fs::metadata(target)?.modified()?;
+        if let Ok(file) = fs::File::options().write(true).open(at) {
+            let _ = file.set_modified(modified);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(test, not(unix)))]
+mod link_tests {
+    #[test]
+    fn copy_keeps_the_source_mtime() {
+        let dir = std::env::temp_dir().join(format!("horizon-link-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (src, dst) = (dir.join("a.png"), dir.join("b.png"));
+        std::fs::write(&src, b"x").unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(86_400);
+        std::fs::File::options()
+            .write(true)
+            .open(&src)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        super::link(&src, &dst).unwrap();
+        assert_eq!(
+            std::fs::metadata(&dst).unwrap().modified().unwrap(),
+            std::fs::metadata(&src).unwrap().modified().unwrap()
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
 
@@ -963,6 +1247,8 @@ impl Known {
         let mut blocks: std::collections::BTreeSet<String> =
             plan.defaults.keys().cloned().collect();
         blocks.extend(plan.blocks.iter().map(|b| b.decl.id.clone()));
+        // The mods' tags name their undeclared blocks too (mineable/axe ...).
+        blocks.extend(plan.server.iter().map(|b| b.name.clone()));
         let mut items = std::collections::BTreeSet::new();
         if let J::Obj(o) = read_json(&base.join("items.json"))? {
             items.extend(o.into_iter().map(|(k, _)| k));
@@ -1086,6 +1372,50 @@ impl TagMerge {
 /// would mostly add memory.
 const TABLE_THREADS: usize = 3;
 
+/// Gameplay rows can dwarf the base document after adding mod blocks. Keep
+/// the vanilla rows for template lookups and write each added row immediately.
+fn write_gameplay_table(plan: &Plan<'_>, doc: &J, mut out: impl Write) -> Result<()> {
+    let J::Obj(fields) = doc else {
+        return Err("no list at /states".into());
+    };
+    let Some(states_index) = fields.iter().position(|(key, _)| key == "states") else {
+        return Err("no list at /states".into());
+    };
+    let J::Arr(vanilla) = &fields[states_index].1 else {
+        return Err("no list at /states".into());
+    };
+    out.write_all(b"{")?;
+    for (index, (key, value)) in fields.iter().enumerate() {
+        if index != 0 {
+            out.write_all(b",")?;
+        }
+        serde_json::to_writer(&mut out, key)?;
+        out.write_all(b":")?;
+        if index != states_index {
+            serde_json::to_writer(&mut out, value)?;
+            continue;
+        }
+
+        out.write_all(b"[")?;
+        let mut first = true;
+        let mut write_row = |row: &J| -> Result<()> {
+            if !first {
+                out.write_all(b",")?;
+            }
+            first = false;
+            serde_json::to_writer(&mut out, row)?;
+            Ok(())
+        };
+        for row in vanilla {
+            write_row(row)?;
+        }
+        plan.emit_states(vanilla, false, Rows::Gameplay, |row| write_row(&row))?;
+        out.write_all(b"]")?;
+    }
+    out.write_all(b"}")?;
+    Ok(())
+}
+
 /// Rewrites the base's per-state tables for the mods' states into the
 /// overlay. They are independent: [`TABLE_THREADS`] threads take them,
 /// the largest first.
@@ -1104,6 +1434,13 @@ fn tables(base: &Path, plan: &Plan, overlay: &Overlay<'_>) -> Result<()> {
     }
     let table = |name: &str| -> Result<()> {
         let path = base.join(name);
+        if name == "gameplay-facts.json" {
+            let doc = read_json(&path)?;
+            let mut out = BufWriter::new(overlay.create(name)?);
+            write_gameplay_table(plan, &doc, &mut out).map_err(|e| format!("{name}: {e}"))?;
+            out.flush()?;
+            return Ok(());
+        }
         let bytes = if JSON_TABLES.contains(&name) {
             let mut doc = read_json(&path)?;
             plan.json(name, &mut doc)
@@ -1144,6 +1481,18 @@ fn tables(base: &Path, plan: &Plan, overlay: &Overlay<'_>) -> Result<()> {
 /// Builds the content root for `mods` over `base` in `out`. Returns the
 /// warnings for the log: the shared tags a mod replaced.
 pub fn build(base: &Path, mods: &[ContentMod], out: &Path) -> Result<Vec<String>> {
+    build_with_server(base, mods, None, out)
+}
+
+/// [`build`], adding the blocks of the server's state table at
+/// `server_table` that no mod declares (`mod_content_server.rs`). The warnings also name
+/// the server blocks left out.
+pub fn build_with_server(
+    base: &Path,
+    mods: &[ContentMod],
+    server_table: Option<&Path>,
+    out: &Path,
+) -> Result<Vec<String>> {
     // Two mods owning one namespace would mix their files.
     for (i, a) in mods.iter().enumerate() {
         for b in &mods[..i] {
@@ -1158,12 +1507,12 @@ pub fn build(base: &Path, mods: &[ContentMod], out: &Path) -> Result<Vec<String>
     }
     // The overlay links to the base: a relative base would leave them dangling.
     let base = &std::path::absolute(base)?;
-    let plan = Plan::new(base, mods)?;
+    let plan = Plan::new(base, mods, server_table)?;
     let overlay = Overlay::new(base, out)?;
     tables(base, &plan, &overlay)?;
     // Mod files, and every tag addition gathered per tag file.
     let mut tags: BTreeMap<String, TagMerge> = BTreeMap::new();
-    let mut warnings = Vec::new();
+    let mut warnings = plan.warnings.clone();
     let mut worldgen: BTreeMap<&str, Vec<(String, String)>> = BTreeMap::new();
     let mut additions: BTreeMap<&str, Vec<Addition>> = BTreeMap::new();
     for m in mods {
@@ -1171,11 +1520,15 @@ pub fn build(base: &Path, mods: &[ContentMod], out: &Path) -> Result<Vec<String>
         let mut reader = m.content.reader()?;
         for file in &m.content.files {
             let bytes = reader.read(file)?;
-            let is_tag = file.starts_with("data/") && file.contains("/tags/");
+            // data/<ns>/tags/<registry>/...: a mod's own data under another
+            // folder named tags (Big Cannons' block_armor/tags) is not one.
+            let is_tag = file.starts_with("data/") && file.split('/').nth(2) == Some("tags");
             if is_tag && file.ends_with(".json") {
                 let doc: J = serde_json::from_slice(&bytes).map_err(|e| format!("{file}: {e}"))?;
                 let Some(J::Arr(values)) = doc.get("values") else {
-                    return Err(format!("{}: {file}: no values", m.id).into());
+                    // One malformed tag skips that file, not every mod.
+                    warnings.push(format!("{}: {file}: a tag without values, skipped", m.id));
+                    continue;
                 };
                 let replace = doc.get("replace") == Some(&J::Bool(true));
                 let ns = file.split('/').nth(1).unwrap_or_default();
@@ -1330,7 +1683,7 @@ pub fn build(base: &Path, mods: &[ContentMod], out: &Path) -> Result<Vec<String>
         .collect();
     namespaces.sort();
     overlay.write(MARKER, &serde_json::to_vec(&namespaces)?)?;
-    if mods.iter().any(|m| !m.content.blocks.is_empty()) {
+    if mods.iter().any(|m| !m.content.blocks.is_empty()) || !plan.server.is_empty() {
         overlay.write(crate::content_identity::MARKER, b"1")?;
     }
     overlay.write(WARNINGS, warnings.join("\n").as_bytes())?;
@@ -1348,17 +1701,20 @@ pub fn resource_root(base: &Path, mods: &[ContentMod], cache: &Path) -> Result<P
         return Ok(base.to_owned());
     }
     let out = cache.join("mod-content");
-    let stamp = stamp(base, mods)?;
+    let server_table = server::table();
+    let stamp = stamp(base, mods, server_table.as_deref())?;
     if fs::read(out.join(STAMP)).is_ok_and(|s| s == stamp.as_bytes()) {
         // A reused root warns as the build did.
         let warnings = fs::read_to_string(out.join(WARNINGS)).unwrap_or_default();
         warnings.lines().for_each(|w| log::warn!("Horizon: {w}"));
         return Ok(out);
     }
-    for warning in build(base, mods, &out)? {
+    for warning in build_with_server(base, mods, server_table.as_deref(), &out)? {
         log::warn!("Horizon: {warning}");
     }
-    fs::write(out.join(STAMP), stamp)?;
+    let pending = out.join(format!("{STAMP}.{}.tmp", std::process::id()));
+    fs::write(&pending, stamp)?;
+    fs::rename(&pending, out.join(STAMP))?;
     Ok(out)
 }
 
@@ -1369,9 +1725,10 @@ const WARNINGS: &str = "horizon-mod-content-warnings.txt";
 const STAMP: &str = "horizon-mod-content.stamp";
 
 /// What a content root is built from: this build of the game, the base's
-/// manifest and the tables [`build`] rewrites, and every file of every mod
-/// in order. Files count by size and modification time, as build tools do.
-fn stamp(base: &Path, mods: &[ContentMod]) -> Result<String> {
+/// manifest and the tables [`build`] rewrites, every file of every mod in
+/// order, and the server's state table when there is one. Files count by
+/// size and modification time, as build tools do.
+fn stamp(base: &Path, mods: &[ContentMod], server_table: Option<&Path>) -> Result<String> {
     use sha2::{Digest, Sha256};
     let meta = |path: &Path| -> Result<String> {
         let m = fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -1387,7 +1744,17 @@ fn stamp(base: &Path, mods: &[ContentMod]) -> Result<String> {
         ))
     };
     let mut parts = vec!["horizon mod content 1".to_owned()];
-    parts.push(meta(&std::env::current_exe()?)?);
+    // The builder's own source, not the executable: every rebuild of the
+    // game changed the exe's stamp and re-extracted every mod (minutes) on
+    // the next launch, though only this file decides what a root holds.
+    parts.push(format!(
+        "builder {:x}",
+        Sha256::digest(include_str!("mod_content.rs").as_bytes())
+    ));
+    parts.push(format!(
+        "server blocks {:x}",
+        Sha256::digest(include_str!("mod_content_server.rs").as_bytes())
+    ));
     let base = std::path::absolute(base)?;
     parts.push(
         String::from_utf8_lossy(&fs::read(base.join("horizon-resources.json"))?).into_owned(),
@@ -1401,12 +1768,20 @@ fn stamp(base: &Path, mods: &[ContentMod]) -> Result<String> {
         parts.push(m.id.clone());
         let source = m.content.source();
         if source.is_dir() {
+            let manifest = source.join(horizon_mods::manifest::MANIFEST);
+            if manifest.exists() {
+                parts.push(meta(&manifest)?);
+            }
             for file in &m.content.files {
                 parts.push(meta(&source.join(file))?);
             }
         } else {
             parts.push(meta(source)?);
         }
+    }
+    // Without it a root built for another server's blocks would be reused.
+    if let Some(table) = server_table.filter(|t| t.is_file()) {
+        parts.push(format!("server states {}", meta(table)?));
     }
     let mut hasher = Sha256::new();
     for part in &parts {

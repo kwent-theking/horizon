@@ -106,6 +106,7 @@ pub mod registry;
 pub mod registry_collision_scan;
 pub mod registry_fall_ray;
 pub mod registry_fluid;
+pub mod resource_cache;
 pub mod retrogen;
 pub mod server_player_combat;
 pub mod server_player_damage;

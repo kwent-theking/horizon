@@ -13,6 +13,8 @@ use std::{
     marker::PhantomData,
     sync::Arc,
 };
+mod stream;
+pub(super) use stream::{Row, read as stream};
 
 // RawValue skips numeric range and depth checks. A non-allocating validation pass
 // keeps the original Value loader's JSON errors, even in overwritten/unused fields.
@@ -126,8 +128,10 @@ fn text(v: Value) -> Option<String> {
     }
 }
 
+#[cfg(test)]
 #[derive(Default)]
 pub(super) struct Entries<'a>(pub Option<Vec<Entry<'a>>>);
+#[cfg(test)]
 impl<'de> Container<'de> for Entries<'de> {
     fn seq<A: SeqAccess<'de>>(mut seq: A) -> Result<Self, A::Error> {
         let mut entries = Vec::new();
@@ -137,11 +141,13 @@ impl<'de> Container<'de> for Entries<'de> {
         Ok(Self(Some(entries)))
     }
 }
+#[cfg(test)]
 impl<'de> Deserialize<'de> for Entries<'de> {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         container(d)
     }
 }
+#[cfg(test)]
 object!(Gameplay<'a> { states: Entries<'a> = Entries::default() => typed });
 object!(SoundId<'a> { id: Option<String> = None => value(text) });
 object!(Sound<'a> {
@@ -240,15 +246,15 @@ impl Hash for ShapeKey {
     }
 }
 #[derive(Default)]
-pub(super) struct Shapes<'a> {
-    raw: HashMap<&'a str, usize>,
+pub(super) struct Shapes {
+    raw: HashMap<Box<str>, usize>,
     canonical: HashMap<ShapeKey, usize>,
     values: Vec<Arc<[[f64; 6]]>>,
 }
-impl<'a> Shapes<'a> {
+impl Shapes {
     pub fn intern(
         &mut self,
-        raw: Option<&'a RawValue>,
+        raw: Option<&RawValue>,
         fallback: impl FnOnce() -> Vec<[f64; 6]>,
     ) -> crate::Result<Arc<[[f64; 6]]>> {
         let Some(raw) = raw else {
@@ -283,7 +289,7 @@ impl<'a> Shapes<'a> {
                 id
             }
         };
-        self.raw.insert(raw.get(), id);
+        self.raw.insert(raw.get().into(), id);
         Ok(self.values[id].clone())
     }
 }

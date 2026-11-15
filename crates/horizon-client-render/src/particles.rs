@@ -47,18 +47,29 @@ pub struct ParticleOptions {
     /// `GeyserParticleOptions.waterBlocks` and `GeyserBaseParticleOptions`'
     /// `waterBlocks` and `burstImpulseBase` (0 where the type has none).
     pub geyser: Option<(i32, f32)>,
+    /// A content mod's particle (`ns:name`): drawn from its own sprite set as
+    /// a generic particle, `ty` only picking the layer.
+    pub modded: Option<String>,
 }
 impl ParticleOptions {
     pub fn simple(ty: ParticleType) -> Self {
         Self {
             ty,
             block: None,
+            modded: None,
             color: [1.0; 4],
             scale: 1.0,
             to_color: [1.0, 0.0, 0.0],
             trail: None,
             item: None,
             geyser: None,
+        }
+    }
+    /// A content mod's particle by registry name.
+    pub fn modded(name: &str) -> Self {
+        Self {
+            modded: Some(name.to_owned()),
+            ..Self::simple(ParticleType::Poof)
         }
     }
     /// `GeyserParticleOptions(type, waterBlocks)`.
@@ -1054,6 +1065,8 @@ pub struct ParticleEngine {
     atlas: HashMap<String, (Rect, bool)>,
     sets: HashMap<ParticleType, u32>,
     set_sprites: Vec<Vec<u32>>,
+    /// Content mods' particle types (`ns:name`) to their sprite set.
+    modded_sets: HashMap<String, u32>,
     /// `TrackingEmitter`s: particle type, entity feet position, width, height, ticks left.
     emitters: Vec<(ParticleOptions, [f64; 3], f64, f64, u32)>,
     /// Camera position for the 32-block spawn limiter.
@@ -1087,6 +1100,7 @@ impl ParticleEngine {
             atlas: HashMap::new(),
             sets: HashMap::new(),
             set_sprites: Vec::new(),
+            modded_sets: HashMap::new(),
             emitters: Vec::new(),
             starters: Vec::new(),
             camera: [0.0; 3],
@@ -1118,6 +1132,7 @@ impl ParticleEngine {
             .collect();
         self.sets.clear();
         self.set_sprites.clear();
+        self.modded_sets.clear();
         self.item_sprites.clear();
         self.load_sprites(root);
     }
@@ -1147,6 +1162,41 @@ impl ParticleEngine {
                 self.set_sprites.push(sprites);
             }
         }
+        self.load_modded_sprites(root);
+    }
+    /// The sprite sets of content mods' particle definitions; only sprites the
+    /// atlas holds count, and a type with none is left out (it falls back).
+    fn load_modded_sprites(&mut self, root: &Path) {
+        for definition in crate::particle_defs::scan(root) {
+            let known: Vec<&String> = definition
+                .sprites
+                .iter()
+                .filter(|s| self.atlas.contains_key(s.as_str()))
+                .collect();
+            let sprites: Vec<u32> = known.into_iter().map(|s| self.intern(s)).collect();
+            if !sprites.is_empty() {
+                self.modded_sets
+                    .insert(definition.name, self.set_sprites.len() as u32);
+                self.set_sprites.push(sprites);
+            }
+        }
+    }
+    /// Whether a content mod's particle type has sprites to draw.
+    pub fn has_modded(&self, name: &str) -> bool {
+        self.modded_sets.contains_key(name)
+    }
+    /// A content mod's particle as vanilla's generic `Particle(x, y, z, xa, ya,
+    /// za)`: default lifetime, size and drift, cycling its sprites with age.
+    fn make_modded(&mut self, name: &str, p: [f64; 3], v: [f64; 3], seed: i64) -> Option<Particle> {
+        let set = *self.modded_sets.get(name)?;
+        let mut local = LegacyRandom::new(seed);
+        let mut q = Particle::moving(&mut local, ParticleType::Poof, p, v);
+        q.set = Some(set);
+        q.sprite = Sprite::Index(self.set_sprites[set as usize][0]);
+        q.behaviour = Behaviour::Animated;
+        self.sprite_from_age(&mut q);
+        q.random = local;
+        Some(q)
     }
     fn intern(&mut self, name: &str) -> u32 {
         if let Some(i) = self.names.iter().position(|n| n == name) {
@@ -1593,6 +1643,9 @@ impl ParticleEngine {
         seed: i64,
     ) -> Option<Particle> {
         use ParticleType as T;
+        if let Some(name) = &o.modded {
+            return self.make_modded(name, p, v, seed);
+        }
         let ty = o.ty;
         let set = self.set_of(ty);
         let mut local = LegacyRandom::new(seed);
@@ -3966,148 +4019,262 @@ impl ParticleEngine {
         light_at: &dyn Fn([i32; 3]) -> u8,
         out: &mut Vec<Vertex>,
     ) {
+        let timing = particle_timing_enabled().then(std::time::Instant::now);
         // Camera.setRotation: rotationYXZ(PI - yRot, -xRot, 0).
         let base = Quat::from_rotation_y(std::f32::consts::PI - yaw.to_radians())
             * Quat::from_rotation_x(-pitch.to_radians());
+        if self.particles.len() < 256 {
+            for p in &self.particles {
+                if let Some((p, r, layer, packed)) = render_input(self, p, light_at) {
+                    render_particle(p, r, layer, packed, camera, base, partial, out);
+                }
+            }
+            if let Some(started) = timing {
+                record_particle_timing(started, 1, self.particles.len());
+            }
+            return;
+        }
+        let mut inputs = Vec::new();
         for p in &self.particles {
-            if p.no_render {
-                continue;
+            if let Some(input) = render_input(self, p, light_at) {
+                inputs.push(input);
             }
-            // SparkParticle.extract: twinkling sparks blink after a third of their life.
-            if let Behaviour::Spark { twinkle: true, .. } = p.behaviour
-                && p.age >= p.lifetime / 3
-                && ((p.age + p.lifetime) / 3) % 2 != 0
-            {
-                continue;
-            }
-            // `SubmitNodeCollection.submitQuadParticleGroup`: the translucent
-            // layer draws after translucent terrain, so a crumb of stained
-            // glass cannot hide the glass behind it (`getLayer`).
-            let (rect, layer) = match &p.sprite {
-                Sprite::Index(i) => (
-                    self.rects.get(*i as usize).copied().flatten(),
-                    p.ty.translucent_layer(),
-                ),
-                Sprite::Named(name) => match self.atlas.get(name) {
-                    Some(&(rect, translucent)) => (Some(rect), translucent),
-                    None => (None, false),
-                },
-            };
-            let Some(r) = rect else { continue };
-            let a = f64::from(partial);
-            let pos = DVec3::new(
-                p.previous[0] + (p.position[0] - p.previous[0]) * a,
-                p.previous[1] + (p.position[1] - p.previous[1]) * a,
-                p.previous[2] + (p.position[2] - p.previous[2]) * a,
-            ) - camera;
-            let center = pos.as_vec3();
-            let rotation = if p.roll != 0.0 {
-                base * Quat::from_rotation_z(p.o_roll + (p.roll - p.o_roll) * partial)
-            } else {
-                base
-            };
-            let size = p.quad_size(partial);
-            let mut alpha = p.rgba[3];
-            // OverlayParticle.extract: the flash fades as it pulses.
-            if p.ty == ParticleType::Flash {
-                alpha = 0.6 - (p.age as f32 + partial - 1.0) * 0.25 * 0.5;
-            }
-            if let Behaviour::FlyTowards { alpha: la, .. } = p.behaviour {
-                alpha = lifetime_alpha(la, p.age, p.lifetime, partial);
-            }
-            let mut rotations = [Some(rotation), None];
-            let mut rgb = [p.rgba[0], p.rgba[1], p.rgba[2]];
-            match p.behaviour {
-                // ShriekParticle.extract: two tilted quads, fading out.
-                Behaviour::Shriek { delay } => {
-                    if delay > 0 {
-                        continue;
-                    }
-                    alpha = 1.0 - ((p.age as f32 + partial) / p.lifetime as f32).clamp(0.0, 1.0);
-                    rotations = [
-                        Some(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_3)),
-                        Some(Quat::from_euler(
-                            glam::EulerRot::YXZ,
-                            -std::f32::consts::PI,
-                            std::f32::consts::FRAC_PI_3,
-                            0.0,
-                        )),
-                    ];
-                }
-                // VibrationSignalParticle.extract: two quads along the flight.
-                Behaviour::Vibration {
-                    rot,
-                    rot_o,
-                    pitch,
-                    pitch_o,
-                    ..
-                } => {
-                    let sway =
-                        ((p.age as f32 + partial - std::f32::consts::TAU) * 0.05).sin() * 2.0;
-                    let lerped_rot = rot_o + (rot - rot_o) * partial;
-                    let lerped_pitch =
-                        pitch_o + (pitch - pitch_o) * partial + std::f32::consts::FRAC_PI_2;
-                    rotations = [
-                        Some(
-                            Quat::from_rotation_y(lerped_rot)
-                                * Quat::from_rotation_x(-lerped_pitch)
-                                * Quat::from_rotation_y(sway),
-                        ),
-                        Some(
-                            Quat::from_rotation_y(-std::f32::consts::PI + lerped_rot)
-                                * Quat::from_rotation_x(lerped_pitch)
-                                * Quat::from_rotation_y(sway),
-                        ),
-                    ];
-                }
-                // DustColorTransitionParticle.lerpColors.
-                Behaviour::Transition { from, to } => {
-                    let t = (p.age as f32 + partial) / (p.lifetime as f32 + 1.0);
-                    rgb = std::array::from_fn(|i| from[i] + (to[i] - from[i]) * t);
-                }
-                _ => {}
-            }
-            let block = ParticleLevel::block_at(p.position);
-            let packed = light_at(block);
-            let (sky_light, block_light) = p.light_coords(
-                partial,
-                u32::from(packed >> 4) * 16,
-                u32::from(packed & 15) * 16,
-            );
-            let light = sky_light | block_light << 8;
-            let c = |v: f32| (v.clamp(0.0, 1.0) * 255.0) as u32;
-            let color = c(alpha) << 24 | c(rgb[2]) << 16 | c(rgb[1]) << 8 | c(rgb[0]);
-            let (du, dv) = (r.u1 - r.u0, r.v1 - r.v0);
-            let (u0, v0, u1, v1) = (
-                r.u0 + du * p.uv[0],
-                r.v0 + dv * p.uv[1],
-                r.u0 + du * p.uv[2],
-                r.v0 + dv * p.uv[3],
-            );
-            for rotation in rotations.into_iter().flatten() {
-                for (n, uv) in [
-                    ((1.0, -1.0), [u1, v1]),
-                    ((1.0, 1.0), [u1, v0]),
-                    ((-1.0, 1.0), [u0, v0]),
-                    ((-1.0, -1.0), [u0, v1]),
-                ] {
-                    let v = center + rotation * FVec3::new(n.0, n.1, 0.0) * size;
-                    out.push(Vertex {
-                        normal: [0; 4],
-                        pos: v.to_array(),
-                        uv,
-                        layer: if layer {
-                            crate::gfx::TRANSLUCENT_PARTICLE_OVERLAY
-                        } else {
-                            u32::from(hdr_tier(p.ty)) << 16
-                        },
-                        color,
-                        light,
+        }
 
-                        glint_uv: [0.0, 0.0],
-                    });
+        let threads = crate::par::frame_threads(crate::par::threads(), inputs.len(), 256);
+        render_inputs(&inputs, threads, camera, base, partial, out);
+        if let Some(started) = timing {
+            record_particle_timing(started, threads, inputs.len());
+        }
+    }
+}
+
+fn particle_timing_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("HORIZON_PARTICLE_TIMING").is_some())
+}
+
+fn record_particle_timing(started: std::time::Instant, threads: usize, particles: usize) {
+    use std::sync::{Mutex, OnceLock};
+    static WINDOW: OnceLock<Mutex<(std::time::Instant, u64, usize, usize, std::time::Duration)>> =
+        OnceLock::new();
+    let window = WINDOW.get_or_init(|| {
+        Mutex::new((
+            std::time::Instant::now(),
+            0,
+            0,
+            0,
+            std::time::Duration::ZERO,
+        ))
+    });
+    let elapsed = started.elapsed();
+    if let Ok(mut window) = window.lock() {
+        window.1 += 1;
+        window.2 = window.2.max(threads);
+        window.3 = window.3.max(particles);
+        window.4 += elapsed;
+        if window.0.elapsed() >= std::time::Duration::from_secs(10) {
+            log::debug!(
+                "Horizon particle render: {} frames, max_particles={}, max_threads={}, avg={:?} in 10s",
+                window.1,
+                window.3,
+                window.2,
+                window.4 / window.1.min(u32::MAX as u64) as u32
+            );
+            *window = (
+                std::time::Instant::now(),
+                0,
+                0,
+                0,
+                std::time::Duration::ZERO,
+            );
+        }
+    }
+}
+
+fn render_input<'a>(
+    engine: &'a ParticleEngine,
+    p: &'a Particle,
+    light_at: &dyn Fn([i32; 3]) -> u8,
+) -> Option<(&'a Particle, Rect, bool, u8)> {
+    if p.no_render {
+        return None;
+    }
+    // SparkParticle.extract: twinkling sparks blink after a third of their life.
+    if let Behaviour::Spark { twinkle: true, .. } = p.behaviour
+        && p.age >= p.lifetime / 3
+        && ((p.age + p.lifetime) / 3) % 2 != 0
+    {
+        return None;
+    }
+    // `SubmitNodeCollection.submitQuadParticleGroup`: the translucent
+    // layer draws after translucent terrain, so a crumb of stained glass
+    // cannot hide the glass behind it (`getLayer`).
+    let (rect, layer) = match &p.sprite {
+        Sprite::Index(i) => (
+            engine.rects.get(*i as usize).copied().flatten(),
+            p.ty.translucent_layer(),
+        ),
+        Sprite::Named(name) => match engine.atlas.get(name) {
+            Some(&(rect, translucent)) => (Some(rect), translucent),
+            None => (None, false),
+        },
+    };
+    let r = rect?;
+    if matches!(p.behaviour, Behaviour::Shriek { delay } if delay > 0) {
+        return None;
+    }
+    // The light callback can access the live world and is not Sync.
+    // Query it serially in the same order as the original render loop.
+    let packed = light_at(ParticleLevel::block_at(p.position));
+    Some((p, r, layer, packed))
+}
+
+fn render_inputs(
+    inputs: &[(&Particle, Rect, bool, u8)],
+    threads: usize,
+    camera: DVec3,
+    base: Quat,
+    partial: f32,
+    out: &mut Vec<Vertex>,
+) {
+    if threads == 1 {
+        for (p, r, layer, packed) in inputs.iter().copied() {
+            render_particle(p, r, layer, packed, camera, base, partial, out);
+        }
+    } else {
+        crate::par::map_batches_with(
+            threads,
+            inputs.chunks(64),
+            crate::par::MAX_PAR_THREADS,
+            |chunk| {
+                let mut vertices = Vec::with_capacity(chunk.len() * 4);
+                for (p, r, layer, packed) in chunk.iter().copied() {
+                    render_particle(p, r, layer, packed, camera, base, partial, &mut vertices);
                 }
-            }
+                vertices
+            },
+            |vertices| out.extend(vertices),
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_particle(
+    p: &Particle,
+    r: Rect,
+    layer: bool,
+    packed: u8,
+    camera: DVec3,
+    base: Quat,
+    partial: f32,
+    out: &mut Vec<Vertex>,
+) {
+    let a = f64::from(partial);
+    let pos = DVec3::new(
+        p.previous[0] + (p.position[0] - p.previous[0]) * a,
+        p.previous[1] + (p.position[1] - p.previous[1]) * a,
+        p.previous[2] + (p.position[2] - p.previous[2]) * a,
+    ) - camera;
+    let center = pos.as_vec3();
+    let rotation = if p.roll != 0.0 {
+        base * Quat::from_rotation_z(p.o_roll + (p.roll - p.o_roll) * partial)
+    } else {
+        base
+    };
+    let size = p.quad_size(partial);
+    let mut alpha = p.rgba[3];
+    // OverlayParticle.extract: the flash fades as it pulses.
+    if p.ty == ParticleType::Flash {
+        alpha = 0.6 - (p.age as f32 + partial - 1.0) * 0.25 * 0.5;
+    }
+    if let Behaviour::FlyTowards { alpha: la, .. } = p.behaviour {
+        alpha = lifetime_alpha(la, p.age, p.lifetime, partial);
+    }
+    let mut rotations = [Some(rotation), None];
+    let mut rgb = [p.rgba[0], p.rgba[1], p.rgba[2]];
+    match p.behaviour {
+        // ShriekParticle.extract: two tilted quads, fading out.
+        Behaviour::Shriek { .. } => {
+            alpha = 1.0 - ((p.age as f32 + partial) / p.lifetime as f32).clamp(0.0, 1.0);
+            rotations = [
+                Some(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_3)),
+                Some(Quat::from_euler(
+                    glam::EulerRot::YXZ,
+                    -std::f32::consts::PI,
+                    std::f32::consts::FRAC_PI_3,
+                    0.0,
+                )),
+            ];
+        }
+        // VibrationSignalParticle.extract: two quads along the flight.
+        Behaviour::Vibration {
+            rot,
+            rot_o,
+            pitch,
+            pitch_o,
+            ..
+        } => {
+            let sway = ((p.age as f32 + partial - std::f32::consts::TAU) * 0.05).sin() * 2.0;
+            let lerped_rot = rot_o + (rot - rot_o) * partial;
+            let lerped_pitch = pitch_o + (pitch - pitch_o) * partial + std::f32::consts::FRAC_PI_2;
+            rotations = [
+                Some(
+                    Quat::from_rotation_y(lerped_rot)
+                        * Quat::from_rotation_x(-lerped_pitch)
+                        * Quat::from_rotation_y(sway),
+                ),
+                Some(
+                    Quat::from_rotation_y(-std::f32::consts::PI + lerped_rot)
+                        * Quat::from_rotation_x(lerped_pitch)
+                        * Quat::from_rotation_y(sway),
+                ),
+            ];
+        }
+        // DustColorTransitionParticle.lerpColors.
+        Behaviour::Transition { from, to } => {
+            let t = (p.age as f32 + partial) / (p.lifetime as f32 + 1.0);
+            rgb = std::array::from_fn(|i| from[i] + (to[i] - from[i]) * t);
+        }
+        _ => {}
+    }
+    let (sky_light, block_light) = p.light_coords(
+        partial,
+        u32::from(packed >> 4) * 16,
+        u32::from(packed & 15) * 16,
+    );
+    let light = sky_light | block_light << 8;
+    let c = |v: f32| (v.clamp(0.0, 1.0) * 255.0) as u32;
+    let color = c(alpha) << 24 | c(rgb[2]) << 16 | c(rgb[1]) << 8 | c(rgb[0]);
+    let (du, dv) = (r.u1 - r.u0, r.v1 - r.v0);
+    let (u0, v0, u1, v1) = (
+        r.u0 + du * p.uv[0],
+        r.v0 + dv * p.uv[1],
+        r.u0 + du * p.uv[2],
+        r.v0 + dv * p.uv[3],
+    );
+    for rotation in rotations.into_iter().flatten() {
+        for (n, uv) in [
+            ((1.0, -1.0), [u1, v1]),
+            ((1.0, 1.0), [u1, v0]),
+            ((-1.0, 1.0), [u0, v0]),
+            ((-1.0, -1.0), [u0, v1]),
+        ] {
+            let v = center + rotation * FVec3::new(n.0, n.1, 0.0) * size;
+            out.push(Vertex {
+                normal: [0; 4],
+                pos: v.to_array(),
+                uv,
+                layer: if layer {
+                    crate::gfx::TRANSLUCENT_PARTICLE_OVERLAY
+                } else {
+                    u32::from(hdr_tier(p.ty)) << 16
+                },
+                color,
+                light,
+
+                glint_uv: [0.0, 0.0],
+            });
         }
     }
 }
@@ -4176,6 +4343,97 @@ const CREEPER: [[f64; 2]; 12] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn render_preserves_light_lookup_order_and_geometry_for_worker_counts() {
+        let mut engine = ParticleEngine::new(Path::new(""), &HashMap::new(), &HashSet::new());
+        engine.rects.push(Some(Rect {
+            u0: 0.0,
+            v0: 0.0,
+            u1: 1.0,
+            v1: 1.0,
+            w: 16,
+            h: 16,
+        }));
+        let mut random = LegacyRandom::new(7);
+        for i in 0..260 {
+            let mut p = Particle::moving(
+                &mut random,
+                ParticleType::Poof,
+                [i as f64 * 0.01, 2.0, -1.0],
+                [0.0; 3],
+            );
+            p.sprite = Sprite::Index(0);
+            match i {
+                0 => p.no_render = true,
+                1 => {
+                    p.behaviour = Behaviour::Spark {
+                        fade: None,
+                        trail: false,
+                        twinkle: true,
+                    };
+                    p.age = 11;
+                    p.lifetime = 30;
+                }
+                2 => p.sprite = Sprite::Index(1),
+                3 => p.behaviour = Behaviour::Shriek { delay: 1 },
+                _ => {}
+            }
+            engine.particles.push(p);
+        }
+
+        let expected_lookups: Vec<_> = engine.particles[4..]
+            .iter()
+            .map(|p| ParticleLevel::block_at(p.position))
+            .collect();
+        let lookups = std::cell::RefCell::new(Vec::new());
+        let mut public = Vec::new();
+        engine.render(
+            DVec3::ZERO,
+            0.0,
+            0.0,
+            0.5,
+            &|block| {
+                lookups.borrow_mut().push(block);
+                0xF0
+            },
+            &mut public,
+        );
+        assert_eq!(*lookups.borrow(), expected_lookups);
+
+        let baseline_lookups = std::cell::RefCell::new(Vec::new());
+        let inputs: Vec<_> = engine
+            .particles
+            .iter()
+            .filter_map(|p| {
+                render_input(&engine, p, &|block| {
+                    baseline_lookups.borrow_mut().push(block);
+                    0xF0
+                })
+            })
+            .collect();
+        assert_eq!(*baseline_lookups.borrow(), expected_lookups);
+        assert_eq!(inputs.len(), 256);
+        assert_eq!(crate::par::frame_threads(6, 255, 256), 1);
+        assert_eq!(crate::par::frame_threads(6, 256, 256), 6);
+        let camera = DVec3::ZERO;
+        let base = Quat::IDENTITY;
+        let mut serial = Vec::new();
+        render_inputs(&inputs, 1, camera, base, 0.5, &mut serial);
+        assert_eq!(
+            bytemuck::cast_slice::<Vertex, u8>(&public),
+            bytemuck::cast_slice::<Vertex, u8>(&serial),
+        );
+        for threads in [2, 6] {
+            let mut parallel = Vec::new();
+            render_inputs(&inputs, threads, camera, base, 0.5, &mut parallel);
+            assert_eq!(
+                bytemuck::cast_slice::<Vertex, u8>(&serial),
+                bytemuck::cast_slice::<Vertex, u8>(&parallel),
+                "particle geometry changed with {threads} workers"
+            );
+        }
+    }
 
     #[test]
     fn egg_teleport_unpacks_offsets_and_preserves_seeded_draw_order() {

@@ -29,14 +29,24 @@ impl Ingredient {
     }
     pub(crate) fn parse(v: &Value, items: &Items) -> Option<Self> {
         let mut list: Vec<String> = Vec::new();
+        let mut seen = HashSet::new();
         let mut add = |s: &str| {
-            let more: Vec<String> = match s.strip_prefix('#') {
-                Some(tag) => items.item_tag_order.get(tag).cloned().unwrap_or_default(),
-                None => vec![s.to_owned()],
+            let more: &[String] = match s.strip_prefix('#') {
+                Some(tag) => items
+                    .item_tag_order
+                    .get(tag)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default(),
+                None => {
+                    if seen.insert(s.to_owned()) {
+                        list.push(s.to_owned());
+                    }
+                    return;
+                }
             };
             for i in more {
-                if !list.contains(&i) {
-                    list.push(i);
+                if seen.insert(i.clone()) {
+                    list.push(i.clone());
                 }
             }
         };
@@ -45,7 +55,7 @@ impl Ingredient {
             Value::Array(a) => a.iter().filter_map(Value::as_str).for_each(&mut add),
             _ => return None,
         }
-        (!list.is_empty()).then(|| Self::of(list))
+        (!list.is_empty()).then_some(Self(seen, list))
     }
     pub fn test(&self, stack: &ItemStack) -> bool {
         self.0.contains(&*stack.item)
@@ -1651,6 +1661,24 @@ impl Recipes {
 mod tests {
     use super::*;
     use crate::banner::BannerLayer;
+
+    #[test]
+    fn ingredient_tags_keep_first_occurrence_order() {
+        let mut items = Items::for_tests(HashMap::new());
+        items.item_tag_order.insert(
+            "test:all".into(),
+            ["test:b", "test:a", "test:b"].map(str::to_owned).into(),
+        );
+        let parsed = Ingredient::parse(
+            &serde_json::json!(["test:c", "#test:all", "test:a", "#missing", "#test:all"]),
+            &items,
+        )
+        .unwrap();
+        assert_eq!(parsed.1, ["test:c", "test:b", "test:a"]);
+        assert_eq!(parsed.0, parsed.1.iter().cloned().collect::<HashSet<_>>());
+        assert!(Ingredient::parse(&serde_json::json!("#missing"), &items).is_none());
+        assert!(Ingredient::parse(&serde_json::json!({}), &items).is_none());
+    }
 
     #[test]
     fn result_count_is_bounded_like_vanilla() {

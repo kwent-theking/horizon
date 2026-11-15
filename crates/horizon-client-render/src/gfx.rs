@@ -154,6 +154,31 @@ fn world_pass_after_culling<'e>(
         ..Default::default()
     })
 }
+/// Sable's plot parking lot (`SubLevelContainer`): global chunk coordinate =
+/// local + (((PLOT_ORIGIN + px) << LOG_PLOT_SIZE), ...), with PLOTS_PER_AXIS
+/// plots per axis. Mirrors `horizon_client::sublevel` (the render crate must
+/// not depend on the game crate, so the constants are repeated here).
+/// RU: «парковка плот» Sable: глобальная координата чанка = локальная +
+/// ((10000 + px) << 7). Зеркалит `horizon_client::sublevel`; render-крейт
+/// не зависит от game-крейта, поэтому константы продублированы.
+const PLOT_ORIGIN: i32 = 10_000;
+const LOG_PLOT_SIZE: i32 = 7;
+const PLOTS_PER_AXIS: i32 = 1 << LOG_PLOT_SIZE;
+/// The render offset of the plot parking-lot column (chunk x, z) from
+/// `Renderer::plot_offsets`, `None` for a normal world column.
+/// RU: смещение колонки (x, z) из «парковки плот» по
+/// `Renderer::plot_offsets`, None для обычной колонки мира.
+fn plot_offset_at(offsets: &[((i32, i32), [f64; 3])], x: i32, z: i32) -> Option<[f64; 3]> {
+    let px = (x >> LOG_PLOT_SIZE) - PLOT_ORIGIN;
+    let pz = (z >> LOG_PLOT_SIZE) - PLOT_ORIGIN;
+    if !(0..PLOTS_PER_AXIS).contains(&px) || !(0..PLOTS_PER_AXIS).contains(&pz) {
+        return None;
+    }
+    offsets
+        .iter()
+        .find(|&&(plot, _)| plot == (px, pz))
+        .map(|&(_, o)| o)
+}
 fn section_instance(origin: [f32; 3]) -> [f32; 4] {
     [
         origin[0],
@@ -529,6 +554,14 @@ pub struct Renderer {
     indirect_capacity: u64,
     /// Indirect draws may set `first_instance` (the section origin).
     pub multi_draw: bool,
+    /// Sable sub-level render offsets: plot coordinates -> world offset (in
+    /// blocks, f64) from the plot's parking-lot position to where the
+    /// sub-level is this frame. Sections meshed in a listed plot are culled
+    /// and drawn at their offset position (translation only for now).
+    /// RU: смещения под-уровней Sable для рендера: координаты плота ->
+    /// мировое смещение (в блоках, f64) от «парковки» до фактической позиции
+    /// под-уровня в этом кадре. Пока только перенос, без вращения.
+    plot_offsets: Vec<((i32, i32), [f64; 3])>,
     /// Per-frame scratch, kept to avoid allocating every frame.
     visible: Vec<resident::Visible>,
     visible_lods: Vec<lod::Visible>,
@@ -701,7 +734,7 @@ fn terrain_group(
 /// CPU texture uploads prepared by the resource worker. Consumed by renderer
 /// construction so the temporary mip chains are released after GPU upload.
 pub struct PreparedTextures {
-    sprites: Vec<(Vec<u8>, u32)>,
+    sprites: Vec<(crate::compact_bytes::CompactBytes, u32)>,
     forcefield: (Vec<u8>, u32),
 }
 impl PreparedTextures {
@@ -730,7 +763,8 @@ impl PreparedTextures {
                     let first = array * split;
                     let count = layers.saturating_sub(first).clamp(1, split);
                     let start = (first as usize * layer_bytes).min(pixels.len());
-                    mip_chain(&pixels[start..], size, settings, first, count)
+                    let (bytes, levels) = mip_chain(&pixels[start..], size, settings, first, count);
+                    (crate::compact_bytes::CompactBytes::new(bytes), levels)
                 })
                 .collect(),
             forcefield: mip_chain(forcefield.0, forcefield.1, &[], 0, 1),
@@ -1173,13 +1207,10 @@ impl Renderer {
             config.present_mode = previous
                 .map(|renderer| renderer.config.present_mode)
                 .filter(|mode| caps.present_modes.contains(mode))
-                .unwrap_or_else(|| {
-                    if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
-                        wgpu::PresentMode::Mailbox
-                    } else {
-                        wgpu::PresentMode::Fifo
-                    }
-                });
+                // Fifo (VSync, vanilla's default) until the options apply
+                // theirs: starting on Mailbox made the first set_present_mode
+                // reconfigure the swapchain mid-run on every launch.
+                .unwrap_or(wgpu::PresentMode::Fifo);
             if previous.is_none() {
                 startup_step(format_args!(
                     "device ready; configuring the surface ({}x{} {:?}, {:?})",
@@ -1509,7 +1540,8 @@ impl Renderer {
             .sprites
             .into_iter()
             .enumerate()
-            .map(|(array, (mut mips, levels))| {
+            .map(|(array, (mips, levels))| {
+                let mut mips = mips.into_decoded();
                 let first = array as u32 * split;
                 let used = layers.saturating_sub(first).clamp(1, split);
                 let count = array_layers(used, gl);
@@ -2729,6 +2761,7 @@ impl Renderer {
             indirect,
             indirect_capacity: 1024,
             multi_draw,
+            plot_offsets: Vec::new(),
             visible: Vec::new(),
             visible_lods: Vec::new(),
             shadow_visible: Vec::new(),
@@ -2961,6 +2994,16 @@ impl Renderer {
     /// Switches leaving out solid quads facing away, for A/B checks.
     pub fn set_section_sides(&mut self, on: bool) {
         self.sides_on = on;
+    }
+    /// The Sable sub-levels' render offsets for this frame: plot coordinates
+    /// -> world offset (blocks) from each plot's parking-lot origin to the
+    /// sub-level's interpolated position. Sections meshed in a listed plot
+    /// are culled and drawn where the sub-level is (translation only).
+    /// RU: смещения под-уровней Sable для текущего кадра: координаты плота ->
+    /// мировое смещение (в блоках) от origin «парковки» до интерполированной
+    /// позиции под-уровня. Пока только перенос.
+    pub fn set_plot_offsets(&mut self, offsets: Vec<((i32, i32), [f64; 3])>) {
+        self.plot_offsets = offsets;
     }
     /// Whether solid sections are occlusion culled (`cull`).
     pub fn section_cull(&self) -> bool {
@@ -3743,8 +3786,22 @@ impl Renderer {
                 self.recreate_surface()?;
                 return Ok(false);
             }
+            // wgpu reports every acquire error (AlreadyAcquired, NotConfigured,
+            // a driver hiccup) as Validation; treat it like a lost surface
+            // instead of ending the game.
             Some(wgpu::CurrentSurfaceTexture::Validation) => {
-                return Err("surface acquisition failed validation".into());
+                static FAILURES: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
+                let n = FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < 8 || n.is_power_of_two() {
+                    log::warn!(
+                        "Horizon renderer: surface acquisition failed validation \
+                         ({} times); recreating the surface",
+                        n + 1
+                    );
+                }
+                self.recreate_surface()?;
+                return Ok(false);
             }
         };
         let size = [self.config.width, self.config.height];
@@ -3939,6 +3996,18 @@ impl Renderer {
         }
         let reachable = &self.occlusion;
         let cutout = &self.lod_cutout;
+        // Sable sub-levels: parking-lot columns get their plot's offset, so
+        // the culling walk and the instance origins use where the sub-level
+        // is, not where it is meshed (translation only for now).
+        // RU: под-уровни Sable — колонки «парковки» получают смещение плота:
+        // culling и instance-origin считаются по фактической позиции
+        // под-уровня, а не по месту мешинга (пока только перенос).
+        let offsets = &self.plot_offsets;
+        let plot_offset = |x: i32, z: i32| {
+            (!offsets.is_empty())
+                .then(|| plot_offset_at(offsets, x, z))
+                .flatten()
+        };
         let mut visible = std::mem::take(&mut self.visible);
         visible.clear();
         crate::spans::time("visibility", || {
@@ -3946,6 +4015,7 @@ impl Renderer {
                 camera,
                 (frame.detail_distance / 16.0) as i32,
                 &view,
+                &plot_offset,
                 |k| !culling || reachable.contains(k),
                 |x, z| !cutout.is_empty() && cutout.contains(&(x, z)),
                 &mut visible,
@@ -3986,6 +4056,7 @@ impl Renderer {
                     camera,
                     radius,
                     &light,
+                    &plot_offset,
                     |_| true,
                     |_, _| false,
                     &mut shadow_visible,
@@ -6233,7 +6304,7 @@ mod sprite_upload_tests {
                 .iter()
                 .flat_map(|(bytes, levels)| {
                     assert_eq!(*levels, expected.1);
-                    bytes.iter().copied()
+                    bytes.decode().into_owned()
                 })
                 .collect();
             assert_eq!(actual, expected.0);

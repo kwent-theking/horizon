@@ -115,7 +115,7 @@ mod tests {
                         .unwrap()
                         .into_iter()
                         .map(|quad| BakedFace {
-                            quad,
+                            quad: quad.into(),
                             layer: 7,
                             opaque: true,
                             translucent: false,
@@ -149,7 +149,7 @@ mod tests {
                 .unwrap()
                 .into_iter()
                 .map(|quad| BakedFace {
-                    quad,
+                    quad: quad.into(),
                     layer: 0,
                     opaque: true,
                     translucent: false,
