@@ -450,12 +450,8 @@ impl Game<'_> {
             );
             let seed = i64::from(self.pack.item_renderer.item_id(&item.stack.item))
                 + i64::from(item.stack.damage);
-            for copy in item_render::cluster_poses(
-                &state,
-                pose,
-                item_render::rendered_amount(item.stack.count),
-                seed,
-            ) {
+            let amount = cluster_count_lod(pos.length_squared(), item.stack.count);
+            for copy in item_render::cluster_poses(&state, pose, amount, seed) {
                 self.submit_item_world(&state, copy, vertex_light(packed), out);
             }
             if self.entity_glowing(item.id) {
@@ -468,10 +464,28 @@ impl Game<'_> {
     }
 }
 
+#[inline]
+pub(crate) fn cluster_count_lod(distance_squared: f64, count: u32) -> u32 {
+    if distance_squared > 24.0 * 24.0 {
+        1
+    } else {
+        item_render::rendered_amount(count)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn distant_item_stacks_use_single_item_lod() {
+        assert_eq!(cluster_count_lod(10.0 * 10.0, 64), 5);
+        assert_eq!(cluster_count_lod(24.0 * 24.0, 64), 5);
+        assert_eq!(cluster_count_lod(25.0 * 25.0, 64), 1);
+        assert_eq!(cluster_count_lod(50.0 * 50.0, 64), 1);
+        assert_eq!(cluster_count_lod(50.0 * 50.0, 1), 1);
+    }
 
     #[test]
     fn civil_dates_follow_the_gregorian_calendar() {

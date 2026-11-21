@@ -46,9 +46,13 @@ impl Uploads {
             let mut view = slice
                 .get_mapped_range_mut()
                 .expect("staging belt slices are mapped");
-            for (i, src) in pixels.chunks(row).enumerate() {
-                view.slice(i * padded..i * padded + row)
-                    .copy_from_slice(src);
+            if row == padded {
+                view.slice(..pixels.len()).copy_from_slice(pixels);
+            } else {
+                for (i, src) in pixels.chunks(row).enumerate() {
+                    view.slice(i * padded..i * padded + row)
+                        .copy_from_slice(src);
+                }
             }
         }
         encoder.copy_buffer_to_texture(

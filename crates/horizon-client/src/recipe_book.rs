@@ -414,7 +414,7 @@ impl Book {
     /// `ingredient`'s items as its display resolves them (the cycling order
     /// of ghost slots and the overlay).
     pub fn items_of(&self, ingredient: &Ingredient) -> Vec<String> {
-        ingredient.1.clone()
+        ingredient.1.to_vec()
     }
     /// `RecipeBookComponent.fillGhostRecipe` of a book type: the result and the
     /// ingredients faded into the menu's slots, in the order the component
@@ -661,18 +661,12 @@ impl RecipeIndex {
     /// Reads `data/minecraft/recipe/*.json` under `root`.
     pub fn load(root: &std::path::Path) -> Self {
         let mut recipes = std::collections::BTreeMap::new();
-        let dir = root.join("data/minecraft/recipe");
-        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-            let path = entry.path();
-            if path.extension().is_none_or(|e| e != "json") {
+        for (namespace, stem, bytes) in crate::crafting::recipe_json_files(root).unwrap_or_default()
+        {
+            if namespace != "minecraft" {
                 continue;
             }
-            let (Some(stem), Some(v)) = (
-                path.file_stem().and_then(|s| s.to_str()),
-                std::fs::read(&path)
-                    .ok()
-                    .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()),
-            ) else {
+            let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
                 continue;
             };
             let kind = v["type"].as_str().unwrap_or_default();

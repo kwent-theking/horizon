@@ -15,28 +15,38 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, RwLock},
 };
 
 /// A set of accepted items (expanded from an item, list or tag), and the
 /// items in its `HolderSet` order (`Ingredient.display`'s `TagSlotDisplay`).
 #[derive(Clone, Debug)]
-pub struct Ingredient(pub HashSet<String>, pub Vec<String>);
+pub struct Ingredient(pub Arc<HashSet<String>>, pub Arc<Vec<String>>);
 impl Ingredient {
     /// The items of a list, in order.
     pub fn of(items: Vec<String>) -> Self {
-        Self(items.iter().cloned().collect(), items)
+        Self(Arc::new(items.iter().cloned().collect()), Arc::new(items))
     }
     pub(crate) fn parse(v: &Value, items: &Items) -> Option<Self> {
         let mut list: Vec<String> = Vec::new();
+        let mut seen = HashSet::new();
         let mut add = |s: &str| {
-            let more: Vec<String> = match s.strip_prefix('#') {
-                Some(tag) => items.item_tag_order.get(tag).cloned().unwrap_or_default(),
-                None => vec![s.to_owned()],
+            let more: &[String] = match s.strip_prefix('#') {
+                Some(tag) => items
+                    .item_tag_order
+                    .get(tag)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default(),
+                None => {
+                    if seen.insert(s.to_owned()) {
+                        list.push(s.to_owned());
+                    }
+                    return;
+                }
             };
             for i in more {
-                if !list.contains(&i) {
-                    list.push(i);
+                if seen.insert(i.clone()) {
+                    list.push(i.clone());
                 }
             }
         };
@@ -45,7 +55,7 @@ impl Ingredient {
             Value::Array(a) => a.iter().filter_map(Value::as_str).for_each(&mut add),
             _ => return None,
         }
-        (!list.is_empty()).then(|| Self::of(list))
+        (!list.is_empty()).then(|| Self(Arc::new(seen), Arc::new(list)))
     }
     pub fn test(&self, stack: &ItemStack) -> bool {
         self.0.contains(&*stack.item)
@@ -347,7 +357,7 @@ impl Special {
                 result,
             } => {
                 // DyedSlotDemo: the targets cycle fastest, 16 stacks at most.
-                let (targets, dyes) = (&target.1, &dye.1);
+                let (targets, dyes) = (&*target.1, &*dye.1);
                 let all: Vec<ItemStack> = (0..targets.len() * dyes.len())
                     .map(|i| {
                         let mut made = result.create();
@@ -1179,226 +1189,340 @@ fn matches_all(ingredients: &[Ingredient], stacks: &[&ItemStack]) -> bool {
         augment(i, ingredients, stacks, &mut owner, &mut seen)
     })
 }
+pub fn recipe_json_files(root: &Path) -> std::io::Result<Vec<(String, String, Vec<u8>)>> {
+    let cache = horizon_world::resource_cache::Cache::for_tree(root, "recipe-files-v1", &[]);
+    if let Some(files) = cache
+        .as_ref()
+        .and_then(|c| c.read_value::<Vec<(String, String, Vec<u8>)>>())
+        .filter(|files| {
+            files
+                .iter()
+                .all(|(ns, stem, _)| !ns.is_empty() && !stem.is_empty())
+        })
+    {
+        return Ok(files);
+    }
+    let json_files = |dir: &Path| -> std::io::Result<Vec<PathBuf>> {
+        let mut files: Vec<_> = fs::read_dir(dir)?
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e == "json"))
+            .collect();
+        files.sort();
+        Ok(files)
+    };
+    let mut entries: Vec<(String, String, PathBuf)> = Vec::new();
+    for path in json_files(&root.join("data/minecraft/recipe"))? {
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_owned();
+        if !stem.is_empty() {
+            entries.push(("minecraft".to_owned(), stem, path));
+        }
+    }
+    for namespace in crate::mod_content::namespaces(root) {
+        let dir = root.join(format!("data/{namespace}/recipe"));
+        if dir.is_dir() {
+            for path in json_files(&dir)? {
+                let stem = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_owned();
+                if !stem.is_empty() {
+                    entries.push((namespace.clone(), stem, path));
+                }
+            }
+        }
+    }
+    let mut raw = Vec::with_capacity(entries.len());
+    horizon_core::par::try_map_batches_with(
+        horizon_core::par::threads(),
+        entries,
+        256,
+        |(ns, stem, path)| fs::read(path).map(|bytes| (ns.clone(), stem.clone(), bytes)),
+        |entry| raw.push(entry),
+    )?;
+    if let Some(cache) = cache {
+        let _ = cache.write_value(&raw);
+    }
+    Ok(raw)
+}
+
+/// A recipe type without a namespace, or with an empty one, is vanilla's,
+/// as `Identifier.parse` reads `crafting_shaped` and `:crafting_shaped` as
+/// `minecraft:crafting_shaped`.
+pub(crate) fn canonical_recipe_type(raw: &str) -> std::borrow::Cow<'_, str> {
+    match raw.split_once(':') {
+        Some(("", path)) => std::borrow::Cow::Owned(format!("minecraft:{path}")),
+        Some(_) => std::borrow::Cow::Borrowed(raw),
+        None if !raw.is_empty() => std::borrow::Cow::Owned(format!("minecraft:{raw}")),
+        None => std::borrow::Cow::Borrowed(""),
+    }
+}
+
+enum ParsedRecipeEntry {
+    Crafting(String, Recipe, (String, String)),
+    Cooking(Cooking, (String, String)),
+    MetaOnly(String, (String, String)),
+}
+
+fn parse_single_recipe(
+    namespace: &str,
+    stem: &str,
+    bytes: &[u8],
+    items: &Items,
+    single_ingredients: &RwLock<HashMap<String, Option<Ingredient>>>,
+) -> Option<ParsedRecipeEntry> {
+    let name = if namespace == "minecraft" {
+        stem.to_owned()
+    } else {
+        format!("{namespace}:{stem}")
+    };
+    let v: Value = match serde_json::from_slice(bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!("Horizon: recipe {name} not loaded: {e}");
+            return None;
+        }
+    };
+    let mut parse_ing = |val: &Value| -> Option<Ingredient> {
+        if let Some(spec) = val.as_str() {
+            if let Ok(guard) = single_ingredients.read() {
+                if let Some(cached) = guard.get(spec) {
+                    return cached.clone();
+                }
+            }
+            let parsed = Ingredient::parse(val, items);
+            if let Ok(mut guard) = single_ingredients.write() {
+                return guard.entry(spec.to_owned()).or_insert(parsed).clone();
+            }
+            parsed
+        } else {
+            Ingredient::parse(val, items)
+        }
+    };
+    let text = |k: &str| v[k].as_str().unwrap_or("").to_owned();
+    let result = || Template::parse(&v["result"]);
+    let special = |recipe: Option<Special>| recipe.map(Recipe::Special);
+    let meta = (text("category"), text("group"));
+    let parsed: Option<Recipe> =
+        match canonical_recipe_type(v["type"].as_str().unwrap_or("")).as_ref() {
+        "minecraft:crafting_shaped" => {
+            let pattern: Vec<Vec<char>> = v["pattern"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|r| r.as_str().map(|s| s.chars().collect()))
+                .collect();
+            let pattern = shrink(&pattern);
+            let height = pattern.len();
+            let width = pattern.first().map_or(0, Vec::len);
+            let mut cells = Vec::with_capacity(width * height);
+            let mut ok = height > 0;
+            let mut keys: HashMap<char, Option<Ingredient>> = HashMap::new();
+            for row in &pattern {
+                for &c in row {
+                    if c == ' ' {
+                        cells.push(None);
+                    } else {
+                        let entry = keys
+                            .entry(c)
+                            .or_insert_with(|| parse_ing(&v["key"][c.to_string()]));
+                        match entry {
+                            Some(i) => cells.push(Some(i.clone())),
+                            None => ok = false,
+                        }
+                    }
+                }
+            }
+            match (ok, result()) {
+                (true, Some(result)) => Some(Recipe::Shaped {
+                    width,
+                    height,
+                    cells,
+                    result,
+                }),
+                _ => None,
+            }
+        }
+        "minecraft:crafting_shapeless" => {
+            let ingredients: Option<Vec<_>> = v["ingredients"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(&mut parse_ing)
+                .collect();
+            match (ingredients, result()) {
+                (Some(ingredients), Some(result)) => Some(Recipe::Shapeless {
+                    ingredients,
+                    result,
+                }),
+                _ => None,
+            }
+        }
+        "minecraft:crafting_special_bannerduplicate" => special(
+            parse_ing(&v["banner"])
+                .zip(v["result"]["id"].as_str())
+                .map(|(banner, id)| Special::BannerDuplicate {
+                    banner,
+                    result: id.to_owned(),
+                }),
+        ),
+        "minecraft:crafting_special_shielddecoration" => special(
+            parse_ing(&v["banner"])
+                .zip(parse_ing(&v["target"]))
+                .zip(v["result"]["id"].as_str())
+                .map(|((banner, target), id)| Special::ShieldDecoration {
+                    banner,
+                    target,
+                    result: id.to_owned(),
+                }),
+        ),
+        "minecraft:crafting_transmute" => special((|| {
+            let (min, max) = bounds(v.get("material_count"), (1, 1), (1, 8));
+            Some(Special::Transmute {
+                input: parse_ing(&v["input"])?,
+                material: parse_ing(&v["material"])?,
+                min: min.clamp(1, 8) as usize,
+                max: max.clamp(1, 8) as usize,
+                add_count: v["add_material_count_to_result"].as_bool().unwrap_or(false),
+                result: result()?,
+            })
+        })()),
+        "minecraft:crafting_dye" => special((|| {
+            Some(Special::Dye {
+                target: parse_ing(&v["target"])?,
+                dye: parse_ing(&v["dye"])?,
+                result: result()?,
+            })
+        })()),
+        "minecraft:crafting_imbue" => special((|| {
+            Some(Special::Imbue {
+                source: parse_ing(&v["source"])?,
+                material: parse_ing(&v["material"])?,
+                result: result()?,
+            })
+        })()),
+        "minecraft:crafting_special_bookcloning" => special((|| {
+            let (min, max) = bounds(v.get("allowed_generations"), (0, 1), (0, 2));
+            Some(Special::BookCloning {
+                source: parse_ing(&v["source"])?,
+                material: parse_ing(&v["material"])?,
+                min: min as i32,
+                max: max as i32,
+                result: result()?,
+            })
+        })()),
+        "minecraft:crafting_special_firework_rocket" => special((|| {
+            Some(Special::FireworkRocket {
+                shell: parse_ing(&v["shell"])?,
+                fuel: parse_ing(&v["fuel"])?,
+                star: parse_ing(&v["star"])?,
+                result: result()?,
+            })
+        })()),
+        "minecraft:crafting_special_firework_star" => special((|| {
+            let mut shapes = Vec::new();
+            for (shape, value) in v["shapes"].as_object()? {
+                shapes.push((FireworkShape::from_name(shape), parse_ing(value)?));
+            }
+            Some(Special::FireworkStar {
+                dye: parse_ing(&v["dye"])?,
+                fuel: parse_ing(&v["fuel"])?,
+                trail: parse_ing(&v["trail"])?,
+                twinkle: parse_ing(&v["twinkle"])?,
+                shapes,
+                result: result()?,
+            })
+        })()),
+        "minecraft:crafting_special_firework_star_fade" => special((|| {
+            Some(Special::FireworkStarFade {
+                dye: parse_ing(&v["dye"])?,
+                target: parse_ing(&v["target"])?,
+                result: result()?,
+            })
+        })()),
+        "minecraft:crafting_special_mapextending" => special((|| {
+            Some(Special::MapExtending {
+                map: parse_ing(&v["map"])?,
+                material: parse_ing(&v["material"])?,
+                result: result()?,
+            })
+        })()),
+        "minecraft:crafting_decorated_pot" => special((|| {
+            Some(Special::DecoratedPot {
+                back: parse_ing(&v["back"])?,
+                left: parse_ing(&v["left"])?,
+                right: parse_ing(&v["right"])?,
+                front: parse_ing(&v["front"])?,
+                result: result()?,
+            })
+        })()),
+        "minecraft:crafting_special_repairitem" => special(Some(Special::RepairItem)),
+        kind @ ("minecraft:smelting"
+        | "minecraft:blasting"
+        | "minecraft:smoking"
+        | "minecraft:campfire_cooking") => {
+            if let (Some(ingredient), Some(result)) = (parse_ing(&v["ingredient"]), result()) {
+                let cooking = Cooking {
+                    id: name.clone(),
+                    category: text("category"),
+                    group: text("group"),
+                    kind: kind.to_owned(),
+                    ingredient,
+                    result: result.create(),
+                    experience: v["experience"].as_f64().unwrap_or(0.0) as f32,
+                    time: v["cookingtime"].as_u64().unwrap_or(200) as u32,
+                };
+                return Some(ParsedRecipeEntry::Cooking(cooking, meta));
+            }
+            None
+        }
+        _ => None,
+    };
+    if let Some(recipe) = parsed {
+        Some(ParsedRecipeEntry::Crafting(name, recipe, meta))
+    } else {
+        Some(ParsedRecipeEntry::MetaOnly(name, meta))
+    }
+}
+
 impl Recipes {
     pub fn load(root: &Path, items: &Items) -> Result<Self> {
+        let files = recipe_json_files(root)?;
+        Self::load_with_files(root, items, &files)
+    }
+
+    pub fn load_with_files(
+        root: &Path,
+        items: &Items,
+        files: &[(String, String, Vec<u8>)],
+    ) -> Result<Self> {
+        let single_ingredients = RwLock::new(HashMap::<String, Option<Ingredient>>::new());
+        let threads = horizon_core::par::threads();
+        let parsed_entries =
+            horizon_core::par::par_map_with(threads, files, |(namespace, stem, bytes)| {
+                parse_single_recipe(namespace, stem, bytes, items, &single_ingredients)
+            });
         let mut crafting = Vec::new();
         let mut cooking = Vec::new();
         let mut meta = HashMap::new();
-        let json_files = |dir: &Path| -> Result<Vec<PathBuf>> {
-            let mut files: Vec<_> = fs::read_dir(dir)?
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| p.extension().is_some_and(|e| e == "json"))
-                .collect();
-            files.sort();
-            Ok(files)
-        };
-        // Vanilla's recipes by bare name, then content mods' as `<ns>:<name>`.
-        let mut files: Vec<(String, PathBuf)> = json_files(&root.join("data/minecraft/recipe"))?
-            .into_iter()
-            .map(|p| (String::new(), p))
-            .collect();
-        for namespace in crate::mod_content::namespaces(root) {
-            let dir = root.join(format!("data/{namespace}/recipe"));
-            if dir.is_dir() {
-                files.extend(
-                    json_files(&dir)?
-                        .into_iter()
-                        .map(|p| (format!("{namespace}:"), p)),
-                );
-            }
-        }
-        for (prefix, path) in files {
-            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-            let name = format!("{prefix}{stem}");
-            // Vanilla's RecipeManager logs a file that does not parse and
-            // goes on ("Couldn't parse data file").
-            let v: Value = match serde_json::from_slice(&fs::read(&path)?) {
-                Ok(v) => v,
-                Err(e) => {
-                    log::warn!("Horizon: recipe {name} not loaded: {e}");
-                    continue;
+        for entry in parsed_entries.into_iter().flatten() {
+            match entry {
+                ParsedRecipeEntry::Crafting(name, recipe, m) => {
+                    meta.insert(name.clone(), m);
+                    crafting.push((name, recipe));
                 }
-            };
-            let text = |k: &str| v[k].as_str().unwrap_or("").to_owned();
-            meta.insert(name.clone(), (text("category"), text("group")));
-            let ing = |k: &str| Ingredient::parse(&v[k], items);
-            let result = || Template::parse(&v["result"]);
-            let special = |recipe: Option<Special>| recipe.map(Recipe::Special);
-            let parsed: Option<Recipe> = match v["type"].as_str().unwrap_or("") {
-                "minecraft:crafting_shaped" => {
-                    let pattern: Vec<Vec<char>> = v["pattern"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(|r| r.as_str().map(|s| s.chars().collect()))
-                        .collect();
-                    let pattern = shrink(&pattern);
-                    let height = pattern.len();
-                    let width = pattern.first().map_or(0, Vec::len);
-                    let mut cells = Vec::with_capacity(width * height);
-                    let mut ok = height > 0;
-                    for row in &pattern {
-                        for c in row {
-                            if *c == ' ' {
-                                cells.push(None);
-                            } else {
-                                match Ingredient::parse(&v["key"][c.to_string()], items) {
-                                    Some(i) => cells.push(Some(i)),
-                                    None => ok = false,
-                                }
-                            }
-                        }
-                    }
-                    match (ok, result()) {
-                        (true, Some(result)) => Some(Recipe::Shaped {
-                            width,
-                            height,
-                            cells,
-                            result,
-                        }),
-                        _ => None,
-                    }
+                ParsedRecipeEntry::Cooking(c, m) => {
+                    meta.insert(c.id.clone(), m);
+                    cooking.push(c);
                 }
-                "minecraft:crafting_shapeless" => {
-                    let ingredients: Option<Vec<_>> = v["ingredients"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .map(|i| Ingredient::parse(i, items))
-                        .collect();
-                    match (ingredients, result()) {
-                        (Some(ingredients), Some(result)) => Some(Recipe::Shapeless {
-                            ingredients,
-                            result,
-                        }),
-                        _ => None,
-                    }
+                ParsedRecipeEntry::MetaOnly(name, m) => {
+                    meta.insert(name, m);
                 }
-                "minecraft:crafting_special_bannerduplicate" => special(
-                    ing("banner")
-                        .zip(v["result"]["id"].as_str())
-                        .map(|(banner, id)| Special::BannerDuplicate {
-                            banner,
-                            result: id.to_owned(),
-                        }),
-                ),
-                "minecraft:crafting_special_shielddecoration" => special(
-                    ing("banner")
-                        .zip(ing("target"))
-                        .zip(v["result"]["id"].as_str())
-                        .map(|((banner, target), id)| Special::ShieldDecoration {
-                            banner,
-                            target,
-                            result: id.to_owned(),
-                        }),
-                ),
-                "minecraft:crafting_transmute" => special((|| {
-                    let (min, max) = bounds(v.get("material_count"), (1, 1), (1, 8));
-                    Some(Special::Transmute {
-                        input: ing("input")?,
-                        material: ing("material")?,
-                        min: min.clamp(1, 8) as usize,
-                        max: max.clamp(1, 8) as usize,
-                        add_count: v["add_material_count_to_result"].as_bool().unwrap_or(false),
-                        result: result()?,
-                    })
-                })()),
-                "minecraft:crafting_dye" => special((|| {
-                    Some(Special::Dye {
-                        target: ing("target")?,
-                        dye: ing("dye")?,
-                        result: result()?,
-                    })
-                })()),
-                "minecraft:crafting_imbue" => special((|| {
-                    Some(Special::Imbue {
-                        source: ing("source")?,
-                        material: ing("material")?,
-                        result: result()?,
-                    })
-                })()),
-                "minecraft:crafting_special_bookcloning" => special((|| {
-                    let (min, max) = bounds(v.get("allowed_generations"), (0, 1), (0, 2));
-                    Some(Special::BookCloning {
-                        source: ing("source")?,
-                        material: ing("material")?,
-                        min: min as i32,
-                        max: max as i32,
-                        result: result()?,
-                    })
-                })()),
-                "minecraft:crafting_special_firework_rocket" => special((|| {
-                    Some(Special::FireworkRocket {
-                        shell: ing("shell")?,
-                        fuel: ing("fuel")?,
-                        star: ing("star")?,
-                        result: result()?,
-                    })
-                })()),
-                "minecraft:crafting_special_firework_star" => special((|| {
-                    let mut shapes = Vec::new();
-                    for (shape, value) in v["shapes"].as_object()? {
-                        shapes.push((
-                            FireworkShape::from_name(shape),
-                            Ingredient::parse(value, items)?,
-                        ));
-                    }
-                    Some(Special::FireworkStar {
-                        dye: ing("dye")?,
-                        fuel: ing("fuel")?,
-                        trail: ing("trail")?,
-                        twinkle: ing("twinkle")?,
-                        shapes,
-                        result: result()?,
-                    })
-                })()),
-                "minecraft:crafting_special_firework_star_fade" => special((|| {
-                    Some(Special::FireworkStarFade {
-                        dye: ing("dye")?,
-                        target: ing("target")?,
-                        result: result()?,
-                    })
-                })()),
-                "minecraft:crafting_special_mapextending" => special((|| {
-                    Some(Special::MapExtending {
-                        map: ing("map")?,
-                        material: ing("material")?,
-                        result: result()?,
-                    })
-                })()),
-                "minecraft:crafting_decorated_pot" => special((|| {
-                    Some(Special::DecoratedPot {
-                        back: ing("back")?,
-                        left: ing("left")?,
-                        right: ing("right")?,
-                        front: ing("front")?,
-                        result: result()?,
-                    })
-                })()),
-                "minecraft:crafting_special_repairitem" => special(Some(Special::RepairItem)),
-                kind @ ("minecraft:smelting"
-                | "minecraft:blasting"
-                | "minecraft:smoking"
-                | "minecraft:campfire_cooking") => {
-                    if let (Some(ingredient), Some(result)) = (ing("ingredient"), result()) {
-                        cooking.push(Cooking {
-                            id: name.clone(),
-                            category: text("category"),
-                            group: text("group"),
-                            kind: kind.to_owned(),
-                            ingredient,
-                            result: result.create(),
-                            experience: v["experience"].as_f64().unwrap_or(0.0) as f32,
-                            time: v["cookingtime"].as_u64().unwrap_or(200) as u32,
-                        });
-                    }
-                    None
-                }
-                _ => None,
-            };
-            if let Some(recipe) = parsed {
-                crafting.push((name, recipe));
             }
         }
         let facts = items
@@ -1629,7 +1753,7 @@ impl Recipes {
             let mut index = CookIndex::new();
             for (i, c) in self.cooking.iter().enumerate() {
                 let of_kind = index.entry(c.kind.clone()).or_default();
-                for item in &c.ingredient.0 {
+                for item in c.ingredient.0.iter() {
                     of_kind.entry(item.clone()).or_insert(i);
                 }
             }
@@ -1651,6 +1775,137 @@ impl Recipes {
 mod tests {
     use super::*;
     use crate::banner::BannerLayer;
+
+    #[test]
+    fn ingredient_tags_keep_first_occurrence_order() {
+        let mut items = Items::for_tests(HashMap::new());
+        items.item_tag_order.insert(
+            "test:all".into(),
+            ["test:b", "test:a", "test:b"].map(str::to_owned).into(),
+        );
+        let parsed = Ingredient::parse(
+            &serde_json::json!(["test:c", "#test:all", "test:a", "#missing", "#test:all"]),
+            &items,
+        )
+        .unwrap();
+        assert_eq!(*parsed.1, ["test:c", "test:b", "test:a"]);
+        assert_eq!(*parsed.0, parsed.1.iter().cloned().collect::<HashSet<_>>());
+        assert!(Ingredient::parse(&serde_json::json!("#missing"), &items).is_none());
+        assert!(Ingredient::parse(&serde_json::json!({}), &items).is_none());
+    }
+
+    #[test]
+    fn shared_single_ingredients_reuse_arc_backing_across_recipes() {
+        let dir = std::env::temp_dir().join(format!("horizon-recipe-arc-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("data/minecraft/recipe")).unwrap();
+        fs::create_dir_all(dir.join("data/minecraft/tags/item")).unwrap();
+        fs::write(
+            dir.join("data/minecraft/tags/item/planks.json"),
+            r#"{"values":["minecraft:oak_planks","minecraft:spruce_planks"]}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("data/minecraft/recipe/a.json"),
+            r###"{"type":"minecraft:crafting_shaped","pattern":["##"],"key":{"#":"#minecraft:planks"},"result":{"id":"minecraft:stick","count":4}}"###,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("data/minecraft/recipe/b.json"),
+            r##"{"type":"minecraft:crafting_shapeless","ingredients":["#minecraft:planks"],"result":{"id":"minecraft:oak_button"}}"##,
+        )
+        .unwrap();
+        let mut tags = HashMap::new();
+        tags.insert(
+            "minecraft:planks".to_owned(),
+            [
+                "minecraft:oak_planks".to_owned(),
+                "minecraft:spruce_planks".to_owned(),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let mut items = Items::for_tests(tags);
+        items.item_tag_order.insert(
+            "minecraft:planks".to_owned(),
+            vec![
+                "minecraft:oak_planks".to_owned(),
+                "minecraft:spruce_planks".to_owned(),
+            ],
+        );
+        let loaded = Recipes::load(&dir, &items).unwrap();
+        let Recipe::Shaped { cells, .. } = &loaded.crafting.iter().find(|r| r.0 == "a").unwrap().1
+        else {
+            panic!("expected shaped");
+        };
+        let Recipe::Shapeless { ingredients, .. } =
+            &loaded.crafting.iter().find(|r| r.0 == "b").unwrap().1
+        else {
+            panic!("expected shapeless");
+        };
+        let a0 = cells[0].as_ref().unwrap();
+        let a1 = cells[1].as_ref().unwrap();
+        assert!(Arc::ptr_eq(&a0.0, &a1.0));
+        assert!(Arc::ptr_eq(&a0.1, &ingredients[0].1));
+        assert!(Arc::ptr_eq(&a0.0, &ingredients[0].0));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_with_files_preserves_order_and_parses_parallel() {
+        let items = Items::for_tests(HashMap::new());
+        let a = (
+            "minecraft".to_owned(),
+            "first".to_owned(),
+            br#"{"type":"minecraft:crafting_shapeless","ingredients":[],"result":{"id":"minecraft:apple"}}"#.to_vec(),
+        );
+        let b = (
+            "minecraft".to_owned(),
+            "second".to_owned(),
+            br#"{"type":"minecraft:crafting_shapeless","ingredients":[],"result":{"id":"minecraft:bread"}}"#.to_vec(),
+        );
+        let c = (
+            "minecraft".to_owned(),
+            "cook".to_owned(),
+            br#"{"type":"minecraft:smelting","ingredient":"minecraft:iron_ore","result":{"id":"minecraft:iron_ingot"},"experience":0.7,"cookingtime":100}"#.to_vec(),
+        );
+        let temp = std::env::temp_dir().join(format!("horizon-recipe-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp);
+        fs::create_dir_all(&temp).unwrap();
+        let loaded = Recipes::load_with_files(&temp, &items, &[a, b, c]).unwrap();
+        assert_eq!(loaded.crafting.len(), 2);
+        assert_eq!(loaded.crafting[0].0, "first");
+        assert_eq!(loaded.crafting[1].0, "second");
+        assert_eq!(loaded.cooking.len(), 1);
+        assert_eq!(loaded.cooking[0].id, "cook");
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn a_recipe_type_without_a_namespace_is_vanillas() {
+        let items = Items::for_tests(HashMap::new());
+        let bare = (
+            "minecraft".to_owned(),
+            "bare".to_owned(),
+            br#"{"type":"crafting_shapeless","ingredients":[],"result":{"id":"minecraft:stick","count":3}}"#.to_vec(),
+        );
+        let empty = (
+            "minecraft".to_owned(),
+            "empty".to_owned(),
+            br#"{"type":":crafting_shapeless","ingredients":[],"result":{"id":"minecraft:stick","count":3}}"#.to_vec(),
+        );
+        let temp = std::env::temp_dir().join(format!(
+            "horizon-recipe-bare-type-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&temp);
+        fs::create_dir_all(&temp).unwrap();
+        let loaded = Recipes::load_with_files(&temp, &items, &[bare, empty]).unwrap();
+        assert_eq!(loaded.crafting.len(), 2);
+        let ids: Vec<&str> = loaded.crafting.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, ["bare", "empty"]);
+        let _ = fs::remove_dir_all(&temp);
+    }
 
     #[test]
     fn result_count_is_bounded_like_vanilla() {
@@ -1823,5 +2078,53 @@ mod tests {
     fn dyes_blend_like_dyed_item_color() {
         // One red dye on an undyed item gives the dye's own colour.
         assert_eq!(apply_dyes(None, &[14]), 0xB02E26);
+    }
+
+    #[test]
+    fn recipe_files_snapshot_hits_recovers_and_invalidates() {
+        let temp =
+            std::env::temp_dir().join(format!("horizon-recipe-files-cache-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp);
+        let recipe_dir = temp.join("data/minecraft/recipe");
+        fs::create_dir_all(&recipe_dir).unwrap();
+        fs::write(temp.join("horizon-mod-content.stamp"), "recipes-test-v1").unwrap();
+        let stick = recipe_dir.join("stick.json");
+        fs::write(&stick, br#"{"type":"minecraft:crafting_shaped"}"#).unwrap();
+
+        let first = recipe_json_files(&temp).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].0, "minecraft");
+        assert_eq!(first[0].1, "stick");
+
+        let cache =
+            horizon_world::resource_cache::Cache::for_tree(&temp, "recipe-files-v1", &[]).unwrap();
+        let mut seeded = cache
+            .read_value::<Vec<(String, String, Vec<u8>)>>()
+            .unwrap();
+        seeded.push(("horizon".into(), "cached".into(), b"{}".to_vec()));
+        cache.write_value(&seeded).unwrap();
+        let hit = recipe_json_files(&temp).unwrap();
+        assert_eq!(hit.len(), 2);
+
+        for entry in fs::read_dir(temp.join(".horizon-derived"))
+            .unwrap()
+            .flatten()
+        {
+            if entry.path().is_file() {
+                fs::write(entry.path(), b"corrupt-recipe-files").unwrap();
+            }
+        }
+        let recovered = recipe_json_files(&temp).unwrap();
+        assert_eq!(recovered.len(), 1);
+
+        fs::write(
+            recipe_dir.join("torch.json"),
+            br#"{"type":"minecraft:crafting_shaped"}"#,
+        )
+        .unwrap();
+        let updated = recipe_json_files(&temp).unwrap();
+        assert_eq!(updated.len(), 2);
+
+        let _ = fs::remove_dir_all(&temp);
     }
 }

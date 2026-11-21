@@ -35,12 +35,7 @@ impl<'s, 'r> FallRayRegistry<'s, 'r> {
         water_fluids: &BTreeSet<String>,
     ) -> io::Result<Self> {
         let registry = interactions.registry();
-        if reset_blocks
-            .iter()
-            .any(|name| registry.default_state(name).is_none())
-        {
-            return Err(invalid("unknown fall-reset block tag member"));
-        }
+        // Tag members of mods that are not installed match no state: skip them.
         let mut water_mask = 0;
         for name in water_fluids {
             water_mask |= FluidKind::from_name(name)

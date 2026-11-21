@@ -25,11 +25,9 @@ impl<'r> ClimbingRegistry<'r> {
         climbable: &BTreeSet<String>,
         glide_through: &BTreeSet<String>,
     ) -> io::Result<Self> {
-        for names in [trapdoors, climbable, glide_through] {
-            if names.iter().any(|n| registry.default_state(n).is_none()) {
-                return Err(invalid("unknown climbing block member"));
-            }
-        }
+        // A mod's tag may name blocks of mods that are not installed: those
+        // names match no state below, so they change nothing.
+        let _ = (trapdoors, climbable, glide_through);
         let mut states = Vec::with_capacity(registry.len());
         for i in 0..registry.len() {
             let s = registry.state(BlockStateId(i as u32)).unwrap();
@@ -43,11 +41,11 @@ impl<'r> ClimbingRegistry<'r> {
                 }
             };
             let open_trapdoor = if trapdoors.contains(&s.name) {
-                let f = facing()?;
-                match s.properties.get("open").map(String::as_str) {
-                    Some("true") => Some(f),
-                    Some("false") => None,
-                    _ => return Err(invalid("invalid trapdoor open state")),
+                // A mod's trapdoor class may face up or down, or have no
+                // `open`: it is no open trapdoor a ladder can lean on.
+                match (facing(), s.properties.get("open").map(String::as_str)) {
+                    (Ok(f), Some("true")) => Some(f),
+                    _ => None,
                 }
             } else {
                 None

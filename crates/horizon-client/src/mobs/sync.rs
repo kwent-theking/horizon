@@ -126,6 +126,31 @@ pub fn entity_event(m: &mut Mob, event: u8) {
         Species::Hoglin | Species::Zoglin => piglin::client_event(m, event),
         Species::IronGolem => golem::client_event(m, event),
         Species::Creaking => creaking::entity_event(m, event),
+        _ if event == 4 && !m.kind.id.starts_with("minecraft:") => {
+            m.swing_hand_modified(false, crate::first_person::SwingAnimation::DEFAULT);
+        }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mobs::sensor_scan_tests::kind;
+    use horizon_core::geometry::Vec3;
+    use std::sync::Arc;
+
+    #[test]
+    fn entity_event_4_starts_attack_swing_for_modded_mobs() {
+        let mut mod_kind = kind();
+        Arc::make_mut(&mut mod_kind).id = "born_in_chaos_v1:door_knight".into();
+        let mut modded = Mob::new(1, mod_kind, Vec3::ZERO, 0.0);
+        entity_event(&mut modded, 4);
+        assert!(modded.ai.swinging);
+        assert_eq!(modded.ai.swing_time, -1);
+
+        let mut vanilla = Mob::new(2, kind(), Vec3::ZERO, 0.0);
+        entity_event(&mut vanilla, 4);
+        assert!(!vanilla.ai.swinging);
     }
 }

@@ -151,7 +151,7 @@ fn allocated_ids_follow_mod_and_entry_order_after_vanilla() {
     );
     let mut mods = vec![ruby, alpha];
     for index in 0..2 {
-        let plan = Plan::new(&base, &mods).unwrap();
+        let plan = Plan::new(&base, &mods, None).unwrap();
         let blocks: Vec<_> = plan
             .blocks
             .iter()
@@ -258,11 +258,13 @@ fn ruby_mod(dir: &Path) -> ContentMod {
                     "operation": "add_value", "slot": "mainhand"}],
                 "!minecraft:repairable": {}}}"#,
         ),
-        // Carried-over tags name blocks left out and other mods' ids too.
+        // Carried-over tags name blocks left out and other mods' ids too, and
+        // 1.21.1's vanilla tags 26.3 renamed (`concrete_powders`).
         (
             "data/minecraft/tags/block/mineable/pickaxe.json",
             r##"{"values": ["ruby:ruby_block", "ruby:left_out", "othermod:thing",
-                {"id": "othermod:optional", "required": false}, "#c:storage_blocks/ruby"]}"##,
+                {"id": "othermod:optional", "required": false}, "#c:storage_blocks/ruby",
+                "#minecraft:concrete_powder"]}"##,
         ),
         (
             "data/c/tags/item/gems/ruby.json",
@@ -737,6 +739,12 @@ fn content_root_is_reused_until_a_mod_changes() {
         root
     );
     assert!(sentinel.exists(), "an unchanged mod rebuilt the root");
+    // A copied root with a matching stamp but without its base is rebuilt, not loaded.
+    fs::remove_file(root.join("horizon-resources.json")).unwrap();
+    resource_root(&base, std::slice::from_ref(&m), &cache).unwrap();
+    assert!(!sentinel.exists(), "a root without its base was reused");
+    assert!(root.join("horizon-resources.json").is_file());
+    fs::write(&sentinel, b"").unwrap();
     let lang = scratch.join("ruby/assets/ruby/lang/en_us.json");
     fs::write(&lang, r#"{"block.ruby.ruby_block": "Ruby Block"}"#).unwrap();
     let file = fs::File::options().write(true).open(&lang).unwrap();
@@ -1079,4 +1087,878 @@ fn a_replacing_mod_tag_reaches_the_root() {
         "{warnings}"
     );
     let _ = fs::remove_dir_all(&scratch);
+}
+
+/// A server table's lines (`id \t block \t properties`) after its header.
+fn server_table(path: &Path, lines: &[&str]) {
+    let mut text = format!("# horizon-oracle state ids v1\t{}\n", lines.len());
+    for (id, line) in lines.iter().enumerate() {
+        text.push_str(&format!("{id}\t{line}\n"));
+    }
+    fs::write(path, text).unwrap();
+}
+
+fn nbt_compound(entries: Vec<(&str, Tag)>) -> Tag {
+    Tag::Compound(
+        entries
+            .into_iter()
+            .map(|(k, v)| (JavaString::from(k), v))
+            .collect(),
+    )
+}
+
+/// A small base of air and stone with every kind of table the server blocks touch.
+fn server_base(base: &Path) {
+    let files: [(&str, &str); 12] = [
+        (
+            "facts.json",
+            r#"{"states": [["minecraft:air", true, false, "Block{minecraft:air}", {"id": "minecraft:air"}],
+                ["minecraft:stone", false, false, "Block{minecraft:stone}", {"id": "minecraft:stone"}]],
+                "defaults": {"minecraft:air": 0, "minecraft:stone": 1}}"#,
+        ),
+        (
+            "gameplay-facts.json",
+            r#"{"states": [{"id": 0, "full_collision": false, "item": "minecraft:air", "outline": []},
+                {"id": 1, "dampening": 15, "can_occlude": true, "replaceable": false,
+                "full_collision": true, "item": "minecraft:stone",
+                "outline": [[0.0, 0.0, 0.0, 1.0, 1.0, 1.0]], "outline_edges": [[0.0, 0.0, 0.0, 0.0, 0.0, 1.0]],
+                "sound": {"volume": 1.0, "pitch": 1.0, "break": {"id": "minecraft:block.stone.break"}}}]}"#,
+        ),
+        (
+            "block-behaviours.json",
+            r#"{"blocks": [{"name": "minecraft:air", "item": "minecraft:air"},
+                {"name": "minecraft:stone", "class": ["Block"], "item": "minecraft:stone"}],
+                "states": [[0, 34, 0], [262143, 5, 0]], "items": {}}"#,
+        ),
+        ("items.json", r#"{"minecraft:stone": {}}"#),
+        (
+            "registries.json",
+            r#"{"minecraft:item": {"entries": {"minecraft:stone": {"protocol_id": 1}}},
+                "minecraft:block": {"entries": {"minecraft:air": {"protocol_id": 0},
+                "minecraft:stone": {"protocol_id": 1}}}}"#,
+        ),
+        (
+            "model-states.json",
+            r#"{"minecraft:air": {"schema": {}, "states": [{}]}, "minecraft:stone": {"schema": {}, "states": [{}]}}"#,
+        ),
+        (
+            "render-definitions.json",
+            r#"{"minecraft:stone": {"rule": "never", "bars_tag": false, "can_occlude": true, "default": 1, "states": [1]}}"#,
+        ),
+        (
+            "worldgen/blocks/structure-blocks.json",
+            r#"{"states": 2, "rotate": [[0, 0, 0], [1, 1, 1]], "mirror": [[0, 0], [1, 1]], "full_block": [false, true]}"#,
+        ),
+        ("horizon-resources.json", "{}"),
+        ("assets/minecraft/blockstates/stone.json", "{}"),
+        (
+            "assets/minecraft/models/block/cube.json",
+            r#"{"elements": [{"from": [0, 0, 0], "to": [16, 16, 16]}]}"#,
+        ),
+        (
+            "assets/minecraft/models/block/cube_all.json",
+            r#"{"parent": "block/cube"}"#,
+        ),
+    ];
+    for (name, text) in files {
+        let path = base.join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    }
+    let state = |name: &str| nbt_compound(vec![("id", Tag::String(name.into()))]);
+    let collision = nbt_compound(vec![
+        (
+            "states",
+            Tag::List(vec![state("minecraft:air"), state("minecraft:stone")]),
+        ),
+        ("cached_shapes", Tag::IntArray(vec![0, 1])),
+        (
+            "blocks",
+            nbt_compound(vec![(
+                "minecraft:stone",
+                nbt_compound(vec![("friction", Tag::Float(0.6f32.to_bits()))]),
+            )]),
+        ),
+    ]);
+    let named = nbt::NamedTag {
+        name: "".into(),
+        tag: collision,
+    };
+    fs::write(
+        base.join("cached-collision.nbt"),
+        nbt::write_named(&named, Limits::tables()).unwrap(),
+    )
+    .unwrap();
+}
+
+/// A mod with a declared block, and blockstates for a chair (no cube), a
+/// brick (a cube through vanilla's parents) and an Every Compat chair.
+fn furniture_mod(dir: &Path) -> ContentMod {
+    folder_mod(
+        dir,
+        &[
+            ("horizon-mod.toml", &manifest("furn", "\"everycomp\"")),
+            (
+                "data/furn/horizon/block/declared.json",
+                r#"{"template": "minecraft:stone"}"#,
+            ),
+            (
+                "assets/furn/blockstates/chair.json",
+                r#"{"variants": {"facing=north": {"model": "furn:block/chair"},
+                    "facing=south": {"model": "furn:block/chair", "y": 180}}}"#,
+            ),
+            (
+                "assets/furn/models/block/chair.json",
+                r#"{"elements": [{"from": [2, 0, 2], "to": [14, 10, 14]}]}"#,
+            ),
+            (
+                "assets/furn/blockstates/brick.json",
+                r#"{"variants": {"": [{"model": "furn:block/brick"}, {"model": "furn:block/brick", "y": 90}]}}"#,
+            ),
+            (
+                "assets/furn/models/block/brick.json",
+                r#"{"parent": "minecraft:block/cube_all", "textures": {"all": "furn:block/brick"}}"#,
+            ),
+            (
+                "assets/everycomp/blockstates/hc/furn/oak_chair.json",
+                r#"{"variants": {"": {"model": "furn:block/chair"}}}"#,
+            ),
+        ],
+    )
+}
+
+const FURNITURE_TABLE: [&str; 10] = [
+    "minecraft:air\t",
+    "minecraft:stone\t",
+    "furn:chair\tfacing=north,waterlogged=true",
+    "furn:chair\tfacing=north,waterlogged=false",
+    "furn:chair\tfacing=south,waterlogged=true",
+    "furn:chair\tfacing=south,waterlogged=false",
+    "everycomp:hc/furn/oak_chair\tfacing=north",
+    "furn:brick\t",
+    "furn:declared\t",
+    "nobody:thing\t",
+];
+
+/// The server's undeclared blocks with a blockstate in the mods join after
+/// every other id with the server's exact states; Every Compat's, declared
+/// ones and ones without a blockstate do not.
+#[test]
+fn server_blocks_join_with_the_servers_exact_states_after_every_other_id() {
+    let scratch = std::env::temp_dir().join(format!("horizon-mod-server-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&scratch);
+    let base = scratch.join("base");
+    server_base(&base);
+    let mods = vec![furniture_mod(&scratch.join("furn"))];
+    let table = scratch.join("server-states.tsv");
+    server_table(&table, &FURNITURE_TABLE);
+
+    // Vanilla's and the declared ids are the same with the table as without.
+    let without = Plan::new(&base, &mods, None).unwrap();
+    let plan = Plan::new(&base, &mods, Some(table.as_path())).unwrap();
+    assert!(without.server.is_empty());
+    let declared = |plan: &Plan| -> Vec<(String, u32)> {
+        let blocks = plan.blocks.iter();
+        blocks
+            .map(|b| (b.decl.id.clone(), b.rename.first))
+            .collect()
+    };
+    assert_eq!(declared(&plan), declared(&without));
+    assert_eq!(declared(&plan), [("furn:declared".to_owned(), 2)]);
+    let server: Vec<_> = plan
+        .server
+        .iter()
+        .map(|b| (b.name.as_str(), b.first, b.states.len(), b.cube))
+        .collect();
+    assert_eq!(
+        server,
+        [("furn:brick", 3, 1, true), ("furn:chair", 4, 4, false)]
+    );
+    assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+    // The streaming writer must match the in-memory representation,
+    // including field order and the first occurrence of a repeated key.
+    let mut doc = read_json(&base.join("gameplay-facts.json")).unwrap();
+    let J::Obj(fields) = &mut doc else {
+        panic!("gameplay document must be an object");
+    };
+    fields.insert(0, ("metadata".into(), J::Str("test\nvalue".into())));
+    fields.push(("states".into(), J::Arr(Vec::new())));
+    let mut expected = doc.clone();
+    let Some(J::Arr(rows)) = expected.at("states") else {
+        panic!("gameplay document must have a states array");
+    };
+    plan.states(rows, false, Rows::Gameplay).unwrap();
+    let mut streamed = Vec::new();
+    write_gameplay_table(&plan, &doc, &mut streamed).unwrap();
+    assert_eq!(streamed, serde_json::to_vec(&expected).unwrap());
+    drop((plan, without));
+
+    let out = scratch.join("out");
+    build_with_server(&base, &mods, Some(table.as_path()), &out).unwrap();
+    let read = |name: &str| -> serde_json::Value {
+        serde_json::from_slice(&fs::read(out.join(name)).unwrap()).unwrap()
+    };
+    let facts = read("facts.json");
+    let rows = facts["states"].as_array().unwrap();
+    assert_eq!(rows.len(), 8);
+    assert_eq!(
+        rows[3],
+        serde_json::json!(["furn:brick", false, false, "Block{furn:brick}", {"id": "furn:brick"}])
+    );
+    assert_eq!(
+        rows[4],
+        serde_json::json!(["furn:chair", false, false,
+            "Block{furn:chair}[facing=north,waterlogged=true]",
+            {"properties": {"facing": "north", "waterlogged": "true"}, "id": "furn:chair"}])
+    );
+    assert_eq!(facts["defaults"]["furn:chair"], 4);
+    assert!(rows.iter().all(|r| {
+        let name = r[0].as_str().unwrap();
+        !name.starts_with("everycomp:") && name != "nobody:thing"
+    }));
+    // The registry, and so game::server_states, resolves the server's states exactly.
+    let registry = horizon_world::registry::BlockRegistry::from_facts_json(
+        fs::File::open(out.join("facts.json")).unwrap(),
+    )
+    .unwrap();
+    let state = |name: &str, properties: &[(&str, &str)]| horizon_world::chunk::BlockState {
+        name: name.into(),
+        properties: properties
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+    };
+    let chair = state(
+        "furn:chair",
+        &[("facing", "south"), ("waterlogged", "false")],
+    );
+    assert_eq!(registry.resolve(&chair).unwrap(), BlockStateId(7));
+    assert_eq!(
+        registry.resolve(&state("furn:brick", &[])).unwrap(),
+        BlockStateId(3)
+    );
+
+    let gameplay = read("gameplay-facts.json");
+    let rows = gameplay["states"].as_array().unwrap();
+    assert_eq!(rows.len(), 8);
+    for (id, row) in rows.iter().enumerate() {
+        assert_eq!(row["id"], id, "{row}");
+    }
+    // Compact: what the readers default is left out. The brick collides
+    // and hides what is behind it; the chair does neither.
+    let brick = &rows[3];
+    assert_eq!(brick["full_collision"], true);
+    assert_eq!(brick["can_occlude"], true);
+    assert_eq!(brick["item"], "minecraft:air");
+    assert!(brick.get("outline").is_none() && brick.get("replaceable").is_none());
+    assert_eq!(
+        brick["sound"],
+        serde_json::json!({"break": {"id": "minecraft:block.stone.break"}})
+    );
+    let chair_row = &rows[4];
+    assert!(chair_row.get("full_collision").is_none() && chair_row.get("can_occlude").is_none());
+    assert_eq!(chair_row["dampening"], 0);
+    assert_eq!(chair_row["skylight_down"], true);
+    // A declared block's rows stay full copies.
+    assert_eq!(
+        rows[2]["outline"],
+        serde_json::json!([[0.0, 0.0, 0.0, 1.0, 1.0, 1.0]])
+    );
+
+    let behaviours = read("block-behaviours.json");
+    let names: Vec<&str> = behaviours["blocks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "minecraft:air",
+            "minecraft:stone",
+            "furn:declared",
+            "furn:brick",
+            "furn:chair"
+        ]
+    );
+    let states = behaviours["states"].as_array().unwrap();
+    assert_eq!(states.len(), 8);
+    assert_eq!(states[3], serde_json::json!([262143, 5, 0]));
+    assert_eq!(
+        states[4],
+        serde_json::json!([
+            0,
+            horizon_world::level::data::state_flags::COLLISION_EMPTY,
+            0
+        ])
+    );
+
+    let models = read("model-states.json");
+    assert_eq!(
+        models["furn:chair"]["schema"],
+        serde_json::json!({"facing": {"named": ["north", "south"]},
+            "waterlogged": {"named": ["true", "false"]}})
+    );
+    assert_eq!(
+        models["furn:chair"]["states"][3],
+        serde_json::json!({"facing": "south", "waterlogged": "false"})
+    );
+    let render = read("render-definitions.json");
+    assert_eq!(
+        render["furn:chair"],
+        serde_json::json!({"rule": "never", "bars_tag": false, "can_occlude": false,
+            "default": 4, "states": [4, 5, 6, 7]})
+    );
+    assert_eq!(render["furn:brick"]["can_occlude"], true);
+    let structure = read("worldgen/blocks/structure-blocks.json");
+    assert_eq!(structure["states"], 8);
+    assert_eq!(structure["rotate"][5], serde_json::json!([5, 5, 5]));
+    assert_eq!(structure["mirror"][3], serde_json::json!([3, 3]));
+    assert_eq!(structure["full_block"][3], true);
+    assert_eq!(structure["full_block"][4], false);
+    let registries = read("registries.json");
+    let block_id =
+        |name: &str| registries["minecraft:block"]["entries"][name]["protocol_id"].clone();
+    assert_eq!(block_id("furn:declared"), 2);
+    assert_eq!(block_id("furn:brick"), 3);
+    assert_eq!(block_id("furn:chair"), 4);
+
+    // NBT tables: exact identities, the brick's template shape, the chair's air shape.
+    let (collision, _) = nbt::read_named(
+        &fs::read(out.join("cached-collision.nbt")).unwrap(),
+        Limits::tables(),
+    )
+    .unwrap();
+    let Some(Tag::List(identities)) = collision.tag.get("states") else {
+        panic!("no states");
+    };
+    let identities: Vec<_> = identities
+        .iter()
+        .map(|t| horizon_world::chunk::BlockState::from_nbt(t).unwrap())
+        .collect();
+    assert_eq!(identities[7], chair);
+    assert_eq!(identities[3], state("furn:brick", &[]));
+    assert!(matches!(
+        collision.tag.get("cached_shapes"),
+        Some(Tag::IntArray(shapes)) if shapes == &[0, 1, 1, 1, 0, 0, 0, 0]
+    ));
+    let Some(Tag::Compound(blocks)) = collision.tag.get("blocks") else {
+        panic!("no blocks");
+    };
+    assert!(blocks.contains_key(&JavaString::from("furn:chair")));
+
+    // The table is part of what the root is built from.
+    let with_table = stamp(&base, &mods, Some(table.as_path())).unwrap();
+    assert_ne!(stamp(&base, &mods, None).unwrap(), with_table);
+    server_table(&table, &FURNITURE_TABLE[..9]);
+    assert_ne!(
+        stamp(&base, &mods, Some(table.as_path())).unwrap(),
+        with_table
+    );
+    fs::remove_dir_all(&scratch).unwrap();
+}
+
+/// A namespace whose server states would pass the cap is left out with a
+/// warning; the others still get ids, after the existing ones.
+#[test]
+fn server_blocks_past_the_cap_leave_their_namespace_out() {
+    let block = |name: &str, states: usize| server::ServerBlock {
+        name: name.into(),
+        states: vec![String::new(); states],
+        first: 0,
+        cube: true,
+        opaque: true,
+        donors: Vec::new(),
+    };
+    let blocks = vec![
+        block("a:x", 3),
+        block("b:y", 4),
+        block("b:z", 1),
+        block("c:w", 2),
+    ];
+    let mut warnings = Vec::new();
+    let placed = server::place(blocks, 10, 16, &mut warnings);
+    let ids: Vec<_> = placed.iter().map(|b| (b.name.as_str(), b.first)).collect();
+    assert_eq!(ids, [("a:x", 10), ("c:w", 13)]);
+    assert_eq!(warnings.len(), 1);
+    assert!(
+        warnings[0].contains("server's b blocks are left out: their 5 states"),
+        "{}",
+        warnings[0]
+    );
+}
+
+/// Every loader reads a root with server blocks over the real prepared
+/// resources: the NBT tables' identities, the gameplay and behaviour
+/// lengths and block order, and the model catalog's states.
+#[test]
+#[ignore = "full content root: CI and pr_ready run it"]
+fn server_blocks_load_with_every_table() {
+    let Some(base) = prepared() else {
+        return;
+    };
+    let scratch =
+        std::env::temp_dir().join(format!("horizon-mod-server-root-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&scratch);
+    let dir = scratch.join("ruby");
+    let assets_files = [
+        (
+            "assets/ruby/blockstates/ruby_chair.json",
+            r#"{"variants": {"facing=north": {"model": "ruby:block/ruby_chair"},
+                "facing=south": {"model": "ruby:block/ruby_chair", "y": 180}}}"#,
+        ),
+        (
+            "assets/ruby/models/block/ruby_chair.json",
+            r##"{"textures": {"all": "minecraft:block/oak_planks"}, "elements": [{"from": [2, 0, 2],
+                "to": [14, 10, 14], "faces": {"up": {"texture": "#all"}}}]}"##,
+        ),
+        (
+            "assets/ruby/blockstates/ruby_bricks.json",
+            r#"{"variants": {"": {"model": "minecraft:block/bricks"}}}"#,
+        ),
+    ];
+    for (name, text) in assets_files {
+        let path = dir.join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    }
+    let m = ruby_mod(&dir);
+    let table = scratch.join("server-states.tsv");
+    server_table(
+        &table,
+        &[
+            "minecraft:air\t",
+            "ruby:ruby_chair\tfacing=north,waterlogged=false",
+            "ruby:ruby_chair\tfacing=north,waterlogged=true",
+            "ruby:ruby_chair\tfacing=south,waterlogged=false",
+            "ruby:ruby_chair\tfacing=south,waterlogged=true",
+            "ruby:ruby_bricks\t",
+            "ruby:ruby_block\t",
+        ],
+    );
+    let out = scratch.join("out");
+    build_with_server(&base, std::slice::from_ref(&m), Some(table.as_path()), &out).unwrap();
+
+    let n = horizon_world::registry::BlockRegistry::from_facts_json(
+        fs::File::open(base.join("facts.json")).unwrap(),
+    )
+    .unwrap()
+    .len() as u32;
+    let assets = Assets::load(&out).unwrap();
+    let registry = assets.registry;
+    // After ruby's 66 declared states: the bricks, then the chair's four.
+    let bricks = BlockStateId(n + 66);
+    assert_eq!(registry.default_state("ruby:ruby_bricks"), Some(bricks));
+    let chair = registry
+        .resolve(&horizon_world::chunk::BlockState {
+            name: "ruby:ruby_chair".into(),
+            properties: [("facing", "south"), ("waterlogged", "true")]
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                .into(),
+        })
+        .unwrap();
+    assert_eq!(chair, BlockStateId(n + 70));
+    assert_eq!(registry.len() as u32, n + 71);
+
+    let facts = BlockFacts::load(&out, registry).unwrap();
+    let behaviours = horizon_world::level::Behaviours::load(registry, &out).unwrap();
+    use horizon_world::level::data::state_flags::{COLLISION_EMPTY, FULL_COLLISION};
+    assert_ne!(behaviours.facts(bricks).flags & FULL_COLLISION, 0);
+    assert_eq!(behaviours.facts(chair).flags & FULL_COLLISION, 0);
+    assert_ne!(behaviours.facts(chair).flags & COLLISION_EMPTY, 0);
+    Items::load(&out, registry, &facts).unwrap();
+    crate::collisions::load(&out, registry).unwrap();
+    crate::models::load_visibility(&out, registry).unwrap();
+    crate::light::LightTables::load(&out, registry, &facts).unwrap();
+    crate::motion::MotionResources::load(&out, &assets).unwrap();
+    horizon_world::worldgen::generator::GeneratorData::load(&out.join("worldgen"), registry)
+        .unwrap();
+    // Each binds its own blockstate over the server's states.
+    let mut sprites = crate::sprites::Sprites::default();
+    let prepared = crate::models::prepare(&out, registry, &mut sprites).unwrap();
+    let position = horizon_core::position::BlockPos::new(0, 0, 0);
+    assert_eq!(prepared.catalog.collect(chair, position).unwrap().len(), 1);
+    assert_eq!(prepared.catalog.collect(bricks, position).unwrap().len(), 1);
+    fs::remove_dir_all(&scratch).unwrap();
+}
+
+/// A block or item tag entry naming a vanilla tag the base lacks is dropped
+/// (1.21.1's `concrete_powder`); one the base has stays, and a base without
+/// that kind's folder keeps every `minecraft:` tag as before.
+#[test]
+fn tag_entries_naming_missing_vanilla_tags_are_dropped() {
+    let dir = std::env::temp_dir().join(format!("horizon-tag-paths-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let block_tags = dir.join("data/minecraft/tags/block");
+    fs::create_dir_all(block_tags.join("mineable")).unwrap();
+    fs::write(block_tags.join("mineable/pickaxe.json"), "{}").unwrap();
+    fs::write(block_tags.join("logs.json"), "{}").unwrap();
+    fs::write(block_tags.join("notes.txt"), "").unwrap();
+    let mut paths = std::collections::BTreeSet::new();
+    tag_paths(&block_tags, "", &mut paths).unwrap();
+    assert_eq!(
+        paths.iter().map(String::as_str).collect::<Vec<_>>(),
+        ["logs", "mineable/pickaxe"]
+    );
+
+    let known = |vanilla_tags: BTreeMap<&'static str, std::collections::BTreeSet<String>>| Known {
+        blocks: ["minecraft:stone".to_owned()].into(),
+        items: Default::default(),
+        biomes: Default::default(),
+        biome_tags: Default::default(),
+        tag_files: ["data/c/tags/block/storage_blocks/ruby.json".to_owned()].into(),
+        vanilla_tags,
+    };
+    let file = "data/minecraft/tags/block/mineable/pickaxe.json";
+    let entry = |s: &str| J::Str(s.into());
+    let with_base = known(BTreeMap::from([("block", paths)]));
+    assert!(with_base.keeps(file, &entry("#minecraft:mineable/pickaxe")));
+    assert!(with_base.keeps(file, &entry("#logs")));
+    assert!(with_base.keeps(file, &entry("#c:storage_blocks/ruby")));
+    assert!(with_base.keeps(file, &entry("minecraft:stone")));
+    assert!(!with_base.keeps(file, &entry("#minecraft:concrete_powder")));
+    assert!(!with_base.keeps(file, &entry("#c:not_added")));
+    // Item tags have no folder in this base: their vanilla tags all stay.
+    let item_file = "data/minecraft/tags/item/gems.json";
+    assert!(with_base.keeps(item_file, &entry("#minecraft:concrete_powder")));
+    let without_base = known(BTreeMap::new());
+    assert!(without_base.keeps(file, &entry("#minecraft:concrete_powder")));
+
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn declared_non_cube_and_cutout_blocks_do_not_occlude_neighbors() {
+    let scratch =
+        std::env::temp_dir().join(format!("horizon-mod-declared-occlude-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&scratch);
+    let base = scratch.join("base");
+    server_base(&base);
+    // Copy cached-collision.nbt shape table layout [0, 1] into occlusion.nbt as well.
+    fs::copy(base.join("cached-collision.nbt"), base.join("occlusion.nbt")).unwrap();
+
+    let m = folder_mod(
+        &scratch.join("bwg"),
+        &[
+            ("horizon-mod.toml", &manifest("bwg", "")),
+            (
+                "data/bwg/horizon/block/clover_patch.json",
+                r#"{"template": "minecraft:stone"}"#,
+            ),
+            (
+                "data/bwg/horizon/block/glass_bush.json",
+                r#"{"template": "minecraft:stone"}"#,
+            ),
+            (
+                "data/bwg/horizon/block/marble.json",
+                r#"{"template": "minecraft:stone"}"#,
+            ),
+            (
+                "data/bwg/horizon/block/depot.json",
+                r#"{"template": "minecraft:stone"}"#,
+            ),
+            (
+                "data/bwg/horizon/block/petals.json",
+                r#"{"template": "minecraft:stone"}"#,
+            ),
+            (
+                "assets/bwg/blockstates/petals.json",
+                r#"{"variants": {"": [{"model": "bwg:block/petals"}, {"model": "bwg:block/petals", "y": 90}]}}"#,
+            ),
+            (
+                "assets/bwg/models/block/petals.json",
+                r#"{"render_type": "minecraft:cutout", "elements": [{"from": [0, 2, 0], "to": [16, 2, 16]}, {"from": [8, 0, 0], "to": [8, 6, 16]}]}"#,
+            ),
+            (
+                "assets/bwg/blockstates/depot.json",
+                r#"{"variants": {"": {"model": "bwg:block/depot"}}}"#,
+            ),
+            (
+                "assets/bwg/models/block/depot.json",
+                r#"{"parent": "minecraft:block/block", "elements": [{"from": [1, 0, 1], "to": [15, 13, 15]}]}"#,
+            ),
+            (
+                "assets/bwg/blockstates/clover_patch.json",
+                r#"{"variants": {"": {"model": "bwg:block/clover_patch"}}}"#,
+            ),
+            (
+                "assets/bwg/models/block/clover_patch.json",
+                r#"{"parent": "minecraft:block/cross", "render_type": "minecraft:cutout"}"#,
+            ),
+            (
+                "assets/bwg/blockstates/glass_bush.json",
+                r#"{"variants": {"": {"model": "bwg:block/glass_bush"}}}"#,
+            ),
+            (
+                "assets/bwg/models/block/glass_bush.json",
+                r#"{"parent": "minecraft:block/cube_all", "render_type": "minecraft:cutout"}"#,
+            ),
+            (
+                "assets/bwg/blockstates/marble.json",
+                r#"{"variants": {"": {"model": "bwg:block/marble"}}}"#,
+            ),
+            (
+                "assets/bwg/models/block/marble.json",
+                r#"{"parent": "minecraft:block/cube_all"}"#,
+            ),
+        ],
+    );
+    let out = scratch.join("out");
+    build_with_server(&base, &[m], None, &out).unwrap();
+    let read = |name: &str| -> serde_json::Value {
+        serde_json::from_slice(&fs::read(out.join(name)).unwrap()).unwrap()
+    };
+
+    let render = read("render-definitions.json");
+    assert_eq!(render["bwg:clover_patch"]["can_occlude"], false);
+    assert_eq!(render["bwg:glass_bush"]["can_occlude"], false);
+    assert_eq!(render["bwg:marble"]["can_occlude"], true);
+
+    let gameplay = read("gameplay-facts.json");
+    let rows = gameplay["states"].as_array().unwrap();
+    let facts = read("facts.json");
+    let clover_id = facts["defaults"]["bwg:clover_patch"].as_u64().unwrap() as usize;
+    let bush_id = facts["defaults"]["bwg:glass_bush"].as_u64().unwrap() as usize;
+    let marble_id = facts["defaults"]["bwg:marble"].as_u64().unwrap() as usize;
+    let depot_id = facts["defaults"]["bwg:depot"].as_u64().unwrap() as usize;
+    let petals_id = facts["defaults"]["bwg:petals"].as_u64().unwrap() as usize;
+    assert_eq!(render["bwg:depot"]["can_occlude"], false);
+    // Flat planes only (a petal patch): walked through like a cross plant.
+    assert_eq!(rows[petals_id]["full_collision"], false);
+    assert_eq!(rows[clover_id]["can_occlude"], false);
+    assert_eq!(rows[clover_id]["full_collision"], false);
+    // A see-through cube (leaves, glass, ice) and a shape that is no plant
+    // stay solid like the server's: only occlusion is dropped.
+    assert_eq!(rows[bush_id]["can_occlude"], false);
+    assert_eq!(rows[bush_id]["full_collision"], true);
+    assert_eq!(rows[depot_id]["can_occlude"], false);
+    assert_eq!(rows[depot_id]["full_collision"], true);
+    assert_eq!(rows[marble_id]["can_occlude"], true);
+    assert_eq!(rows[marble_id]["full_collision"], true);
+
+    let (occ, _) =
+        nbt::read_named(&fs::read(out.join("occlusion.nbt")).unwrap(), Limits::tables()).unwrap();
+    let Some(Tag::IntArray(occ_shapes)) = occ.tag.get("cached_shapes") else {
+        panic!("no occlusion shapes");
+    };
+    assert_eq!(occ_shapes[clover_id], occ_shapes[0]);
+    assert_eq!(occ_shapes[bush_id], occ_shapes[0]);
+    assert_eq!(occ_shapes[depot_id], occ_shapes[0]);
+    assert_eq!(occ_shapes[marble_id], occ_shapes[1]);
+
+    let (col, _) = nbt::read_named(
+        &fs::read(out.join("cached-collision.nbt")).unwrap(),
+        Limits::tables(),
+    )
+    .unwrap();
+    let Some(Tag::IntArray(col_shapes)) = col.tag.get("cached_shapes") else {
+        panic!("no collision shapes");
+    };
+    assert_eq!(col_shapes[clover_id], col_shapes[0]);
+    assert_eq!(col_shapes[bush_id], col_shapes[1]);
+    assert_eq!(col_shapes[petals_id], col_shapes[0]);
+    assert_eq!(col_shapes[depot_id], col_shapes[1]);
+    assert_eq!(col_shapes[marble_id], col_shapes[1]);
+
+    fs::remove_dir_all(&scratch).unwrap();
+}
+
+/// A full-cube template's occlusion goes only to a model that hides as much;
+/// slabs and stairs keep theirs unless the model is see-through.
+#[test]
+fn template_occlusion_passes_only_to_models_that_hide_as_much() {
+    let base = std::env::temp_dir().join(format!(
+        "horizon-template-occlusion-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&base);
+    let files = [
+        (
+            "assets/minecraft/models/block/cube.json",
+            r#"{"elements": [{"from": [0, 0, 0], "to": [16, 16, 16]}]}"#,
+        ),
+        (
+            "assets/minecraft/models/block/cube_all.json",
+            r#"{"parent": "minecraft:block/cube"}"#,
+        ),
+        (
+            "assets/minecraft/blockstates/furnace.json",
+            r#"{"variants": {"lit=false": {"model": "minecraft:block/furnace"}}}"#,
+        ),
+        (
+            "assets/minecraft/models/block/furnace.json",
+            r#"{"parent": "minecraft:block/cube_all"}"#,
+        ),
+        (
+            "assets/minecraft/blockstates/oak_stairs.json",
+            r#"{"variants": {"half=bottom": {"model": "minecraft:block/stairs"}}}"#,
+        ),
+        (
+            "assets/minecraft/models/block/stairs.json",
+            r#"{"elements": [{"from": [0, 0, 0], "to": [16, 8, 16]}, {"from": [8, 8, 0], "to": [16, 16, 16]}]}"#,
+        ),
+        (
+            "assets/m/blockstates/wall_torch.json",
+            r#"{"variants": {"lit=false": {"model": "m:block/wall_torch"}}}"#,
+        ),
+        (
+            "assets/m/models/block/wall_torch.json",
+            r#"{"render_type": "minecraft:cutout", "elements": [{"from": [7, 3, 12], "to": [9, 13, 16]}]}"#,
+        ),
+        (
+            "assets/m/blockstates/kiln.json",
+            r#"{"variants": {"lit=false": {"model": "m:block/kiln"}}}"#,
+        ),
+        (
+            "assets/m/models/block/kiln.json",
+            r#"{"parent": "minecraft:block/cube_all"}"#,
+        ),
+        (
+            "assets/m/blockstates/brick_stairs.json",
+            r#"{"variants": {"half=bottom": {"model": "m:block/brick_stairs"}}}"#,
+        ),
+        (
+            "assets/m/models/block/brick_stairs.json",
+            r#"{"parent": "minecraft:block/stairs"}"#,
+        ),
+        (
+            "assets/m/blockstates/glass_stairs.json",
+            r#"{"variants": {"half=bottom": {"model": "m:block/glass_stairs"}}}"#,
+        ),
+        (
+            "assets/m/models/block/glass_stairs.json",
+            r#"{"parent": "minecraft:block/stairs", "render_type": "minecraft:translucent"}"#,
+        ),
+    ];
+    for (name, text) in files {
+        let path = base.join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    }
+    let mut assets = server::ModAssets::new(&base, &[]);
+    let keeps = |assets: &mut server::ModAssets<'_>, id: &str, template: &str| {
+        keeps_template_occlusion(assets, id, template, false)
+    };
+    assert!(keeps(&mut assets, "m:kiln", "minecraft:furnace"));
+    assert!(!keeps(&mut assets, "m:wall_torch", "minecraft:furnace"));
+    assert!(keeps(&mut assets, "m:brick_stairs", "minecraft:oak_stairs"));
+    assert!(!keeps(&mut assets, "m:glass_stairs", "minecraft:oak_stairs"));
+    drop(assets);
+    fs::remove_dir_all(&base).unwrap();
+}
+
+/// A see-through cube the server sends (glass, ice, leaves) keeps its
+/// collision but occludes nothing; an opaque one keeps both.
+#[test]
+fn server_see_through_cubes_collide_but_do_not_occlude() {
+    let scratch =
+        std::env::temp_dir().join(format!("horizon-mod-server-glass-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&scratch);
+    let base = scratch.join("base");
+    server_base(&base);
+    fs::copy(base.join("cached-collision.nbt"), base.join("occlusion.nbt")).unwrap();
+    let m = folder_mod(
+        &scratch.join("glassy"),
+        &[
+            ("horizon-mod.toml", &manifest("glassy", "")),
+            (
+                "assets/glassy/blockstates/glass.json",
+                r#"{"variants": {"": {"model": "glassy:block/glass"}}}"#,
+            ),
+            (
+                "assets/glassy/models/block/glass.json",
+                r#"{"parent": "minecraft:block/cube_all", "render_type": "minecraft:translucent"}"#,
+            ),
+            (
+                "assets/glassy/blockstates/rock.json",
+                r#"{"variants": {"": {"model": "glassy:block/rock"}}}"#,
+            ),
+            (
+                "assets/glassy/models/block/rock.json",
+                r#"{"parent": "minecraft:block/cube_all"}"#,
+            ),
+        ],
+    );
+    let table = scratch.join("server-states.tsv");
+    server_table(
+        &table,
+        &[
+            "minecraft:air\t",
+            "minecraft:stone\t",
+            "glassy:glass\t",
+            "glassy:rock\t",
+        ],
+    );
+    let plan = Plan::new(&base, std::slice::from_ref(&m), Some(table.as_path())).unwrap();
+    let flags: Vec<_> = plan
+        .server
+        .iter()
+        .map(|b| (b.name.as_str(), b.cube, b.opaque))
+        .collect();
+    assert_eq!(
+        flags,
+        [("glassy:glass", true, false), ("glassy:rock", true, true)]
+    );
+    let id = |name: &str| plan.server.iter().find(|b| b.name == name).unwrap().first as usize;
+    let (glass, rock) = (id("glassy:glass"), id("glassy:rock"));
+    drop(plan);
+
+    let out = scratch.join("out");
+    build_with_server(&base, &[m], Some(table.as_path()), &out).unwrap();
+    let gameplay: serde_json::Value =
+        serde_json::from_slice(&fs::read(out.join("gameplay-facts.json")).unwrap()).unwrap();
+    let rows = gameplay["states"].as_array().unwrap();
+    assert_eq!(rows[glass]["full_collision"], true);
+    assert_ne!(rows[glass]["can_occlude"], true);
+    assert_eq!(rows[rock]["full_collision"], true);
+    assert_eq!(rows[rock]["can_occlude"], true);
+    let shapes = |name: &str| {
+        let (tag, _) =
+            nbt::read_named(&fs::read(out.join(name)).unwrap(), Limits::tables()).unwrap();
+        let Some(Tag::IntArray(shapes)) = tag.tag.get("cached_shapes") else {
+            panic!("no shapes in {name}");
+        };
+        shapes.clone()
+    };
+    let (occlusion, collision) = (shapes("occlusion.nbt"), shapes("cached-collision.nbt"));
+    assert_eq!(occlusion[glass], occlusion[0]);
+    assert_eq!(collision[glass], collision[1]);
+    assert_eq!(occlusion[rock], occlusion[1]);
+    assert_eq!(collision[rock], collision[1]);
+    fs::remove_dir_all(&scratch).unwrap();
+}
+
+#[test]
+fn overlay_write_and_batch_do_not_mutate_base_files() {
+    let scratch = std::env::temp_dir().join(format!("horizon-overlay-batch-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&scratch);
+    let base = scratch.join("base");
+    let out = scratch.join("out");
+    fs::create_dir_all(base.join("assets/minecraft")).unwrap();
+    fs::write(base.join("assets/minecraft/a.txt"), b"base-a").unwrap();
+    fs::write(base.join("assets/minecraft/b.txt"), b"base-b").unwrap();
+    fs::create_dir_all(out.join(".horizon-derived")).unwrap();
+    fs::write(out.join(".horizon-derived/keep.txt"), b"keep").unwrap();
+
+    let overlay = Overlay::new(&base, &out).unwrap();
+    overlay.write("assets/minecraft/a.txt", b"mod-a").unwrap();
+    overlay
+        .write_batch(
+            &[
+                ("assets/minecraft/b.txt", b"mod-b"),
+                ("assets/mod/new/c.txt", b"mod-c"),
+            ],
+            2,
+        )
+        .unwrap();
+
+    assert_eq!(fs::read(base.join("assets/minecraft/a.txt")).unwrap(), b"base-a");
+    assert_eq!(fs::read(base.join("assets/minecraft/b.txt")).unwrap(), b"base-b");
+    assert_eq!(fs::read(out.join("assets/minecraft/a.txt")).unwrap(), b"mod-a");
+    assert_eq!(fs::read(out.join("assets/minecraft/b.txt")).unwrap(), b"mod-b");
+    assert_eq!(fs::read(out.join("assets/mod/new/c.txt")).unwrap(), b"mod-c");
+    assert_eq!(fs::read(out.join(".horizon-derived/keep.txt")).unwrap(), b"keep");
+
+    fs::remove_dir_all(&scratch).unwrap();
 }

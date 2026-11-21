@@ -36,28 +36,93 @@ impl Game<'_> {
         let Some(culler) = &self.entity_culler else {
             return;
         };
-        let hidden = culler.hidden(vertices, start, |pos| {
-            let state = self.world.block(pos[0], pos[1], pos[2]);
-            if !opaque(self.res.facts().get(state)) {
-                return false;
-            }
-            let Some(y) = pos[1].checked_sub(MIN_Y) else {
-                return false;
-            };
-            let section = (pos[0] >> 4, y.div_euclid(16), pos[2] >> 4);
-            // Newly edited or not-yet-uploaded terrain is not an occluder.
-            self.renderer
-                .as_ref()
-                .is_some_and(|r| r.has_section(section))
-                && !self.world.dirty_sections.contains(&section)
-                && !self.streaming.is_meshing(section)
-                && !self.pending_uploads.iter().any(|(key, _)| *key == section)
-        });
+        let hidden = culler.hidden(vertices, start, |pos| self.occludes(pos));
         // A shader pack's shadow pass still draws what the camera cannot see.
         if hidden && !(self.pack_shadow_casters.0 && self.hide_spans_from(start, vertices.len())) {
             vertices.truncate(start);
         }
     }
+}
+
+impl Game<'_> {
+    /// A fully built, uploaded opaque block that can hide an entity behind it.
+    fn occludes(&self, pos: [i32; 3]) -> bool {
+        let state = self.world.block(pos[0], pos[1], pos[2]);
+        if !opaque(self.res.facts().get(state)) {
+            return false;
+        }
+        let Some(y) = pos[1].checked_sub(MIN_Y) else {
+            return false;
+        };
+        let section = (pos[0] >> 4, y.div_euclid(16), pos[2] >> 4);
+        // Newly edited or not-yet-uploaded terrain is not an occluder.
+        self.renderer
+            .as_ref()
+            .is_some_and(|r| r.has_section(section))
+            && !self.world.dirty_sections.contains(&section)
+            && !self.streaming.is_meshing(section)
+            && !self.pending_uploads.iter().any(|(key, _)| *key == section)
+    }
+
+    /// Whether a mob standing at `feet` (interpolated, `width` by `height`)
+    /// is hidden behind opaque blocks before its pose and mesh are built.
+    /// A shader pack's shadow pass still needs what the camera cannot see.
+    pub(super) fn mob_hidden_before_pose(
+        &self,
+        feet: glam::DVec3,
+        width: f64,
+        height: f64,
+    ) -> bool {
+        if self.pack_shadow_casters.0 {
+            return false;
+        }
+        let Some(culler) = &self.entity_culler else {
+            return false;
+        };
+        let (min, max) = pose_bounds(feet, width, height);
+        culler.occluded(min, max, |pos| self.occludes(pos))
+    }
+}
+
+/// Margin around a mob's collision box that its posed model stays inside:
+/// equipment, wings, tentacles and a dragon's limbs reach past the box.
+fn pose_margin(width: f64, height: f64) -> f64 {
+    (width.max(height) * 0.5).max(1.0)
+}
+
+/// Factor on a modded mob's box for the box its model may fill: GeckoLib models
+/// can be far bigger than the template hitbox they run on.
+const MODDED_MODEL_EXTENT: f64 = 4.0;
+
+/// The width and height of the box a mob's drawn model can fill, from its
+/// collision box and its `scale` attribute (`model_scale`, 0 when unset); and
+/// whether the model's size is unknown (a modded type), where the occlusion
+/// test before the pose must not run.
+pub(super) fn drawn_extent(
+    kind: &str,
+    width: f64,
+    height: f64,
+    model_scale: f32,
+) -> (f64, f64, bool) {
+    let scale = if model_scale > 0.0 {
+        f64::from(model_scale)
+    } else {
+        1.0
+    };
+    let modded = !kind.starts_with("minecraft:");
+    let grow = if modded { MODDED_MODEL_EXTENT } else { 1.0 };
+    let factor = scale.max(1.0) * grow;
+    (width * factor, height * factor, modded)
+}
+
+/// The whole box (not the position) a mob's model can occupy, in world space.
+pub(super) fn pose_bounds(feet: glam::DVec3, width: f64, height: f64) -> ([f64; 3], [f64; 3]) {
+    let margin = pose_margin(width, height);
+    let half = width / 2.0 + margin;
+    (
+        [feet.x - half, feet.y - margin, feet.z - half],
+        [feet.x + half, feet.y + height + margin, feet.z + half],
+    )
 }
 
 impl Game<'_> {
@@ -147,6 +212,52 @@ impl Game<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pre-pose box covers the collision box with room for a model that
+    /// reaches past it, and a big mob's margin grows with its size.
+    #[test]
+    fn the_pose_box_covers_the_whole_mob() {
+        let (min, max) = pose_bounds(glam::DVec3::new(10.0, 64.0, -3.0), 0.6, 1.8);
+        assert_eq!(min, [10.0 - 1.3, 63.0, -3.0 - 1.3]);
+        assert_eq!(max, [10.0 + 1.3, 64.0 + 1.8 + 1.0, -3.0 + 1.3]);
+        let (dragon_min, dragon_max) = pose_bounds(glam::DVec3::ZERO, 16.0, 8.0);
+        assert_eq!(dragon_max[0] - dragon_min[0], 16.0 + 16.0);
+    }
+
+    /// A modded model may be far bigger than its hitbox, so it is never
+    /// occlusion-culled before the pose; a scaled mob's box grows with it.
+    #[test]
+    fn the_drawn_extent_grows_for_scaled_and_modded_mobs() {
+        assert_eq!(
+            drawn_extent("minecraft:zombie", 0.6, 1.95, 0.0),
+            (0.6, 1.95, false)
+        );
+        assert_eq!(
+            drawn_extent("minecraft:zombie", 0.6, 2.0, 0.5),
+            (0.6, 2.0, false)
+        );
+        assert_eq!(
+            drawn_extent("minecraft:player", 0.6, 1.8, 5.0),
+            (3.0, 9.0, false)
+        );
+        let (w, h, unknown) = drawn_extent("born_in_chaos_v1:boss", 0.9, 0.9, 0.0);
+        assert!(unknown && w >= 3.0 && h >= 3.0);
+    }
+
+    /// A solid wall across the whole box hides it; a box that sticks out
+    /// past the wall's edge, or a missing wall, leaves it drawn.
+    #[test]
+    fn a_mob_is_hidden_only_when_a_wall_covers_its_whole_box() {
+        let culler = Culler::new([0.5, 65.0, 0.5], 8_192);
+        let wall = |pos: [i32; 3]| {
+            pos[0] == 3 && (55..=75).contains(&pos[1]) && (-10..=10).contains(&pos[2])
+        };
+        let (min, max) = pose_bounds(glam::DVec3::new(10.0, 64.0, 0.5), 0.6, 1.8);
+        assert!(culler.occluded(min, max, wall));
+        let (min, max) = pose_bounds(glam::DVec3::new(10.0, 64.0, 80.0), 0.6, 1.8);
+        assert!(!culler.occluded(min, max, wall));
+        assert!(!culler.occluded(min, max, |_| false));
+    }
 
     /// `Entity.setViewScale`: the entity distance option times the render
     /// distance's boost — 1 at eight chunks, 1.5 at twelve, 2.5 at twenty.

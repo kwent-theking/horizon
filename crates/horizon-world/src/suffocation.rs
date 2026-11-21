@@ -45,11 +45,11 @@ impl<'r> SuffocationRegistry<'r> {
         let registry = collisions.registry();
         if definitions
             .keys()
-            .chain(causes_suffocation)
             .any(|name| registry.default_state(name).is_none())
         {
-            return Err(invalid("unknown suffocation definition or tag member"));
+            return Err(invalid("unknown suffocation definition"));
         }
+        // Tag members of mods that are not installed match no state: skip them.
         let mut full_shapes = HashMap::new();
         let mut rules = Vec::with_capacity(registry.len());
         for index in 0..registry.len() {

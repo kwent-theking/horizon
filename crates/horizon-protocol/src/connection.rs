@@ -354,8 +354,10 @@ impl ConnReader {
                 // (777) shape after the id was mapped.
                 // / RU: шлюз тел: активная трансляция может переписать тело
                 // пакета из формата 767 в родной 777 после маппинга id.
-                let payload = crate::translation::ingress_body(id, &body[start..])
-                    .unwrap_or_else(|| body[start..].to_vec());
+                let (id, payload) = match crate::translation::ingress_body(id, &body[start..]) {
+                    Some(payload) => (crate::translation::native_id(id), payload),
+                    None => (id, body[start..].to_vec()),
+                };
                 self.counters.received.fetch_add(1, Ordering::Relaxed);
                 return Ok((id, payload));
             }
@@ -389,8 +391,12 @@ impl ConnWriter {
     /// обойти его из кода отправки нельзя. С HORIZON_DUMP_SB каждый
     /// исходящий id пишется в лог - защита от тихих обходов.
     pub fn send(&mut self, body: &[u8]) -> Result<()> {
-        let routed = crate::translation::egress(body);
-        let routed = routed.as_deref().unwrap_or_default();
+        for routed in crate::translation::egress_all(body) {
+            self.send_routed(&routed)?;
+        }
+        Ok(())
+    }
+    fn send_routed(&mut self, routed: &[u8]) -> Result<()> {
         if routed.is_empty() {
             // The translation dropped the packet (no counterpart on the
             // wire). Producers must not notice: send stays a success.
@@ -400,8 +406,7 @@ impl ConnWriter {
         }
         if std::env::var_os("HORIZON_DUMP_SB").is_some() {
             let mut r = crate::buf::Reader::new(routed);
-            let id = r.varint().unwrap_or(-1);
-            use std::io::Write;
+            let id = r.varint().unwrap_or(-1);            use std::io::Write;
             if let Ok(mut f) = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)

@@ -64,6 +64,7 @@ pub(super) struct Panorama {
     pipeline: wgpu::RenderPipeline,
     group: wgpu::BindGroup,
     uniform: wgpu::Buffer,
+    pub gpu_bytes: u64,
 }
 
 impl Panorama {
@@ -72,7 +73,31 @@ impl Panorama {
         queue: &wgpu::Queue,
         format: wgpu::TextureFormat,
         faces: &Faces,
+        allow_bc: bool,
     ) -> Self {
+        let can_bc = allow_bc
+            && device
+                .features()
+                .contains(wgpu::Features::TEXTURE_COMPRESSION_BC)
+            && faces.size >= 4
+            && faces.size % 4 == 0;
+        let (tex_format, upload_data, gpu_bytes): (
+            wgpu::TextureFormat,
+            std::borrow::Cow<'_, [u8]>,
+            u64,
+        ) = if can_bc {
+            let bc_fmt = super::bc::pick_format(&faces.pixels);
+            let encoded =
+                super::bc::compress_layer_major_mips(&faces.pixels, faces.size, 1, 6, bc_fmt);
+            let bytes = encoded.len() as u64;
+            (bc_fmt.wgpu(), std::borrow::Cow::Owned(encoded), bytes)
+        } else {
+            (
+                wgpu::TextureFormat::Rgba8Unorm,
+                std::borrow::Cow::Borrowed(faces.pixels.as_slice()),
+                faces.pixels.len() as u64,
+            )
+        };
         let texture = device.create_texture_with_data(
             queue,
             &wgpu::TextureDescriptor {
@@ -85,12 +110,12 @@ impl Panorama {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
+                format: tex_format,
                 usage: wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
             },
             wgpu::util::TextureDataOrder::LayerMajor,
-            &faces.pixels,
+            upload_data.as_ref(),
         );
         let view = texture.create_view(&wgpu::TextureViewDescriptor {
             dimension: Some(wgpu::TextureViewDimension::Cube),
@@ -205,6 +230,7 @@ impl Panorama {
             pipeline,
             group,
             uniform,
+            gpu_bytes,
         }
     }
 

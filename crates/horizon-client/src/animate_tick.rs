@@ -20,9 +20,12 @@ use horizon_world::{
     registry::{BlockRegistry, BlockStateId},
     worldgen::tags::TagDefinitions,
 };
-use std::{collections::BTreeMap, path::Path};
+use std::{
+    collections::{BTreeMap, HashSet},
+    path::Path,
+};
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 enum Animate {
     None,
     Torch(T),
@@ -297,6 +300,7 @@ fn candle_offsets(count: u8) -> &'static [[f64; 3]] {
 }
 
 /// Per-state animate behaviour and the block tags it needs.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct AnimateTables {
     kinds: Vec<Animate>,
     impermeable: Vec<bool>,
@@ -321,6 +325,102 @@ pub struct AnimateTables {
 }
 impl AnimateTables {
     pub fn load(root: &Path, registry: &BlockRegistry, biomes: &Biomes) -> crate::Result<Self> {
+        Self::load_or_cached(root, registry, biomes, None)
+    }
+
+    pub fn load_or_cached(
+        root: &Path,
+        registry: &BlockRegistry,
+        biomes: &Biomes,
+        behaviour: Option<&serde_json::Value>,
+    ) -> crate::Result<Self> {
+        let started = std::time::Instant::now();
+        let cache = Self::snapshot_cache(root, registry, biomes);
+        if let Some(tables) = cache
+            .as_ref()
+            .and_then(|c| c.read_value::<Self>())
+            .filter(|t| t.valid(registry.len(), biomes.list.len()))
+        {
+            log::info!(
+                "Horizon: stage=animate_tables cache=hit elapsed_ms={}",
+                started.elapsed().as_millis()
+            );
+            return Ok(tables);
+        }
+        let owned_behaviour;
+        let behaviour_ref = match behaviour {
+            Some(v) => v,
+            None => {
+                owned_behaviour =
+                    serde_json::from_slice(&std::fs::read(root.join("block-behaviours.json"))?)?;
+                &owned_behaviour
+            }
+        };
+        let tables = Self::load_with_behaviour_json(root, registry, biomes, behaviour_ref)?;
+        if let Some(cache) = cache {
+            let _ = cache.write_value(&tables);
+        }
+        log::info!(
+            "Horizon: stage=animate_tables cache=miss elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
+        Ok(tables)
+    }
+
+    fn snapshot_cache(
+        root: &Path,
+        registry: &BlockRegistry,
+        biomes: &Biomes,
+    ) -> Option<horizon_world::resource_cache::Cache> {
+        let mut biome_names: Vec<(&String, &u16)> = biomes.index.iter().collect();
+        biome_names.sort_by(|a, b| a.0.cmp(b.0));
+        let tree_digest =
+            horizon_world::resource_cache::Cache::for_tree(root, "animate-tables-tree-v1", &[])
+                .map(|c| *c.identity());
+        let identity = horizon_world::resource_cache::Cache::value_identity(&(
+            registry.cache_identity(),
+            biomes.list.len(),
+            biome_names,
+            tree_digest,
+        ))?;
+        let tags_path = root.join("block-tags.json");
+        let behaviour_path = root.join("block-behaviours.json");
+        horizon_world::resource_cache::Cache::new(
+            root,
+            "animate-tables-v1",
+            &[tags_path.as_path(), behaviour_path.as_path()],
+            &identity,
+        )
+    }
+
+    fn valid(&self, states: usize, biomes: usize) -> bool {
+        self.kinds.len() == states
+            && self.dripstone.len() == states
+            && self.impermeable.len() == states
+            && self.power_provider.len() == states
+            && self.power_transmitter.len() == states
+            && self.dried_ghast_sounds.len() == states
+            && self.desert_sand_sounds.len() == states
+            && self.poplar_leaf_logs.len() == states
+            && self.desert_dry_vegetation_sounds.len() == states
+            && self.terracotta.len() == states
+            && self.pale_oak_logs.len() == states
+            && self.burnable.len() == states
+            && self.ambient.len() == biomes
+            && self.ambient.iter().all(|entries| {
+                entries
+                    .iter()
+                    .all(|(_, prob)| prob.is_finite() && *prob >= 0.0)
+            })
+    }
+
+    /// Reuse the behaviour document already read for block facts and server tables.
+    pub fn load_with_behaviour_json(
+        root: &Path,
+        registry: &BlockRegistry,
+        biomes: &Biomes,
+        behaviour: &serde_json::Value,
+    ) -> crate::Result<Self> {
         let kinds = (0..registry.len() as u32)
             .map(|id| {
                 registry.state(BlockStateId(id)).map_or(Animate::None, |s| {
@@ -337,17 +437,21 @@ impl AnimateTables {
         let built =
             definitions.build(|name, _| registry.default_state(name).map(|_| name.to_owned()))?;
         let by_state = |tag: &str| -> Vec<bool> {
-            let names = built.tags.get(tag);
+            let names: HashSet<&str> = built
+                .tags
+                .get(tag)
+                .into_iter()
+                .flatten()
+                .map(String::as_str)
+                .collect();
             (0..registry.len() as u32)
                 .map(|id| {
                     registry
                         .state(BlockStateId(id))
-                        .is_some_and(|s| names.is_some_and(|n| n.contains(&s.name)))
+                        .is_some_and(|s| names.contains(s.name.as_str()))
                 })
                 .collect()
         };
-        let behaviour: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(root.join("block-behaviours.json"))?)?;
         let ignite_odds = behaviour["fire"]["igniteOdds"].as_object();
         let burnable = (0..registry.len() as u32)
             .map(|id| {
@@ -1954,5 +2058,96 @@ mod tests {
         let c = redstone_color(15);
         assert!((c[0] - 1.0).abs() < 1e-6);
         assert!((c[1] - (51.0 / 255.0)).abs() < 0.01);
+    }
+
+    #[test]
+    fn animate_tables_snapshot_round_trips_recovers_and_invalidates() {
+        let temp =
+            std::env::temp_dir().join(format!("horizon-animate-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        let colormaps = temp.join("assets/minecraft/textures/colormap");
+        std::fs::create_dir_all(&colormaps).unwrap();
+        std::fs::write(temp.join("horizon-mod-content.stamp"), "animate-test-v1").unwrap();
+        for name in ["grass", "foliage", "dry_foliage"] {
+            let mut encoder = png::Encoder::new(
+                std::fs::File::create(colormaps.join(format!("{name}.png"))).unwrap(),
+                256,
+                256,
+            );
+            encoder.set_color(png::ColorType::Rgb);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder
+                .write_header()
+                .unwrap()
+                .write_image_data(&vec![128; 256 * 256 * 3])
+                .unwrap();
+        }
+        let biome_dir = temp.join("data/minecraft/worldgen/biome");
+        std::fs::create_dir_all(&biome_dir).unwrap();
+        std::fs::write(biome_dir.join("plains.json"), "{}").unwrap();
+        std::fs::write(
+            temp.join("block-tags.json"),
+            r#"{"minecraft:impermeable":"{\"values\":[\"minecraft:glass\"]}"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            temp.join("block-behaviours.json"),
+            r#"{"fire":{"igniteOdds":{"minecraft:oak_log":5}}}"#,
+        )
+        .unwrap();
+
+        let registry = BlockRegistry::from_ordered_states(
+            vec![
+                horizon_world::chunk::BlockState {
+                    name: "minecraft:glass".into(),
+                    properties: BTreeMap::new(),
+                },
+                horizon_world::chunk::BlockState {
+                    name: "minecraft:oak_log".into(),
+                    properties: BTreeMap::new(),
+                },
+            ],
+            [
+                ("minecraft:glass".into(), 0),
+                ("minecraft:oak_log".into(), 1),
+            ]
+            .into_iter()
+            .collect(),
+        )
+        .unwrap();
+        let biomes = Biomes::load(&temp).unwrap();
+
+        let first = AnimateTables::load_or_cached(&temp, &registry, &biomes, None).unwrap();
+        assert_eq!(first.impermeable, vec![true, false]);
+        assert_eq!(first.burnable, vec![false, true]);
+
+        let cache = AnimateTables::snapshot_cache(&temp, &registry, &biomes).unwrap();
+        let mut seeded = cache.read_value::<AnimateTables>().unwrap();
+        seeded.dripstone[0] = 7;
+        cache.write_value(&seeded).unwrap();
+        let hit = AnimateTables::load_or_cached(&temp, &registry, &biomes, None).unwrap();
+        assert_eq!(hit.dripstone[0], 7);
+
+        for entry in std::fs::read_dir(temp.join(".horizon-derived"))
+            .unwrap()
+            .flatten()
+        {
+            if entry.path().is_file() {
+                std::fs::write(entry.path(), b"corrupt-animate").unwrap();
+            }
+        }
+        let recovered = AnimateTables::load_or_cached(&temp, &registry, &biomes, None).unwrap();
+        assert_eq!(recovered.dripstone[0], 0);
+        assert_eq!(recovered.impermeable, vec![true, false]);
+
+        std::fs::write(
+            temp.join("block-behaviours.json"),
+            r#"{"fire":{"igniteOdds":{"minecraft:glass":10,"minecraft:oak_log":5}}}"#,
+        )
+        .unwrap();
+        let invalidated = AnimateTables::load_or_cached(&temp, &registry, &biomes, None).unwrap();
+        assert_eq!(invalidated.burnable, vec![true, true]);
+
+        let _ = std::fs::remove_dir_all(&temp);
     }
 }

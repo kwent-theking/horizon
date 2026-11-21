@@ -32,7 +32,7 @@ const W: usize = 48;
 const EMPTY: u16 = 0;
 const FULL: u16 = 1;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
 struct Cell {
     dampening: u8,
     emission: u8,
@@ -40,6 +40,7 @@ struct Cell {
     shaped: bool,
     faces: [u16; 6],
 }
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct LightTables {
     cells: Vec<Cell>,
     /// `faceShapeOccludes(a, b)` for every pair of distinct face shapes.
@@ -126,8 +127,32 @@ impl LightTables {
     /// Full tables with the vanilla occlusion shapes from `occlusion.nbt`.
     pub fn load(root: &Path, registry: &BlockRegistry, facts: &BlockFacts) -> crate::Result<Self> {
         use horizon_world::{collision::CachedCollisionRegistry, registry::BlockTableFile};
+        use sha2::{Digest, Sha256};
+        let source = root.join("occlusion.nbt");
+        let mut identity = Sha256::new();
+        identity.update(registry.cache_identity());
+        for state in &facts.states {
+            identity.update([
+                state.dampening,
+                state.emission,
+                u8::from(state.can_occlude),
+                u8::from(state.shape_occlusion),
+            ]);
+        }
+        let cache = horizon_world::resource_cache::Cache::new(
+            root,
+            "light-v1",
+            &[&source],
+            &identity.finalize(),
+        );
+        if let Some(tables) = cache.as_ref().and_then(|cache| cache.read_value::<Self>())
+            && tables.valid_cache(registry.len())
+        {
+            return Ok(tables);
+        }
         let file = BlockTableFile::open(&root.join("occlusion.nbt"), registry)?;
         let occlusion = CachedCollisionRegistry::from_table(file.table("occlusion")?)?;
+        drop(file);
         let mut tables = Self::new(facts);
         let block = VoxelShape::block();
         let mut shapes: Vec<VoxelShape> = vec![VoxelShape::empty(), block.clone()];
@@ -182,6 +207,9 @@ impl LightTables {
             cell.faces = faces;
             cell.shaped = faces.iter().any(|f| *f != EMPTY);
         }
+        drop(by_shape);
+        drop(occlusion);
+        drop(by_geometry);
         let n = shapes.len();
         let mut occludes = vec![false; n * n];
         for a in 0..n {
@@ -197,10 +225,32 @@ impl LightTables {
                 };
             }
         }
+        drop(shapes);
         tables.occludes = occludes;
         tables.faces = n;
         tables.rebuild_cache();
+        if let Some(cache) = cache {
+            let _ = cache.write_value(&tables);
+        }
         Ok(tables)
+    }
+    fn valid_cache(&self, states: usize) -> bool {
+        self.cells.len() == states
+            && self.info.len() == states
+            && self.faces >= 2
+            && self.types > 0
+            && self.types <= 4096
+            && self.faces.checked_mul(self.faces) == Some(self.occludes.len())
+            && self.types.checked_mul(self.types) == Some(self.block_masks.len())
+            && self.cells.iter().all(|cell| {
+                cell.faces
+                    .iter()
+                    .all(|&face| usize::from(face) < self.faces)
+            })
+            && self
+                .info
+                .iter()
+                .all(|info| ((info & 0xffff) >> 4) < self.types as u32)
     }
     /// Assembled tables (tests and benchmarks): derives the packed light cache.
     #[cfg(test)]
@@ -977,6 +1027,37 @@ fn relight_layer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn derived_light_cache_round_trip_and_stale_stamp() {
+        use horizon_world::resource_cache::Cache;
+        use std::fs;
+        let root = std::env::temp_dir().join(format!("horizon-light-cache-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("horizon-mod-content.stamp"), "content-a").unwrap();
+        let cache = Cache::new(&root, "light-v1", &[], b"fixture").unwrap();
+        let original = tables();
+        cache.write_value(&original).unwrap();
+        let restored: LightTables = cache.read_value().unwrap();
+        assert!(restored.valid_cache(original.cells.len()));
+        assert_eq!(original.info, restored.info);
+        assert_eq!(original.block_masks, restored.block_masks);
+        for a in 0..original.cells.len() {
+            for b in 0..original.cells.len() {
+                for d in 0..6 {
+                    assert_eq!(original.blocked(a, b, d), restored.blocked(a, b, d));
+                }
+            }
+        }
+        fs::write(root.join("horizon-mod-content.stamp"), "content-b").unwrap();
+        assert!(
+            Cache::new(&root, "light-v1", &[], b"fixture")
+                .unwrap()
+                .read()
+                .is_none()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 
     const AIR: u32 = 0;
     const STONE: u32 = 1;

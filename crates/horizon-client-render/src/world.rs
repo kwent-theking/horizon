@@ -97,6 +97,9 @@ pub struct World {
     /// The moving-piston block entities of the level, by position, copied
     /// from the block ticks after each tick: collision and rendering read them.
     pub moving_pistons: Vec<([i32; 3], horizon_world::piston_shape::MovingPistonState)>,
+    /// Create's shafts and small cogwheels by position, with the `Speed` (rpm)
+    /// of their block entity: drawn turning, not in the chunk mesh.
+    pub kinetic_speeds: std::collections::HashMap<(i32, i32, i32), f32>,
 }
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Weather {
@@ -189,6 +192,7 @@ impl World {
             light_log: None,
             moving_piston_fallback: Vec::new(),
             moving_pistons: Vec::new(),
+            kinetic_speeds: Default::default(),
             pois: Default::default(),
         }
     }
@@ -384,7 +388,14 @@ impl World {
                 .0
         })
     }
+    #[inline]
     pub fn light(&self, x: i32, y: i32, z: i32) -> u8 {
+        if y < crate::chunk::MIN_Y {
+            return 0;
+        }
+        if y >= crate::chunk::MIN_Y + (crate::chunk::SECTIONS as i32) * 16 {
+            return 0xF0;
+        }
         self.chunks
             .get(&(x >> 4, z >> 4))
             .map_or(0xF0, |chunk| chunk.light(x & 15, y, z & 15))
@@ -497,5 +508,16 @@ mod tests {
         // Past the top, and the palette of air below it.
         assert!(!world.may_hold([0, 400, 0], [0, 401, 0], nine));
         assert!(world.may_hold([0, 400, 0], [0, 401, 0], |s| s.0 == 0));
+    }
+
+    #[test]
+    fn light_outside_world_bounds_short_circuits_without_chunk_lookup() {
+        let world = World::new(BlockStateId(0), 0);
+        // Under the world (void), light is pitch black (0).
+        assert_eq!(world.light(0, MIN_Y - 1, 0), 0);
+        assert_eq!(world.light(100, -100, 200), 0);
+        // Above the world (sky), light is full sky light (0xF0).
+        assert_eq!(world.light(0, MIN_Y + (SECTIONS as i32) * 16, 0), 0xF0);
+        assert_eq!(world.light(100, 500, 200), 0xF0);
     }
 }

@@ -2,7 +2,7 @@
 use super::catalog::BakedFace;
 use horizon_assets::model::Direction;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CubeStyle {
     pub layer: u32,
     /// UV at spatial (u,v)=(0,0), then the two signed unit-axis derivatives.
@@ -115,7 +115,7 @@ mod tests {
                         .unwrap()
                         .into_iter()
                         .map(|quad| BakedFace {
-                            quad,
+                            quad: quad.into(),
                             layer: 7,
                             opaque: true,
                             translucent: false,
@@ -149,7 +149,7 @@ mod tests {
                 .unwrap()
                 .into_iter()
                 .map(|quad| BakedFace {
-                    quad,
+                    quad: quad.into(),
                     layer: 0,
                     opaque: true,
                     translucent: false,

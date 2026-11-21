@@ -139,7 +139,11 @@ pub struct Visible {
     pub distance: u64,
     pub key: SectionKey,
     pub slot: u32,
-    /// Its camera-relative origin.
+    /// Its camera-relative origin, with a Sable sub-level's plot offset
+    /// already applied (parking-lot chunks are culled and drawn where their
+    /// sub-level currently is, not where they are meshed).
+    /// Камера-относительный origin; для чанков «парковки» Sable уже включает
+    /// смещение плота (culled и рисуется там, где под-уровень сейчас).
     pub origin: [f32; 3],
 }
 
@@ -169,23 +173,39 @@ fn in_view(key: SectionKey, camera: DVec3, radius: i32, frustum: &Frustum) -> Op
     if !in_view_distance(camera_column(camera), radius, key.0, key.2) {
         return None;
     }
-    in_frustum(key, camera, frustum, false)
+    in_frustum(key, camera, frustum, false, DVec3::ZERO)
 }
 
 /// `in_view` without the distance test; `inside`: the section's column is
-/// entirely inside the frustum, so the section is too.
+/// entirely inside the frustum, so the section is too. `offset` is a Sable
+/// sub-level's plot offset (zero for normal chunks): both the frustum test
+/// and the distance use the offset position, so a section meshed in the
+/// plot parking lot is culled where its sub-level actually is.
+/// RU: `offset` — смещение плота под-уровня Sable (ноль для обычных чанков);
+/// тест на frustum и расстояние используют позицию со смещением — секция из
+/// «парковки» отсекается там, где под-уровень сейчас находится.
 fn in_frustum(
     key: SectionKey,
     camera: DVec3,
     frustum: &Frustum,
     inside: bool,
+    offset: DVec3,
 ) -> Option<(f64, Vec3)> {
-    let origin = origin(key, camera);
+    let origin = origin(key, camera) + offset;
     let min = origin.as_vec3();
     if !inside && !frustum.intersects(min, min + Vec3::splat(16.0)) {
         return None;
     }
     Some(((origin + DVec3::splat(8.0)).length_squared(), min))
+}
+
+/// The column of a chunk whose block position is shifted by `offset`
+/// (blocks): the render-distance test of a sub-level's plot column must run
+/// against where the sub-level is, not its parking lot.
+/// RU: колонка чанка, сдвинутого на `offset` (в блоках) — тест дальности для
+/// плота идёт по фактической позиции под-уровня, а не по «парковке».
+fn offset_column(column: i32, offset: f64) -> i32 {
+    ((column as f64 * 16.0 + offset) / 16.0).floor() as i32
 }
 
 impl<T> Resident<T> {
@@ -201,23 +221,59 @@ impl<T> Resident<T> {
     /// the frustum rejects holds no section it would accept, and one
     /// entirely inside holds none it would reject (its sections skip the
     /// test). `radius` is the render distance in chunks.
+    ///
+    /// `plot_offset` returns a Sable sub-level's world offset (blocks) for a
+    /// column of the plot parking lot, `None` for a normal world column. An
+    /// offset column's frustum box and render distance use its offset
+    /// position, so moving sub-levels are culled and sorted where they are,
+    /// and `Visible::origin` carries the offset to the instance data.
+    /// RU: `plot_offset` — мировое смещение (в блоках) под-уровня Sable для
+    /// колонки из «парковки плот», None для обычной колонки. Frustum-бокс и
+    /// дальность считаются по смещённой позиции, `Visible::origin` несёт
+    /// смещение в instance-данные.
     pub fn visible(
         &self,
         camera: DVec3,
         radius: i32,
         frustum: &Frustum,
+        plot_offset: impl Fn(i32, i32) -> Option<[f64; 3]>,
         reachable: impl Fn(SectionKey) -> bool,
         beyond: impl Fn(i32, i32) -> bool,
         out: &mut Vec<Visible>,
     ) {
         let from = camera_column(camera);
         for column in &self.columns {
-            let near = in_view_distance(from, radius, column.x, column.z);
+            let offset = plot_offset(column.x, column.z);
+            // The distance test of an offset column runs at the sub-level's
+            // position; a normal column's runs where it is meshed. `beyond`
+            // always sees the meshed column (lod_cutout is keyed by those).
+            // RU: тест дальности для смещённой колонки — по позиции
+            // под-уровня, для обычной — по месту мешинга. `beyond` всегда
+            // получает колонку мешинга (lod_cutout ключуется ею).
+            let near = match offset {
+                Some(o) => in_view_distance(
+                    from,
+                    radius,
+                    offset_column(column.x, o[0]),
+                    offset_column(column.z, o[2]),
+                ),
+                None => in_view_distance(from, radius, column.x, column.z),
+            };
             if !near && !beyond(column.x, column.z) {
                 continue;
             }
-            let min = origin((column.x, column.low, column.z), camera).as_vec3();
-            let top = origin((column.x, column.high, column.z), camera).as_vec3();
+            // An offset column's sections skip the reachability (occlusion
+            // graph) test: the graph knows the meshed parking-lot keys, not
+            // where the sub-level is drawn, so it would wrongly reject a
+            // sub-level standing near the camera. The frustum test still
+            // culls it. RU: секции смещённой колонки не проходят тест
+            // `reachable` — граф окклюзии знает только ключи «парковки» и
+            // ложно отбраковал бы под-уровень рядом с камерой; frustum-тест
+            // остаётся.
+            let is_offset = offset.is_some();
+            let offset = DVec3::from_array(offset.unwrap_or([0.0; 3]));
+            let min = (origin((column.x, column.low, column.z), camera) + offset).as_vec3();
+            let top = (origin((column.x, column.high, column.z), camera) + offset).as_vec3();
             let max = top + Vec3::splat(16.0);
             let inside = frustum.contains(min, max);
             if !inside && !frustum.intersects(min, max) {
@@ -225,10 +281,10 @@ impl<T> Resident<T> {
             }
             for &(y, slot) in &column.sections {
                 let key = (column.x, y, column.z);
-                if near && !reachable(key) {
+                if near && !is_offset && !reachable(key) {
                     continue;
                 }
-                if let Some((d, o)) = in_frustum(key, camera, frustum, inside) {
+                if let Some((d, o)) = in_frustum(key, camera, frustum, inside, offset) {
                     out.push(Visible {
                         distance: d.to_bits(),
                         key,
@@ -277,7 +333,15 @@ mod tests {
                 let mut fast = Vec::new();
                 // Columns past the distance kept for distant terrain.
                 let beyond = |x: i32, z: i32| (x + z).rem_euclid(3) == 0;
-                r.visible(camera, radius, &frustum, reachable, beyond, &mut fast);
+                r.visible(
+                    camera,
+                    radius,
+                    &frustum,
+                    |_, _| None,
+                    reachable,
+                    beyond,
+                    &mut fast,
+                );
                 let mut slow: Vec<(SectionKey, f64, [f32; 3])> = r
                     .items
                     .iter()
@@ -286,7 +350,7 @@ mod tests {
                         if near {
                             in_view(k, camera, radius, &frustum).filter(|_| reachable(k))
                         } else if beyond(k.0, k.2) {
-                            in_frustum(k, camera, &frustum, false)
+                            in_frustum(k, camera, &frustum, false, DVec3::ZERO)
                         } else {
                             None
                         }
@@ -336,7 +400,15 @@ mod tests {
             .count();
         assert!(inside > 50 && inside < r.columns.len(), "{inside}");
         let mut fast = Vec::new();
-        r.visible(camera, 12, &frustum, |_| true, |_, _| false, &mut fast);
+        r.visible(
+            camera,
+            12,
+            &frustum,
+            |_, _| None,
+            |_| true,
+            |_, _| false,
+            &mut fast,
+        );
         let mut slow: Vec<_> = r
             .items
             .iter()
@@ -442,7 +514,15 @@ mod tests {
             old = old.min(t.elapsed());
             let t = Instant::now();
             list.clear();
-            r.visible(camera, 32, &frustum, |_| true, |_, _| false, &mut list);
+            r.visible(
+                camera,
+                32,
+                &frustum,
+                |_, _| None,
+                |_| true,
+                |_, _| false,
+                &mut list,
+            );
             for v in &list {
                 sum += i64::from(r.get(v.slot)[1] + r.get(v.slot)[0]);
             }

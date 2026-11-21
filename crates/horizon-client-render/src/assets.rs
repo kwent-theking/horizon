@@ -1,3 +1,4 @@
+mod snapshot;
 use crate::Result;
 use horizon_world::{
     DATA_VERSION,
@@ -15,7 +16,7 @@ use std::{
 };
 
 pub const MATERIALS: [&str; 6] = ["bedrock", "dirt", "stone", "sand", "oak_planks", "bricks"];
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct StateFacts {
     air: bool,
     fluid: bool,
@@ -84,14 +85,16 @@ pub struct Assets {
 pub struct RenderAssets {
     pub sprite_size: u32,
     pub sprite_minimum_size: u32,
-    pub pixels: Vec<u8>,
+    pixels: std::sync::RwLock<crate::compact_bytes::CompactBytes>,
     pub texture_layers: u32,
     pub model_catalog: crate::models::StateModels,
-    /// Shared parsed resources; item-only validation errors surface at item preparation.
-    pub model_library: std::result::Result<Arc<horizon_assets::resolve::ModelLibrary>, String>,
+    /// Compact immutable source snapshots; taken once by `ItemRenderer` so `RenderAssets` drops its handle.
+    model_library: std::sync::Mutex<
+        Option<std::result::Result<Arc<horizon_assets::resolve::ModelLibrary>, String>>,
+    >,
     pub model_placements: Vec<(horizon_core::position::BlockPos, BlockStateId)>,
     pub model_gallery: Vec<Value>,
-    pub animations: Vec<crate::sprites::SpriteAnimation>,
+    pub animations: Vec<crate::sprites::PackedSpriteAnimation>,
     pub sprite_layers: std::collections::BTreeMap<String, u32>,
     pub translucent_layers: Vec<bool>,
     /// Each layer's `MipmapGenerator` settings.
@@ -102,6 +105,9 @@ fn invalid(message: &str) -> io::Error {
 }
 impl Assets {
     pub fn load(root: &Path) -> Result<Self> {
+        snapshot::load_core(root)
+    }
+    fn load_uncached(root: &Path) -> Result<Self> {
         let manifest: Value = serde_json::from_reader(BufReader::new(File::open(
             root.join("horizon-resources.json"),
         )?))?;
@@ -192,17 +198,86 @@ impl Assets {
     pub fn reload(&self, root: &Path) -> Result<RenderAssets> {
         RenderAssets::load(root, self)
     }
+    pub fn reload_with_cap(&self, root: &Path, max_sprite_side: u32) -> Result<RenderAssets> {
+        RenderAssets::load_with_cap(root, self, max_sprite_side)
+    }
 }
 impl RenderAssets {
     pub fn load(root: &Path, assets: &Assets) -> Result<Self> {
+        snapshot::load_render(root, assets, 0)
+    }
+    pub fn load_with_cap(root: &Path, assets: &Assets, max_sprite_side: u32) -> Result<Self> {
+        snapshot::load_render(root, assets, max_sprite_side)
+    }
+    pub fn with_pixels<R>(&self, f: impl FnOnce(&crate::compact_bytes::CompactBytes) -> R) -> R {
+        let guard = self.pixels.read().unwrap_or_else(|e| e.into_inner());
+        f(&guard)
+    }
+    pub fn decode_pixels(&self) -> Vec<u8> {
+        self.with_pixels(|p| p.decode().into_owned())
+    }
+    pub fn pixel_bytes(&self) -> (usize, usize) {
+        self.with_pixels(|p| (p.len(), p.stored_len()))
+    }
+    pub fn has_pixels(&self) -> bool {
+        self.with_pixels(|p| !p.is_empty())
+    }
+    /// Drops the CPU sprite backing once textures have been uploaded to the GPU.
+    pub fn release_pixels(&self) {
+        if let Ok(mut guard) = self.pixels.write() {
+            *guard = crate::compact_bytes::CompactBytes::new(Vec::new());
+        }
+    }
+    /// Takes the cached item `ModelLibrary` once for `ItemRenderer`, reloading on demand only if needed again.
+    pub fn take_model_library(
+        &self,
+        root: &Path,
+    ) -> std::result::Result<Arc<horizon_assets::resolve::ModelLibrary>, String> {
+        if let Ok(mut guard) = self.model_library.lock()
+            && let Some(library) = guard.take()
+        {
+            return library;
+        }
+        crate::model_library::ParsedModels::load(root).into_item_library()
+    }
+    /// Restores CPU sprite backing from disk cache or pack assets if previously released (e.g. device loss).
+    pub fn ensure_pixels(&self, root: &Path, assets: &Assets, max_sprite_side: u32) -> Result<()> {
+        if self.has_pixels() {
+            return Ok(());
+        }
+        let reloaded = Self::load_with_cap(root, assets, max_sprite_side)?;
+        let fresh = reloaded
+            .pixels
+            .into_inner()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Ok(mut guard) = self.pixels.write() {
+            *guard = fresh;
+        }
+        Ok(())
+    }
+    fn load_uncached(root: &Path, assets: &Assets, max_sprite_side: u32) -> Result<Self> {
         let registry = assets.registry;
+        let timer = std::time::Instant::now();
         let mut sprites = crate::sprites::Sprites::with_disk_cache(root);
+        log::info!("load assets: sprites {:.1}s", timer.elapsed().as_secs_f32());
+        crate::logging::process_memory("load assets: sprites");
         for name in MATERIALS {
             sprites.insert(root, &format!("minecraft:block/{name}"))?;
         }
         let parsed = crate::model_library::ParsedModels::load(root);
+        log::info!(
+            "load assets: parsed models {:.1}s",
+            timer.elapsed().as_secs_f32()
+        );
+        crate::logging::process_memory("load assets: parsed models");
         let models = crate::models::prepare_with_models(root, registry, &mut sprites, &parsed)?;
+        log::info!(
+            "load assets: prepared models {:.1}s",
+            timer.elapsed().as_secs_f32()
+        );
+        crate::logging::process_memory("load assets: prepared models");
         let model_library = parsed.into_item_library();
+        crate::logging::process_memory("load assets: source models released");
         // Fluids are drawn by the fluid renderer, not block models; breaking
         // progress uses the destroy-stage overlays.
         for name in [
@@ -218,19 +293,29 @@ impl RenderAssets {
             sprites.insert(root, &format!("minecraft:block/destroy_stage_{stage}"))?;
         }
         sprites.save_disk_cache();
-        sprites.finish();
-        // `finish` grows the buffer by doubling: keep only the bytes in use.
+        let texture_layers = sprites.finish_and_release(max_sprite_side)?;
+        // Keep only atlas texels, even if a previous allocation had spare capacity.
         sprites.pixels.shrink_to_fit();
+        let pixels = crate::compact_bytes::CompactBytes::new(sprites.pixels);
+        log::info!(
+            "load assets: atlas CPU backing {} -> {} bytes",
+            pixels.len(),
+            pixels.stored_len()
+        );
         Ok(Self {
             sprite_size: sprites.size,
             sprite_minimum_size: sprites.minimum_size,
-            texture_layers: u32::try_from(sprites.count())?,
-            pixels: sprites.pixels,
+            texture_layers,
+            pixels: std::sync::RwLock::new(pixels),
             model_catalog: models.catalog,
-            model_library,
+            model_library: std::sync::Mutex::new(Some(model_library)),
             model_placements: models.placements,
             model_gallery: models.states,
-            animations: sprites.animations,
+            animations: sprites
+                .animations
+                .into_iter()
+                .map(crate::sprites::PackedSpriteAnimation::new)
+                .collect(),
             sprite_layers: sprites.layers,
             translucent_layers: sprites.translucent,
             sprite_mips: sprites.mips,

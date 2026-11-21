@@ -26,6 +26,15 @@ impl PackAtlas {
         sprite: u32,
     ) -> Option<Self> {
         let layers = layers.max(1);
+        if arrays
+            .iter()
+            .any(|a| a.format() != wgpu::TextureFormat::Rgba8Unorm)
+        {
+            log::warn!(
+                "Horizon: shader pack block atlas requires uncompressed sprites; disable Texture Compression and reload"
+            );
+            return None;
+        }
         let columns = (f64::from(layers).sqrt().ceil() as u32).max(1);
         let rows = layers.div_ceil(columns);
         let max = device.limits().max_texture_dimension_2d;

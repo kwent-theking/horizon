@@ -79,6 +79,35 @@ pub(crate) fn decode(data: &[u8]) -> Result<ModSyncPayload, String> {
     Ok(ModSyncPayload { blocks })
 }
 
+/// Decode a NeoForge `modsync_sender` mod-manifest cookie: a VarInt entry count
+/// followed by `(mod_id, version)` length-prefixed UTF-8 strings filling the
+/// payload without trailing bytes.
+pub(crate) fn decode_manifest(data: &[u8]) -> Option<Vec<(String, String)>> {
+    if data.starts_with(MAGIC) {
+        return None;
+    }
+    let mut r = Reader::new(data);
+    let n = r.count(r.remaining()).ok()?;
+    if n == 0 || n > 4096 {
+        return None;
+    }
+    let mut mods = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        let id = r.string(256).ok()?;
+        let version = r.string(256).ok()?;
+        if id.is_empty()
+            || !id
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+            || version.is_empty()
+        {
+            return None;
+        }
+        mods.push((id, version));
+    }
+    (r.remaining() == 0).then_some(mods)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,5 +231,29 @@ mod tests {
         // A namespace in invalid UTF-8: VarInt(2) then 0xC3 0x28.
         let e = decode(b"HMS1\x01\x02\xc3\x28\x01p\x00").unwrap_err();
         assert!(e.contains("entry 0") && e.contains("namespace"));
+    }
+
+    #[test]
+    fn manifest_cookie_decodes_and_rejects_bad_payloads() {
+        let mut w = Writer::new();
+        w.varint(2);
+        w.string("create");
+        w.string("6.0.6");
+        w.string("serene_seasons");
+        w.string("10.1.0");
+        assert_eq!(
+            decode_manifest(&w.data),
+            Some(vec![
+                ("create".into(), "6.0.6".into()),
+                ("serene_seasons".into(), "10.1.0".into()),
+            ])
+        );
+        assert!(decode_manifest(b"BAD!").is_none());
+        assert!(decode_manifest(b"HMS1\x00").is_none());
+        let truncated = &w.data[..w.data.len() - 1];
+        assert!(decode_manifest(truncated).is_none());
+        let mut trailing = w.data.clone();
+        trailing.push(0);
+        assert!(decode_manifest(&trailing).is_none());
     }
 }

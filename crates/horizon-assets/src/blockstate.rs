@@ -9,7 +9,7 @@ use serde::{
 use serde_json::value::RawValue;
 use std::{collections::BTreeMap, fmt};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Variant {
     pub model: String,
     /// X, Y, Z rotations in quarter turns.
@@ -47,6 +47,13 @@ pub struct BlockStateDefinition {
 fn optional<'a>(fields: &Object<'a>, name: &str) -> Option<&'a RawValue> {
     fields.get(name).copied().filter(|v| v.get() != "null")
 }
+fn uv_lock(raw: &RawValue) -> Result<bool> {
+    match raw.get() {
+        "true" | "\"true\"" => Ok(true),
+        "false" | "\"false\"" => Ok(false),
+        other => Ok(serde_json::from_str(other)?),
+    }
+}
 fn ordered_object(raw: &RawValue) -> Result<Vec<(String, &RawValue)>> {
     struct Ordered;
     impl<'de> Visitor<'de> for Ordered {
@@ -73,7 +80,30 @@ fn ordered_object(raw: &RawValue) -> Result<Vec<(String, &RawValue)>> {
     }
     Ok(serde_json::Deserializer::from_str(raw.get()).deserialize_map(Ordered)?)
 }
+impl VariantSet {
+    fn replace_models(&mut self, replace: &mut impl FnMut(&str) -> Option<String>) {
+        let mut apply = |variant: &mut Variant| {
+            if let Some(model) = replace(&variant.model) {
+                variant.model = model;
+            }
+        };
+        match self {
+            Self::Single(variant) => apply(variant),
+            Self::Weighted(list) => list.iter_mut().for_each(|(variant, _)| apply(variant)),
+        }
+    }
+}
 impl BlockStateDefinition {
+    /// Point variants at other models: `replace` returns the new model of a
+    /// variant, or `None` to keep it.
+    pub fn replace_models(&mut self, mut replace: impl FnMut(&str) -> Option<String>) {
+        for (_, set) in self.variants.iter_mut().flatten() {
+            set.replace_models(&mut replace);
+        }
+        for selector in self.multipart.iter_mut().flatten() {
+            selector.variant.replace_models(&mut replace);
+        }
+    }
     pub fn from_json(text: &str) -> Result<Self> {
         let raw: &RawValue = serde_json::from_str(text.strip_prefix('\u{feff}').unwrap_or(text))?;
         validate_number_tokens(raw)?;
@@ -138,7 +168,7 @@ impl Variant {
             model: identifier(&string(required(&fields, "model")?)?)?,
             rotations,
             uv_lock: optional(&fields, "uvlock")
-                .map(|v| serde_json::from_str(v.get()))
+                .map(uv_lock)
                 .transpose()?
                 .unwrap_or(false),
         })
@@ -224,5 +254,46 @@ impl Condition {
             })
             .collect::<Result<_>>()?;
         Ok(Self::Properties(tests))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uvlock_accepts_quoted_boolean_strings() {
+        let def = BlockStateDefinition::from_json(
+            r#"{
+                "multipart": [
+                    {
+                        "when": { "down": "true" },
+                        "apply": { "model": "toms_storage:block/cable_open", "uvlock": "true", "x": 90 }
+                    },
+                    {
+                        "when": { "down": "false" },
+                        "apply": { "model": "toms_storage:block/cable_closed", "uvlock": "false", "x": 90 }
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+        let selectors = def.multipart.unwrap();
+        assert_eq!(
+            selectors[0].variant,
+            VariantSet::Single(Variant {
+                model: "toms_storage:block/cable_open".into(),
+                rotations: [1, 0, 0],
+                uv_lock: true,
+            })
+        );
+        assert_eq!(
+            selectors[1].variant,
+            VariantSet::Single(Variant {
+                model: "toms_storage:block/cable_closed".into(),
+                rotations: [1, 0, 0],
+                uv_lock: false,
+            })
+        );
     }
 }

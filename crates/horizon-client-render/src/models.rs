@@ -68,8 +68,10 @@ pub(crate) fn prepare_with_models(
     sprites: &mut Sprites,
     models: &crate::model_library::ParsedModels,
 ) -> Result<PreparedModels> {
-    let facts: std::collections::BTreeMap<String, Value> =
-        serde_json::from_slice(&std::fs::read(root.join("model-states.json"))?)?;
+    let facts: std::collections::BTreeMap<String, crate::models::catalog::RawFact> =
+        serde_json::from_reader(std::io::BufReader::new(std::fs::File::open(
+            root.join("model-states.json"),
+        )?))?;
     let blocks: Vec<&str> = facts
         .keys()
         .filter(|name| registry.default_state(name).is_some())
@@ -77,6 +79,15 @@ pub(crate) fn prepare_with_models(
         .collect();
     let catalog =
         StateModels::from_facts_with_models(root, registry, &blocks, sprites, &facts, models)?;
+    let (placements, states) = gallery(registry, &catalog)?;
+    Ok(PreparedModels {
+        catalog,
+        placements,
+        states,
+    })
+}
+type Gallery = (Vec<(BlockPos, BlockStateId)>, Vec<Value>);
+pub(crate) fn gallery(registry: &BlockRegistry, catalog: &StateModels) -> Result<Gallery> {
     let mut placements = Vec::new();
     let mut states = Vec::new();
     for (index, (name, properties)) in GALLERY.iter().enumerate() {
@@ -91,12 +102,9 @@ pub(crate) fn prepare_with_models(
             "models":selected.iter().map(|(v,_)| json!({"model":v.model,"rotations":v.rotations,"uv_lock":v.uv_lock})).collect::<Vec<_>>()}));
         placements.push((position, state));
     }
-    Ok(PreparedModels {
-        catalog,
-        placements,
-        states,
-    })
+    Ok((placements, states))
 }
+
 pub fn instance(face: &catalog::BakedFace, position: BlockPos) -> ModelInstance {
     let origin = [position.x as f32, position.y as f32, position.z as f32];
     ModelInstance {
@@ -122,6 +130,7 @@ pub fn load_visibility(
     use std::{collections::BTreeMap, fs};
     let file = BlockTableFile::open(&root.join("occlusion.nbt"), registry)?;
     let occlusion = CachedCollisionRegistry::from_table(file.table("occlusion")?)?;
+    drop(file);
     let raw: BTreeMap<String, Value> =
         serde_json::from_slice(&fs::read(root.join("render-definitions.json"))?)?;
     let definitions = raw

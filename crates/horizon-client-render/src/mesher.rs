@@ -21,7 +21,7 @@ use horizon_world::{
     fluid::{FluidKind, FluidState},
     registry::BlockStateId,
 };
-pub use sides::Sides;
+pub use sides::{Sides, SortScratch};
 use std::sync::Arc;
 
 /// An entity, item and effect vertex (the entity pipelines), with a face
@@ -176,10 +176,26 @@ impl SectionMesh {
     pub fn sort_solid(&mut self) {
         self.sides = sides::sort(&mut self.solid);
     }
+    /// [`Self::sort_solid`] reusing worker scratch buffers.
+    pub fn sort_solid_with(&mut self, scratch: &mut sides::SortScratch) {
+        self.sides = sides::sort_with_scratch(&mut self.solid, scratch);
+    }
+    /// Clears emitted geometry while keeping the underlying buffer capacity for reuse.
+    pub fn reset_keeping_capacity(&mut self) {
+        self.solid.clear();
+        self.sides = Sides::default();
+        self.translucent.clear();
+        self.visibility = ALL_VISIBLE;
+        self.block_entities.clear();
+    }
 }
 pub const ALL_VISIBLE: u64 = (1 << 36) - 1;
 /// VisGraph.resolve: flood fill non-opaque cells and connect the faces each region touches.
 fn visibility(pad: &Padded, info: &[Info]) -> u64 {
+    visibility_with_scratch(pad, info, &mut Vec::new())
+}
+
+fn visibility_with_scratch(pad: &Padded, info: &[Info], stack: &mut Vec<usize>) -> u64 {
     // Opaque cells are already visited: resolve each state's opacity once,
     // then reuse this map for the flood fill and the uniform-section shortcuts.
     let mut seen = [false; 4096];
@@ -201,7 +217,7 @@ fn visibility(pad: &Padded, info: &[Info]) -> u64 {
         return 0;
     }
     let mut result = 0u64;
-    let mut stack = Vec::new();
+    stack.clear();
     for start in 0..4096usize {
         if seen[start] {
             continue;
@@ -349,6 +365,24 @@ pub struct MeshTables {
     lava_still: u16,
     lava_flow: u16,
 }
+/// Create blocks whose entire model is drawn turning by the kinetic renderer,
+/// so the chunk terrain mesher omits their blockstate model completely.
+/// Blocks with static casings (fans, drills, presses, saws, mixers, millstones)
+/// are meshed into chunk terrain normally, and only their partial models are animated.
+pub fn is_kinetic_part(name: &str) -> bool {
+    matches!(
+        name,
+        "create:shaft"
+            | "create:cogwheel"
+            | "create:large_cogwheel"
+            | "create:crushing_wheel"
+            | "create:large_water_wheel"
+            | "create:turntable"
+            | "create:flywheel"
+            | "create:powered_shaft"
+            | "create_enchantment_industry:mechanical_grindstone"
+    )
+}
 fn stem_color(age: u8) -> u32 {
     let a = u32::from(age);
     (a * 32) << 16 | (255 - a * 8) << 8 | (a * 4)
@@ -476,7 +510,7 @@ impl MeshTables {
                 tier: hdr_tier(name, s.emission),
                 emissive,
                 fluid: FluidState::from_block(state)?,
-                model: s.render_shape == RenderShape::Model,
+                model: s.render_shape == RenderShape::Model && !is_kinetic_part(&s.name),
                 block_entity: s.block_entity,
                 tints,
                 tint_count,
@@ -553,7 +587,8 @@ impl MeshTables {
         }
         let [x, y, z] = pos;
         let origin = [x >> 4, z >> 4, y & !15];
-        let mut tints = Tints::new(region, biomes, zoom, blend_radius, origin);
+        let mut layers = Default::default();
+        let mut tints = Tints::new(region, biomes, zoom, blend_radius, origin, &mut layers);
         Mesher::tint(info, 0, &mut tints, [x & 15, y & 15, z & 15])
     }
     /// `BlockColors` for each of the state's tint indices at `pos`, as the
@@ -571,7 +606,8 @@ impl MeshTables {
         let sources = self.info.get(state.0 as usize).map(|info| {
             let [x, y, z] = pos;
             let origin = [x >> 4, z >> 4, y & !15];
-            let mut tints = Tints::new(region, biomes, zoom, blend_radius, origin);
+            let mut layers = Default::default();
+            let mut tints = Tints::new(region, biomes, zoom, blend_radius, origin, &mut layers);
             let local = [x & 15, y & 15, z & 15];
             let colors = [0, 1].map(|i| Mesher::tint(info, i, &mut tints, local));
             (colors, i32::from(info.tint_count))
@@ -593,7 +629,7 @@ impl MeshTables {
         &self,
         state: BlockStateId,
         pos: [i32; 3],
-        quad: &horizon_assets::bake::ModelQuad,
+        quad: &crate::models::catalog::BakedQuad,
         light: impl Fn([i32; 3]) -> u8,
     ) -> u32 {
         let own = self.info.get(state.0 as usize);
@@ -635,17 +671,22 @@ struct Padded {
     blocks: Vec<u32>,
     light: Vec<u8>,
 }
+impl Default for Padded {
+    fn default() -> Self {
+        Self {
+            blocks: vec![0u32; P * P * P],
+            light: vec![0u8; P * P * P],
+        }
+    }
+}
 impl Padded {
-    fn new(region: &[[Option<&Chunk>; 3]; 3], sy: i32) -> Self {
-        let mut blocks = vec![0u32; P * P * P];
-        let mut light = vec![0u8; P * P * P];
+    fn fill(&mut self, own: &mut [u32; 4096], region: &[[Option<&Chunk>; 3]; 3], sy: i32) {
         let base_y = MIN_Y + sy * 16;
         // The section itself is unpacked in one pass; the border cells of the
         // neighbouring sections are read one by one.
-        let mut own = Box::new([0u32; 4096]);
         let center = region[1][1].map(|c| &c.sections[sy as usize]);
         if let Some(section) = center {
-            section.unpack(&mut own);
+            section.unpack(own);
         }
         for y in -B..16 + B {
             let wy = base_y + y;
@@ -654,21 +695,21 @@ impl Padded {
                     let chunk = region[((z + 16) >> 4) as usize][((x + 16) >> 4) as usize];
                     let i = pi(x, y, z);
                     if let Some(c) = chunk {
-                        blocks[i] =
+                        self.blocks[i] =
                             if (0..16).contains(&x) && (0..16).contains(&y) && (0..16).contains(&z)
                             {
                                 own[(y << 8 | z << 4 | x) as usize]
                             } else {
                                 c.get(x & 15, wy, z & 15)
                             };
-                        light[i] = c.light(x & 15, wy, z & 15);
+                        self.light[i] = c.light(x & 15, wy, z & 15);
                     } else {
-                        light[i] = 0xF0;
+                        self.blocks[i] = 0;
+                        self.light[i] = 0xF0;
                     }
                 }
             }
         }
-        Self { blocks, light }
     }
 }
 /// Set on a terrain vertex's sprite layer when its texture alpha must be ignored.
@@ -733,7 +774,8 @@ struct Tints<'a> {
     plains: u16,
     /// Chunk x, chunk z and the section's lowest block y.
     origin: [i32; 3],
-    layers: [Option<Box<Layer>>; 16],
+    layers: &'a mut [Option<Box<Layer>>; 16],
+    initialized_mask: u16,
 }
 impl<'a> Tints<'a> {
     fn new(
@@ -742,6 +784,7 @@ impl<'a> Tints<'a> {
         zoom: BiomeZoom,
         radius: i32,
         origin: [i32; 3],
+        layers: &'a mut [Option<Box<Layer>>; 16],
     ) -> Self {
         Self {
             region,
@@ -750,19 +793,29 @@ impl<'a> Tints<'a> {
             radius: radius.clamp(0, 7),
             plains: biomes.id("minecraft:plains"),
             origin,
-            layers: Default::default(),
+            layers,
+            initialized_mask: 0,
         }
     }
     /// The blended tint of block `(x, y, z)` (section-local x/z, y in 0..16).
     fn get(&mut self, resolver: Resolver, x: i32, y: i32, z: i32) -> u32 {
         let r = self.radius;
         let dim = (16 + 2 * r) as usize;
+        let bit = 1u16 << y;
         let layer = self.layers[y as usize].get_or_insert_with(|| {
             Box::new(Layer {
                 zoomed: vec![NO_BIOME; dim * dim],
                 colors: [[UNSET; 256]; 4],
             })
         });
+        if self.initialized_mask & bit == 0 {
+            self.initialized_mask |= bit;
+            if layer.zoomed.len() != dim * dim {
+                layer.zoomed.resize(dim * dim, NO_BIOME);
+            }
+            layer.zoomed.fill(NO_BIOME);
+            layer.colors = [[UNSET; 256]; 4];
+        }
         let slot = (z * 16 + x) as usize;
         let cached = layer.colors[resolver as usize][slot];
         if cached != UNSET {
@@ -837,17 +890,54 @@ pub struct Mesher<'a> {
     /// The `cutoutLeaves` option (fancy graphics); off makes leaves opaque.
     pub cutout_leaves: bool,
 }
+/// Worker-owned scratch storage reused across sections to eliminate per-section heap allocations
+/// and 56 KB zeroing copies on slow-memory hosts.
+pub struct MeshScratch {
+    pad: Padded,
+    own: Box<[u32; 4096]>,
+    vis_stack: Vec<usize>,
+    tint_layers: [Option<Box<Layer>>; 16],
+    pub sides: SortScratch,
+}
+
+impl Default for MeshScratch {
+    fn default() -> Self {
+        Self {
+            pad: Padded::default(),
+            own: Box::new([0u32; 4096]),
+            vis_stack: Vec::new(),
+            tint_layers: Default::default(),
+            sides: SortScratch::default(),
+        }
+    }
+}
+
 impl Mesher<'_> {
     /// `region[dz][dx]` are the chunks around the meshed column (centre 1,1).
     pub fn mesh(&mut self, region: &[[Option<&Chunk>; 3]; 3], sy: i32) -> SectionMesh {
         let mut out = SectionMesh::default();
+        let mut scratch = MeshScratch::default();
+        self.mesh_into(region, sy, &mut scratch, &mut out);
+        out
+    }
+
+    /// Meshes one section into `out`, reusing buffers held in `scratch`.
+    pub fn mesh_into(
+        &mut self,
+        region: &[[Option<&Chunk>; 3]; 3],
+        sy: i32,
+        scratch: &mut MeshScratch,
+        out: &mut SectionMesh,
+    ) {
+        out.reset_keeping_capacity();
         let center = region[1][1].expect("centre chunk");
         let section = &center.sections[sy as usize];
         if section.is_uniform(0) {
-            return out;
+            return;
         }
-        let pad = Padded::new(region, sy);
-        out.visibility = visibility(&pad, &self.tables.info);
+        scratch.pad.fill(&mut scratch.own, region, sy);
+        let pad = &scratch.pad;
+        out.visibility = visibility_with_scratch(pad, &self.tables.info, &mut scratch.vis_stack);
         let base_y = MIN_Y + sy * 16;
         let mut tints = Tints::new(
             region,
@@ -855,6 +945,7 @@ impl Mesher<'_> {
             self.zoom,
             self.blend_radius,
             [center.x, center.z, base_y],
+            &mut scratch.tint_layers,
         );
         let info = &self.tables.info;
         let catalog = &self.render.model_catalog;
@@ -882,7 +973,7 @@ impl Mesher<'_> {
                     if state.fluid.kind() != FluidKind::Empty {
                         let water = tints.get(Resolver::Water, x, y, z);
                         let nether = self.nether_shading;
-                        fluid::tesselate(self.tables, nether, &pad, water, &mut out, [x, y, z]);
+                        fluid::tesselate(self.tables, nether, pad, water, out, [x, y, z]);
                     }
                     if !state.model {
                         continue;
@@ -927,26 +1018,16 @@ impl Mesher<'_> {
                                 .unwrap_or(true);
                     }
                     for model in &models {
-                        for face in &model.faces {
+                        for face in model.faces.iter() {
                             if face.quad.cull.is_some_and(|d| !visible[d as usize]) {
                                 continue;
                             }
-                            self.face(
-                                &pad,
-                                &mut tints,
-                                &mut out,
-                                [x, y, z],
-                                origin,
-                                face,
-                                ao,
-                                state,
-                            );
+                            self.face(pad, &mut tints, out, [x, y, z], origin, face, ao, state);
                         }
                     }
                 }
             }
         }
-        out
     }
     /// `BlockColors` tint source `index`, or `None` for an untinted (-1) layer.
     fn tint(state: &Info, index: i32, tints: &mut Tints, [x, y, z]: [i32; 3]) -> Option<u32> {

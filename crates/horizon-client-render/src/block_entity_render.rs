@@ -865,33 +865,58 @@ const VIEW_DISTANCE: f64 = 64.0;
 
 impl BlockEntityRenderer {
     pub fn load(root: &Path, registry: &BlockRegistry) -> crate::Result<Self> {
+        Self::load_with_visibility(root, registry, None)
+    }
+
+    pub fn load_with_visibility(
+        root: &Path,
+        registry: &BlockRegistry,
+        visibility: Option<FaceVisibility>,
+    ) -> crate::Result<Self> {
         let all: Value = serde_json::from_slice(&std::fs::read(root.join("entity-models.json"))?)?;
         let models = MODELS
             .iter()
             .filter_map(|(key, layer)| all.get(*layer).map(|v| (*key, ModelPart::parse(v))))
             .collect();
         let mut renderer = Self::new(models, registry);
-        renderer.visibility = Some(Mutex::new(crate::models::load_visibility(root, registry)?));
+        let visibility = match visibility {
+            Some(v) => v,
+            None => crate::models::load_visibility(root, registry)?,
+        };
+        renderer.visibility = Some(Mutex::new(visibility));
         // Sherd items: provides_pottery_pattern -> decorated_pot_pattern asset id.
-        if let Ok(bytes) = std::fs::read(root.join("items.json")) {
-            let items: Value = serde_json::from_slice(&bytes)?;
-            for (item, components) in items.as_object().into_iter().flatten() {
-                let Some(pattern) = components["minecraft:provides_pottery_pattern"].as_str()
-                else {
-                    continue;
-                };
-                let name = pattern.strip_prefix("minecraft:").unwrap_or(pattern);
-                let file = root.join(format!("data/minecraft/decorated_pot_pattern/{name}.json"));
-                let Ok(def) = std::fs::read(file) else {
-                    continue;
-                };
-                let def: Value = serde_json::from_slice(&def)?;
-                if let Some(asset) = def["asset_id"].as_str() {
-                    let asset = asset.strip_prefix("minecraft:").unwrap_or(asset);
-                    renderer
-                        .pot_patterns
-                        .insert(item.clone(), format!("entity/decorated_pot/{asset}"));
+        let pot_cache =
+            horizon_world::resource_cache::Cache::for_tree(root, "pot-patterns-v1", &[]);
+        if let Some(patterns) = pot_cache
+            .as_ref()
+            .and_then(|c| c.read_value::<HashMap<String, String>>())
+        {
+            renderer.pot_patterns = patterns;
+        } else {
+            if let Ok(bytes) = std::fs::read(root.join("items.json")) {
+                let items: Value = serde_json::from_slice(&bytes)?;
+                for (item, components) in items.as_object().into_iter().flatten() {
+                    let Some(pattern) = components["minecraft:provides_pottery_pattern"].as_str()
+                    else {
+                        continue;
+                    };
+                    let name = pattern.strip_prefix("minecraft:").unwrap_or(pattern);
+                    let file =
+                        root.join(format!("data/minecraft/decorated_pot_pattern/{name}.json"));
+                    let Ok(def) = std::fs::read(file) else {
+                        continue;
+                    };
+                    let def: Value = serde_json::from_slice(&def)?;
+                    if let Some(asset) = def["asset_id"].as_str() {
+                        let asset = asset.strip_prefix("minecraft:").unwrap_or(asset);
+                        renderer
+                            .pot_patterns
+                            .insert(item.clone(), format!("entity/decorated_pot/{asset}"));
+                    }
                 }
+            }
+            if let Some(cache) = pot_cache.as_ref() {
+                let _ = cache.write_value(&renderer.pot_patterns);
             }
         }
         Ok(renderer)

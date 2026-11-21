@@ -40,6 +40,20 @@ pub fn pick(
     true
 }
 
+/// Pick Block for a server that must hear every inventory change: only the
+/// carried slot moves (it is synced each tick), nothing is swapped or added.
+/// Returns whether a hotbar stack matched.
+pub fn pick_hotbar(items: &[Option<ItemStack>], selected: &mut usize, stack: &ItemStack) -> bool {
+    let Some(slot) = items[..9].iter().position(|s| {
+        s.as_ref()
+            .is_some_and(|s| s.same_item_same_components(stack))
+    }) else {
+        return false;
+    };
+    *selected = slot;
+    true
+}
+
 /// `getSuitableHotbarSlot`: from the selected slot on, the first empty one,
 /// else the first without enchantments, else the selected one.
 fn suitable_hotbar_slot(items: &[Option<ItemStack>], selected: usize) -> usize {
@@ -72,6 +86,17 @@ mod tests {
     }
     fn stone() -> ItemStack {
         stack("stone", 1).unwrap()
+    }
+
+    #[test]
+    fn hotbar_only_pick_never_moves_items() {
+        let items = inventory(&[(0, "dirt"), (6, "stone"), (20, "stone")]);
+        let mut selected = 2;
+        assert!(pick_hotbar(&items, &mut selected, &stone()));
+        assert_eq!(selected, 6);
+        let only_inventory = inventory(&[(20, "stone")]);
+        assert!(!pick_hotbar(&only_inventory, &mut selected, &stone()));
+        assert_eq!(selected, 6);
     }
 
     #[test]

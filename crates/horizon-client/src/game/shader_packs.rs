@@ -378,7 +378,7 @@ fn block_id_table(pack: &super::PackResources, ids: &BlockIds) -> Vec<i32> {
         }
         let origin = horizon_core::position::BlockPos::new(0, 0, 0);
         for (_, model) in catalog.collect(state_id, origin).unwrap_or_default() {
-            for face in &model.faces {
+            for face in model.faces.iter() {
                 vote(face.layer);
             }
         }

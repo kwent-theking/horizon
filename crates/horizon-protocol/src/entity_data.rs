@@ -9,6 +9,8 @@ use crate::{
 };
 use horizon_world::nbt::Tag;
 
+pub(crate) mod v767;
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value {
     Byte(i8),

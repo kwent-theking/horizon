@@ -15,7 +15,7 @@ use wgpu::util::DeviceExt;
 /// pack that replaced it (vanilla's GUI code draws in those units: `blit`
 /// divides by the texture size it is given, sprites by their `gui.scaling`
 /// size). Textures the default resources lack keep their own size.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Rect {
     pub u0: f32,
     pub v0: f32,
@@ -36,7 +36,7 @@ impl Rect {
 /// `TextureMetadataSection`'s `blur` and `clamp`: how vanilla samples a
 /// standalone texture (`ReloadableTexture.setSampler`: linear rather than
 /// nearest filtering, clamp-to-edge rather than repeat addressing).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TextureFlags {
     pub blur: bool,
     pub clamp: bool,
@@ -56,6 +56,7 @@ impl TextureFlags {
 }
 pub struct HudAtlas {
     pub pixels: Vec<u8>,
+    packed_pixels: Option<crate::compact_bytes::CompactBytes>,
     pub width: u32,
     pub height: u32,
     pub sprites: HashMap<String, Rect>,
@@ -79,6 +80,8 @@ pub struct HudAtlas {
     /// `misc/enchanted_glint_armor`, the armour layers' `GlintSampler`.
     pub glint_armor: (Vec<u8>, u32, u32),
     white: Rect,
+    /// Precomputed glyph widths for `font/ascii_sga` (`A..=Z`, `a..=z`) so CPU atlas pixels can be freed after GPU upload.
+    sga_widths: [u32; 52],
 }
 /// Atlas rows reserved for glyphs rasterized at run time.
 pub const GLYPH_ROWS: u32 = 512;
@@ -151,6 +154,61 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
         }
     }
 }
+/// The folder a modded client's model dump copied its mobs' textures to
+/// (`<ns>/textures/...png`, horizon_client::mobs::modded); the full atlas packs
+/// them like the textures of mods with GeckoLib models.
+static MOD_ENTITY_TEXTURES: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+/// The longest side of a dumped texture the atlas takes: longer ones are
+/// animation strips or sheets.
+const MOD_ENTITY_TEXTURE_SIDE: u32 = 512;
+/// The texels of dumped textures the atlas takes at most (64 MiB of RGBA): an
+/// atlas that doesn't fit rolls the whole resource load back to the defaults.
+const MOD_ENTITY_TEXEL_BUDGET: u64 = 16 * 1024 * 1024;
+/// Where the model dump's textures are; set once, before the first atlas.
+pub fn set_mod_entity_textures(dir: PathBuf) {
+    let _ = MOD_ENTITY_TEXTURES.set(dir);
+}
+/// The dumped textures under `dir` within the limits, but not vanilla's own
+/// (the atlas has them) nor those the content root already gave `files`.
+fn dumped_entity_textures(dir: &Path, assets: &Path, files: &mut Vec<PathBuf>) {
+    let Ok(namespaces) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut found = Vec::new();
+    for ns in namespaces.flatten() {
+        if ns.file_name() != "minecraft" {
+            walk(&ns.path().join("textures"), &mut found);
+        }
+    }
+    found.sort();
+    let have: HashSet<PathBuf> = files.iter().cloned().collect();
+    let mut texels = 0u64;
+    for path in found {
+        let Ok(rel) = path.strip_prefix(dir) else {
+            continue;
+        };
+        let Some((w, h)) = png_size(&path) else {
+            continue;
+        };
+        if have.contains(&assets.join(rel))
+            || w > MOD_ENTITY_TEXTURE_SIDE
+            || h > MOD_ENTITY_TEXTURE_SIDE
+        {
+            continue;
+        }
+        texels += u64::from(w) * u64::from(h);
+        if texels > MOD_ENTITY_TEXEL_BUDGET {
+            log::warn!(
+                "Horizon: the modded entity textures in {} pass the atlas budget; the rest from {} \
+                 are left out",
+                dir.display(),
+                path.display()
+            );
+            break;
+        }
+        files.push(path);
+    }
+}
 /// A packed atlas image: sprite name, size and RGBA pixels.
 type PackedImage = (String, u32, u32, Vec<u8>);
 /// A frame of an animated strip at `x, y`, nearest-resampled to the longer
@@ -182,10 +240,60 @@ fn wrap_border((name, w, h, data): &PackedImage) -> PackedImage {
     }
     (name.clone(), bw, bh, out)
 }
+fn crop_animated_frame(
+    path: &Path,
+    mut w: u32,
+    mut h: u32,
+    pixels: Vec<u8>,
+) -> (u32, u32, Vec<u8>, Option<String>, bool) {
+    let mcmeta = fs::read_to_string(path.with_extension("png.mcmeta")).ok();
+    let animation = mcmeta
+        .as_deref()
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+        .and_then(|meta| {
+            meta.get("animation")
+                .and_then(|section| AnimationMetadata::from_json(&section.to_string()).ok())
+        });
+    let stride = w;
+    let [fw, fh] = animation.as_ref().map_or([w.min(h) as i32; 2], |meta| {
+        meta.frame_size(w as i32, h as i32)
+    });
+    let pixels = match (u32::try_from(fw), u32::try_from(fh)) {
+        (Ok(fw), Ok(fh))
+            if fw > 0 && fh > 0 && w % fw == 0 && h % fh == 0 && (fw, fh) != (w, h) =>
+        {
+            let side = fw.max(fh);
+            (w, h) = (side, side);
+            strip_frame(&pixels, stride, 0, 0, fw, fh)
+        }
+        _ => pixels,
+    };
+    (w, h, pixels, mcmeta, animation.is_some())
+}
+
+fn downscale_mod_if_capped(
+    is_mod_sprite: bool,
+    max_mod_side: u32,
+    mut w: u32,
+    mut h: u32,
+    pixels: Vec<u8>,
+) -> (u32, u32, Vec<u8>, bool) {
+    if max_mod_side > 0 && is_mod_sprite && (w > max_mod_side || h > max_mod_side) {
+        let longest = w.max(h);
+        let nw = ((u64::from(w) * u64::from(max_mod_side)) / u64::from(longest)).max(1) as u32;
+        let nh = ((u64::from(h) * u64::from(max_mod_side)) / u64::from(longest)).max(1) as u32;
+        let scaled = HudAtlas::downscale_rect(&pixels, w, h, nw, nh);
+        (w, h) = (nw, nh);
+        (w, h, scaled, true)
+    } else {
+        (w, h, pixels, false)
+    }
+}
+
 /// Sprites the atlas definitions (`atlases/*.json`) add beyond the texture
 /// files already packed: generated ones (`paletted_permutations` such as the
 /// armour trim sprites, `unstitch` regions) and files listed under another id.
-fn atlas_sprites(root: &Path, packed: &[PackedImage]) -> Vec<PackedImage> {
+fn atlas_sprites(root: &Path, packed: &[PackedImage], max_mod_side: u32) -> Vec<PackedImage> {
     use crate::atlas_sources::{self, SpriteOrigin};
     let have: std::collections::HashSet<&str> = packed.iter().map(|i| i.0.as_str()).collect();
     let textures = atlas_sources::list_textures(root);
@@ -231,14 +339,23 @@ fn atlas_sprites(root: &Path, packed: &[PackedImage]) -> Vec<PackedImage> {
         origins.iter().find_map(|(order, origin)| {
             let image = match origin {
                 SpriteOrigin::File(texture) => {
-                    let path = texture.strip_prefix("minecraft:").unwrap_or(texture);
-                    load(texture, "textures").map(|(w, h, p)| {
-                        // Animated strips keep their first frame, like the packed files.
-                        if h > w && (path.starts_with("block/") || path.starts_with("item/")) {
-                            (w, w, p[..(w * w * 4) as usize].to_vec())
-                        } else {
-                            (w, h, p)
-                        }
+                    let disk_path = atlas_sources::texture_path(root, texture, "textures");
+                    let rel = texture.split_once(':').map_or(texture.as_str(), |(_, p)| p);
+                    decode(&disk_path).ok().and_then(|(w, h, p)| {
+                        let (mut w, mut h, mut p) =
+                            if rel.starts_with("block/") || rel.starts_with("item/") {
+                                let (cw, ch, cp, _, _) = crop_animated_frame(&disk_path, w, h, p);
+                                (cw, ch, cp)
+                            } else {
+                                (w, h, p)
+                            };
+                        let is_mod = !texture.starts_with("minecraft:");
+                        let (dw, dh, dp, _) =
+                            downscale_mod_if_capped(is_mod, max_mod_side, w, h, p);
+                        w = dw;
+                        h = dh;
+                        p = dp;
+                        (w <= 1024 && (h <= 512 || rel.starts_with("font/"))).then_some((w, h, p))
                     })
                 }
                 generated => atlas_sources::generate(generated, &load),
@@ -288,6 +405,10 @@ impl HudAtlas {
     /// The atlas of a resource root that layers packs over `defaults` (the
     /// game's own resources), whose textures give the sprites' GUI sizes.
     pub fn build_over(root: &Path, defaults: &Path) -> Result<Self> {
+        Self::build_over_with_cap(root, defaults, 0)
+    }
+    /// Like [`HudAtlas::build_over`], downscaling oversized mod textures past `max_mod_side`.
+    pub fn build_over_with_cap(root: &Path, defaults: &Path, max_mod_side: u32) -> Result<Self> {
         Self::pack(
             root,
             defaults,
@@ -305,7 +426,93 @@ impl HudAtlas {
                 "map",
             ],
             true,
+            max_mod_side,
         )
+    }
+    /// Compress the CPU-side RGBA atlas buffer in place while waiting for GPU upload.
+    pub fn compact_pixels(&mut self) {
+        if !self.pixels.is_empty() {
+            self.packed_pixels = Some(crate::compact_bytes::CompactBytes::new(std::mem::take(
+                &mut self.pixels,
+            )));
+        }
+    }
+    /// Whether uncompressed or compacted CPU atlas pixels are still retained.
+    pub fn has_pixels(&self) -> bool {
+        !self.pixels.is_empty() || self.packed_pixels.as_ref().is_some_and(|p| !p.is_empty())
+    }
+    /// Decode CPU atlas pixels (zero-copy if uncompressed).
+    pub fn decode_pixels(&self) -> std::borrow::Cow<'_, [u8]> {
+        if !self.pixels.is_empty() {
+            std::borrow::Cow::Borrowed(&self.pixels)
+        } else if let Some(packed) = &self.packed_pixels {
+            packed.decode()
+        } else {
+            std::borrow::Cow::Borrowed(&[])
+        }
+    }
+    /// Drops the CPU-side RGBA atlas and glint buffers once they have been uploaded to the GPU.
+    pub fn release_pixels(&mut self) {
+        self.pixels = Vec::new();
+        self.pixels.shrink_to_fit();
+        self.packed_pixels = None;
+        self.glint.0 = Vec::new();
+        self.glint.0.shrink_to_fit();
+        self.glint_armor.0 = Vec::new();
+        self.glint_armor.0.shrink_to_fit();
+    }
+    /// Width in texels used by an ASCII Standard Galactic glyph (`A..=Z` or `a..=z`).
+    pub fn sga_used(&self, code: u32) -> Option<u32> {
+        let idx = match code {
+            0x41..=0x5A => (code - 0x41) as usize,
+            0x61..=0x7A => 26 + (code - 0x61) as usize,
+            _ => return None,
+        };
+        let sheet = self.sprites.get("font/ascii_sga").copied()?;
+        let cached = self.sga_widths[idx];
+        if cached > 0 || self.pixels.is_empty() {
+            return Some(cached);
+        }
+        Some(Self::sga_cell_used(
+            &self.pixels,
+            self.width,
+            self.height,
+            sheet,
+            code,
+        ))
+    }
+    fn sga_cell_used(pixels: &[u8], atlas_w: u32, atlas_h: u32, sheet: Rect, code: u32) -> u32 {
+        let cell = sheet.w / 16;
+        let px = (sheet.u0 * atlas_w as f32) as u32;
+        let py = (sheet.v0 * atlas_h as f32) as u32;
+        let (col, row) = (code % 16, code / 16);
+        let (cx, cy) = (px + col * cell, py + row * cell);
+        for dx in (0..cell).rev() {
+            if (0..cell).any(|dy| {
+                pixels
+                    .get((((cy + dy) * atlas_w + cx + dx) * 4 + 3) as usize)
+                    .is_some_and(|&a| a != 0)
+            }) {
+                return dx + 1;
+            }
+        }
+        0
+    }
+    fn compute_sga_widths(
+        sprites: &HashMap<String, Rect>,
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+    ) -> [u32; 52] {
+        let mut out = [0u32; 52];
+        let Some(&sheet) = sprites.get("font/ascii_sga") else {
+            return out;
+        };
+        for i in 0..26u32 {
+            out[i as usize] = Self::sga_cell_used(pixels, width, height, sheet, 0x41 + i);
+            out[26 + i as usize] = Self::sga_cell_used(pixels, width, height, sheet, 0x61 + i);
+        }
+        out
     }
     /// Empty slots written at run time: map textures (game/maps.rs), the
     /// minimap, downloaded skins, world and pack icons and the on-screen keyboard's text.
@@ -362,7 +569,7 @@ impl HudAtlas {
     /// holding its textures. The pixels are dropped once the glyph widths are
     /// read, since nothing uploads them.
     pub fn fonts(root: &Path) -> Result<Self> {
-        let mut atlas = Self::pack(root, root, &["font"], false)?;
+        let mut atlas = Self::pack(root, root, &["font"], false, 0)?;
         atlas.pixels = Vec::new();
         Ok(atlas)
     }
@@ -405,7 +612,143 @@ impl HudAtlas {
     }
     /// Pack the textures under these folders of `textures/`, and for the
     /// `full` atlas the generated sprites and the run-time slots too.
-    fn pack(root: &Path, defaults: &Path, folders: &[&str], full: bool) -> Result<Self> {
+    fn pack(
+        root: &Path,
+        defaults: &Path,
+        folders: &[&str],
+        full: bool,
+        max_mod_side: u32,
+    ) -> Result<Self> {
+        if !full {
+            return Self::pack_uncached(root, defaults, folders, false, max_mod_side)
+                .map(|(atlas, _)| atlas);
+        }
+        let started = std::time::Instant::now();
+        let cache = Self::snapshot_cache(root, defaults, folders, max_mod_side);
+        if let Some(snapshot) = cache
+            .as_ref()
+            .and_then(|cache| cache.read_value::<HudAtlasSnapshot>())
+            .filter(HudAtlasSnapshot::valid)
+        {
+            let atlas = snapshot.into_hud_atlas(root);
+            log::info!(
+                "Horizon: stage=hud_atlas cache=hit elapsed_ms={}",
+                started.elapsed().as_millis()
+            );
+            return Ok(atlas);
+        }
+        let (atlas, glyph_region) =
+            Self::pack_uncached(root, defaults, folders, true, max_mod_side)?;
+        if let Some(cache) = cache
+            && let Some(snapshot) = HudAtlasSnapshot::from_atlas(&atlas, glyph_region)
+        {
+            let _ = cache.write_value(&snapshot);
+        }
+        log::info!(
+            "Horizon: stage=hud_atlas cache=miss elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
+        Ok(atlas)
+    }
+
+    fn tree_metadata_digest(dir: &Path) -> Option<[u8; 32]> {
+        use sha2::{Digest, Sha256};
+        fn visit(
+            root: &Path,
+            path: &Path,
+            hash: &mut Sha256,
+            count: &mut usize,
+            depth: usize,
+        ) -> Option<()> {
+            if depth > 64 {
+                return None;
+            }
+            let mut entries: Vec<_> = fs::read_dir(path).ok()?.flatten().collect();
+            entries.sort_by_key(|e| e.file_name());
+            for entry in entries {
+                if path == root
+                    && (entry.file_name() == ".horizon-derived"
+                        || entry.file_name() == "horizon-sprites.cache")
+                {
+                    continue;
+                }
+                let p = entry.path();
+                let kind = entry.file_type().ok()?;
+                let meta = if kind.is_symlink() {
+                    fs::metadata(&p).ok()?
+                } else {
+                    entry.metadata().ok()?
+                };
+                if meta.is_dir() {
+                    visit(root, &p, hash, count, depth + 1)?;
+                } else if meta.is_file() {
+                    *count += 1;
+                    let rel = p.strip_prefix(root).ok()?.to_str()?;
+                    hash.update((rel.len() as u64).to_le_bytes());
+                    hash.update(rel.as_bytes());
+                    hash.update(meta.len().to_le_bytes());
+                    if let Ok(Ok(elapsed)) = meta
+                        .modified()
+                        .map(|t| t.duration_since(std::time::UNIX_EPOCH))
+                    {
+                        hash.update(elapsed.as_nanos().to_le_bytes());
+                    }
+                }
+            }
+            Some(())
+        }
+        let mut hash = Sha256::new();
+        let mut count = 0;
+        visit(dir, dir, &mut hash, &mut count, 0)?;
+        (count > 0).then(|| hash.finalize().into())
+    }
+
+    fn snapshot_cache(
+        root: &Path,
+        defaults: &Path,
+        folders: &[&str],
+        max_mod_side: u32,
+    ) -> Option<horizon_world::resource_cache::Cache> {
+        let defaults_tree = (defaults != root)
+            .then(|| Self::tree_metadata_digest(defaults))
+            .flatten();
+        let dumped_tree = MOD_ENTITY_TEXTURES
+            .get()
+            .and_then(|dir| Self::tree_metadata_digest(dir));
+        let identity = horizon_world::resource_cache::Cache::value_identity(&(
+            folders,
+            defaults != root,
+            defaults.to_string_lossy().as_ref(),
+            defaults_tree,
+            MOD_ENTITY_TEXTURES
+                .get()
+                .map(|dir| dir.to_string_lossy().into_owned()),
+            dumped_tree,
+            max_mod_side,
+        ))?;
+        horizon_world::resource_cache::Cache::for_tree(root, "hud-atlas-v1", &identity)
+    }
+
+    fn downscale_rect(pixels: &[u8], w: u32, h: u32, nw: u32, nh: u32) -> Vec<u8> {
+        let mut out = Vec::with_capacity((nw * nh * 4) as usize);
+        for row in 0..nh {
+            let sy = row * h / nh;
+            for col in 0..nw {
+                let sx = col * w / nw;
+                let off = ((sy * w + sx) * 4) as usize;
+                out.extend_from_slice(&pixels[off..off + 4]);
+            }
+        }
+        out
+    }
+
+    fn pack_uncached(
+        root: &Path,
+        defaults: &Path,
+        folders: &[&str],
+        full: bool,
+        max_mod_side: u32,
+    ) -> Result<(Self, u32)> {
         let textures = root.join("assets/minecraft/textures");
         let default_textures =
             (defaults != root).then(|| defaults.join("assets/minecraft/textures"));
@@ -413,52 +756,72 @@ impl HudAtlas {
         for folder in folders {
             walk(&textures.join(folder), &mut files);
         }
+        // The entity textures of mods with GeckoLib models (assets/<ns>/geo),
+        // as `ns:entity/...` sprites: the mob renderer draws them from here.
+        let assets = root.join("assets");
+        if full && let Ok(namespaces) = fs::read_dir(&assets) {
+            for ns in namespaces.flatten() {
+                if ns.file_name() != "minecraft" && ns.path().join("geo").is_dir() {
+                    // Both folder spellings mods use (`gecko::resolve::TEXTURE_DIRS`).
+                    for folder in ["entity", "entities"] {
+                        walk(&ns.path().join("textures").join(folder), &mut files);
+                    }
+                }
+            }
+        }
+        // The textures a modded client's model dump copied for its Java-modelled
+        // mobs, as `ns:entity/...` sprites too.
+        let dumped = MOD_ENTITY_TEXTURES.get().filter(|_| full);
+        if let Some(dir) = dumped {
+            dumped_entity_textures(dir, &assets, &mut files);
+        }
+        // The sprites of mods' particle definitions (assets/<ns>/particles), as
+        // `ns:particle/...`; an oversized texture stays out of the atlas.
+        if full {
+            files.extend(
+                crate::particle_defs::texture_files(root)
+                    .into_iter()
+                    .filter(|p| png_size(p).is_some_and(|(w, h)| w <= 256 && h <= 256)),
+            );
+        }
         files.retain(|p| {
             let s = p.to_string_lossy();
             !s.contains("title/background") && !s.contains("realms") && !s.contains("presets")
         });
         type Decoded = (PackedImage, Option<TextureFlags>, Option<(u32, u32)>, bool);
         let decode_one = |path: &PathBuf| -> Option<Decoded> {
-            let name = path
-                .strip_prefix(&textures)
-                .ok()?
-                .with_extension("")
-                .to_string_lossy()
-                .replace('\\', "/");
-            let (mut w, mut h, pixels) = decode(path).ok()?;
-            let mcmeta = fs::read_to_string(path.with_extension("png.mcmeta")).ok();
-            let animation = mcmeta
-                .as_deref()
-                .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
-                .and_then(|meta| {
-                    meta.get("animation")
-                        .and_then(|section| AnimationMetadata::from_json(&section.to_string()).ok())
-                });
+            let name = match path.strip_prefix(&textures) {
+                Ok(rel) => rel.with_extension("").to_string_lossy().replace('\\', "/"),
+                // assets/<ns>/textures/<rest> (or <ns>/textures/<rest> of the
+                // model dump's folder): a mod's sprite, `ns:<rest>`.
+                Err(_) => {
+                    let rel = path
+                        .strip_prefix(&assets)
+                        .ok()
+                        .or_else(|| dumped.and_then(|dir| path.strip_prefix(dir).ok()))?;
+                    let mut parts = rel.components();
+                    let ns = parts.next()?.as_os_str().to_string_lossy().into_owned();
+                    let rest = parts.as_path().strip_prefix("textures").ok()?;
+                    format!(
+                        "{ns}:{}",
+                        rest.with_extension("").to_string_lossy().replace('\\', "/")
+                    )
+                }
+            };
+            let (w, h, pixels) = decode(path).ok()?;
             // An animated strip keeps its first frame: the region the mcmeta's
             // frame size picks (`AnimationMetadataSection.frameSize`), which is
             // the top-left square unless it names other dimensions or the
             // frames run along a row.
             let frames = name.starts_with("block/") || name.starts_with("item/");
-            let pixels = if frames {
-                let stride = w;
-                let [fw, fh] = animation.as_ref().map_or([w.min(h) as i32; 2], |meta| {
-                    meta.frame_size(w as i32, h as i32)
-                });
-                match (u32::try_from(fw), u32::try_from(fh)) {
-                    (Ok(fw), Ok(fh))
-                        if fw > 0 && fh > 0 && w % fw == 0 && h % fh == 0 && (fw, fh) != (w, h) =>
-                    {
-                        let side = fw.max(fh);
-                        (w, h) = (side, side);
-                        strip_frame(&pixels, stride, 0, 0, fw, fh)
-                    }
-                    _ => pixels,
-                }
+            let (mut w, mut h, pixels, mcmeta, has_animation) = if frames {
+                crop_animated_frame(path, w, h, pixels)
             } else {
-                pixels
+                let mcmeta = fs::read_to_string(path.with_extension("png.mcmeta")).ok();
+                (w, h, pixels, mcmeta, false)
             };
             // The default texture's size, when a pack's differs from it.
-            let gui_size = default_textures
+            let mut gui_size = default_textures
                 .as_ref()
                 .and_then(|d| png_size(&d.join(format!("{name}.png"))))
                 .map(|(dw, dh)| {
@@ -466,8 +829,16 @@ impl HudAtlas {
                     if frames { (side, side) } else { (dw, dh) }
                 })
                 .filter(|&size| size != (w, h));
+            let is_mod_sprite = name.contains(':') && !name.starts_with("minecraft:");
+            let orig_size = (w, h);
+            let (nw, nh, pixels, downscaled) =
+                downscale_mod_if_capped(is_mod_sprite, max_mod_side, w, h, pixels);
+            if downscaled {
+                gui_size.get_or_insert(orig_size);
+                (w, h) = (nw, nh);
+            }
             let flags = mcmeta.as_deref().and_then(TextureFlags::from_mcmeta);
-            let animated = frames && animation.is_some();
+            let animated = frames && has_animation;
             let (gw, gh) = gui_size.unwrap_or((w, h));
             (gw <= 1024 && (gh <= 512 || name.starts_with("font/"))).then_some((
                 (name, w, h, pixels),
@@ -507,7 +878,7 @@ impl HudAtlas {
             images.push(image);
         }
         if full {
-            images.extend(atlas_sprites(root, &images));
+            images.extend(atlas_sprites(root, &images, max_mod_side));
         }
         // The title screen's "JAVA EDITION" banner reads "RUST EDITION".
         if let Some(edition) = images
@@ -540,7 +911,7 @@ impl HudAtlas {
         let mut pixels = vec![0u8; (width * height * 4) as usize];
         let mut sprites = HashMap::new();
         let mut translucent = HashSet::new();
-        for ((name, w, h, data), (px, py)) in images.iter().zip(placements) {
+        for ((name, w, h, data), (px, py)) in images.into_iter().zip(placements) {
             if data
                 .as_chunks::<4>()
                 .0
@@ -549,16 +920,17 @@ impl HudAtlas {
             {
                 translucent.insert(name.clone());
             }
-            for row in 0..*h {
+            for row in 0..h {
                 let src = &data[(row * w * 4) as usize..((row + 1) * w * 4) as usize];
                 let dst = (((py + row) * width + px) * 4) as usize;
                 pixels[dst..dst + (w * 4) as usize].copy_from_slice(src);
             }
-            let b = u32::from(bordered.contains(name));
+            drop(data);
+            let b = u32::from(bordered.contains(&name));
             let (px, py, w, h) = (px + b, py + b, w - 2 * b, h - 2 * b);
-            let (gw, gh) = gui_sizes.get(name).copied().unwrap_or((w, h));
+            let (gw, gh) = gui_sizes.get(&name).copied().unwrap_or((w, h));
             sprites.insert(
-                name.clone(),
+                name,
                 Rect {
                     u0: px as f32 / width as f32,
                     v0: py as f32 / height as f32,
@@ -607,20 +979,26 @@ impl HudAtlas {
             (glyph_region, height - glyph_region),
             white,
         );
-        Ok(Self {
-            pixels,
-            width,
-            height,
-            sprites,
-            object_skins: HashMap::new(),
-            translucent,
-            flags,
-            sprite_animations,
-            glint,
-            glint_armor,
-            font,
-            white,
-        })
+        let sga_widths = Self::compute_sga_widths(&sprites, &pixels, width, height);
+        Ok((
+            Self {
+                pixels,
+                packed_pixels: None,
+                width,
+                height,
+                sprites,
+                object_skins: HashMap::new(),
+                translucent,
+                flags,
+                sprite_animations,
+                glint,
+                glint_armor,
+                font,
+                white,
+                sga_widths,
+            },
+            glyph_region,
+        ))
     }
     /// `misc/<name>.png` on its own, or a transparent texel if the resource
     /// pack lacks it.
@@ -631,6 +1009,164 @@ impl HudAtlas {
             path = defaults.join(&relative);
         }
         decode(&path).map_or((vec![0; 4], 1, 1), |(w, h, pixels)| (pixels, w, h))
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct HudAtlasSnapshot {
+    pixels: crate::compact_bytes::CompactBytes,
+    width: u32,
+    height: u32,
+    glyph_region: u32,
+    sprites: HashMap<String, Rect>,
+    translucent: HashSet<String>,
+    flags: HashMap<String, TextureFlags>,
+    sprite_animations: Vec<(Rect, crate::sprites::PackedSpriteAnimation)>,
+    glint: (crate::compact_bytes::CompactBytes, u32, u32),
+    glint_armor: (crate::compact_bytes::CompactBytes, u32, u32),
+}
+
+impl HudAtlasSnapshot {
+    fn from_atlas(atlas: &HudAtlas, glyph_region: u32) -> Option<Self> {
+        let pixel_len = atlas
+            .packed_pixels
+            .as_ref()
+            .map_or(atlas.pixels.len(), |p| p.len());
+        if pixel_len > crate::compact_bytes::MAX_COMPACT_BYTES
+            || atlas.glint.0.len() > crate::compact_bytes::MAX_COMPACT_BYTES
+            || atlas.glint_armor.0.len() > crate::compact_bytes::MAX_COMPACT_BYTES
+        {
+            return None;
+        }
+        let pixels = atlas
+            .packed_pixels
+            .clone()
+            .unwrap_or_else(|| crate::compact_bytes::CompactBytes::from_slice(&atlas.pixels));
+        Some(Self {
+            pixels,
+            width: atlas.width,
+            height: atlas.height,
+            glyph_region,
+            sprites: atlas.sprites.clone(),
+            translucent: atlas.translucent.clone(),
+            flags: atlas.flags.clone(),
+            sprite_animations: atlas
+                .sprite_animations
+                .iter()
+                .map(|(rect, anim)| {
+                    (
+                        *rect,
+                        crate::sprites::PackedSpriteAnimation::new(anim.clone()),
+                    )
+                })
+                .collect(),
+            glint: (
+                crate::compact_bytes::CompactBytes::from_slice(&atlas.glint.0),
+                atlas.glint.1,
+                atlas.glint.2,
+            ),
+            glint_armor: (
+                crate::compact_bytes::CompactBytes::from_slice(&atlas.glint_armor.0),
+                atlas.glint_armor.1,
+                atlas.glint_armor.2,
+            ),
+        })
+    }
+
+    fn valid(&self) -> bool {
+        let rect_valid = |rect: &Rect| {
+            rect.u0.is_finite()
+                && rect.v0.is_finite()
+                && rect.u1.is_finite()
+                && rect.v1.is_finite()
+                && 0.0 <= rect.u0
+                && rect.u0 <= rect.u1
+                && rect.u1 <= 1.0
+                && 0.0 <= rect.v0
+                && rect.v0 <= rect.v1
+                && rect.v1 <= 1.0
+        };
+        let glint_valid = |(px, w, h): &(crate::compact_bytes::CompactBytes, u32, u32)| {
+            *w > 0
+                && *h > 0
+                && (*w as usize)
+                    .checked_mul(*h as usize)
+                    .and_then(|n| n.checked_mul(4))
+                    .is_some_and(|expected| {
+                        expected <= crate::compact_bytes::MAX_COMPACT_BYTES && expected == px.len()
+                    })
+        };
+        let expected = (self.width as usize)
+            .checked_mul(self.height as usize)
+            .and_then(|n| n.checked_mul(4));
+        self.width > 0
+            && self.height > 0
+            && self.glyph_region <= self.height
+            && self.height - self.glyph_region >= GLYPH_ROWS
+            && expected.is_some_and(|expected| {
+                expected <= crate::compact_bytes::MAX_COMPACT_BYTES && expected == self.pixels.len()
+            })
+            && self.sprites.contains_key("horizon/white")
+            && self
+                .sprites
+                .iter()
+                .all(|(name, rect)| !name.is_empty() && rect_valid(rect))
+            && self.flags.keys().all(|name| !name.is_empty())
+            && self.translucent.iter().all(|name| !name.is_empty())
+            && self.sprite_animations.iter().all(|(rect, anim)| {
+                if !rect_valid(rect) || !anim.valid_any_size() {
+                    return false;
+                }
+                let (tw, th) = rect.texels((self.width, self.height));
+                let x = (rect.u0 * self.width as f32).round() as u32;
+                let y = (rect.v0 * self.height as f32).round() as u32;
+                tw > 0
+                    && th > 0
+                    && x.checked_add(tw).is_some_and(|end| end <= self.width)
+                    && y.checked_add(th).is_some_and(|end| end <= self.height)
+            })
+            && glint_valid(&self.glint)
+            && glint_valid(&self.glint_armor)
+    }
+
+    fn into_hud_atlas(self, root: &Path) -> HudAtlas {
+        let pixels = self.pixels.into_decoded();
+        let white = self.sprites["horizon/white"];
+        let sprite_animations = self
+            .sprite_animations
+            .into_iter()
+            .map(|(rect, anim)| (rect, anim.decode()))
+            .collect();
+        let font = crate::font::Font::load(
+            root,
+            &self.sprites,
+            &pixels,
+            (self.width, self.height),
+            (self.glyph_region, self.height - self.glyph_region),
+            white,
+        );
+        let sga_widths =
+            HudAtlas::compute_sga_widths(&self.sprites, &pixels, self.width, self.height);
+        HudAtlas {
+            pixels,
+            packed_pixels: None,
+            width: self.width,
+            height: self.height,
+            sprites: self.sprites,
+            object_skins: HashMap::new(),
+            translucent: self.translucent,
+            flags: self.flags,
+            sprite_animations,
+            glint: (self.glint.0.into_decoded(), self.glint.1, self.glint.2),
+            glint_armor: (
+                self.glint_armor.0.into_decoded(),
+                self.glint_armor.1,
+                self.glint_armor.2,
+            ),
+            font,
+            white,
+            sga_widths,
+        }
     }
 }
 #[repr(C)]
@@ -1890,6 +2426,26 @@ mod tests {
         assert_eq!(rect.texels((atlas.width, atlas.height)), (16, 16));
         assert_eq!(texel_at(&atlas, rect, 0, 0), [0, 255, 0, 255]);
     }
+    #[test]
+    fn geckolib_mod_textures_under_entity_and_entities_both_reach_the_atlas() {
+        let root = std::env::temp_dir().join(format!("horizon-atlas-gecko-{}", std::process::id()));
+        let ns = root.join("assets/testmod");
+        for folder in ["entity", "entities"] {
+            fs::create_dir_all(ns.join("textures").join(folder)).unwrap();
+            write_strip(
+                &ns.join("textures").join(folder).join("beast.png"),
+                16,
+                16,
+                &[[9, 9, 9, 255]],
+                None,
+            );
+        }
+        fs::create_dir_all(ns.join("geo")).unwrap();
+        let atlas = HudAtlas::build(&root).unwrap();
+        let _ = fs::remove_dir_all(&root);
+        assert!(atlas.sprites.contains_key("testmod:entity/beast"));
+        assert!(atlas.sprites.contains_key("testmod:entities/beast"));
+    }
     /// `count` images of `w x h`; layout reads only their sizes.
     fn sized(count: usize, w: u32, h: u32) -> Vec<PackedImage> {
         (0..count)
@@ -2405,5 +2961,131 @@ mod tests {
                 );
             }
         }
+    }
+    #[test]
+    fn hud_atlas_snapshot_round_trips_and_recovers_from_corruption() {
+        let temp =
+            std::env::temp_dir().join(format!("horizon-hud-snapshot-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp);
+        let (defaults, pack) = (temp.join("defaults"), temp.join("pack"));
+        write_png(&defaults, "gui/sprites/widget/button", 200, 20);
+        write_png(&pack, "gui/sprites/widget/button", 400, 40);
+        write_png(&pack, "item/test_animated", 16, 32);
+        fs::write(pack.join("horizon-mod-content.stamp"), "hud-test-v1").unwrap();
+        fs::write(
+            pack.join("assets/minecraft/textures/item/test_animated.png.mcmeta"),
+            r#"{"animation":{"frametime":2}}"#,
+        )
+        .unwrap();
+
+        let first = HudAtlas::build_over(&pack, &defaults).unwrap();
+        assert_eq!(first.sprite_animations.len(), 1);
+        assert_eq!(first.sprites["gui/sprites/widget/button"].w, 200);
+
+        let derived = pack.join(".horizon-derived");
+        let cache_entries: Vec<_> = fs::read_dir(&derived)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.is_file())
+            .collect();
+        assert!(
+            !cache_entries.is_empty(),
+            "expected hud-atlas snapshot in .horizon-derived"
+        );
+
+        let second = HudAtlas::build_over(&pack, &defaults).unwrap();
+        assert_eq!((second.width, second.height), (first.width, first.height));
+        assert_eq!(second.pixels, first.pixels);
+        assert_eq!(
+            second.sprite_animations.len(),
+            first.sprite_animations.len()
+        );
+        assert_eq!(
+            second.sprites["gui/sprites/widget/button"].w,
+            first.sprites["gui/sprites/widget/button"].w
+        );
+
+        // Corrupt the persisted cache payload and verify clean rebuild.
+        for path in &cache_entries {
+            fs::write(path, b"corrupt-hud-snapshot").unwrap();
+        }
+        let recovered = HudAtlas::build_over(&pack, &defaults).unwrap();
+        assert_eq!(recovered.pixels, first.pixels);
+
+        // Reject invalid snapshot shapes even if syntactically valid postcard.
+        let mut invalid = HudAtlasSnapshot::from_atlas(&first, GLYPH_ROWS).unwrap();
+        invalid.width = 0;
+        assert!(!invalid.valid());
+        let cache = HudAtlas::snapshot_cache(
+            &pack,
+            &defaults,
+            &[
+                "gui",
+                "item",
+                "block",
+                "font",
+                "environment",
+                "misc",
+                "painting",
+                "entity",
+                "particle",
+                "mob_effect",
+                "map",
+            ],
+            0,
+        )
+        .unwrap();
+        cache.write_value(&invalid).unwrap();
+        let rebuilt = HudAtlas::build_over(&pack, &defaults).unwrap();
+        assert_eq!(rebuilt.pixels, first.pixels);
+
+        // Modifying defaults invalidates the snapshot and updates GUI sizes.
+        write_png(&defaults, "gui/sprites/widget/button", 120, 12);
+        let updated = HudAtlas::build_over(&pack, &defaults).unwrap();
+        assert_eq!(updated.sprites["gui/sprites/widget/button"].w, 120);
+        assert_eq!(updated.sprites["gui/sprites/widget/button"].h, 12);
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn mod_atlas_strips_crop_to_first_frame_and_compact_pixels_round_trips() {
+        let temp =
+            std::env::temp_dir().join(format!("horizon-hud-modstrip-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp);
+        write_png(&temp, "gui/sprites/widget/button", 200, 20);
+        let mod_tex = temp.join("assets/testmod/textures/block/anim.png");
+        fs::create_dir_all(mod_tex.parent().unwrap()).unwrap();
+        let mut encoder = png::Encoder::new(fs::File::create(&mod_tex).unwrap(), 16, 64);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder
+            .write_header()
+            .unwrap()
+            .write_image_data(&vec![128; 16 * 64 * 4])
+            .unwrap();
+        let atlas_dir = temp.join("assets/minecraft/atlases");
+        fs::create_dir_all(&atlas_dir).unwrap();
+        fs::write(
+            atlas_dir.join("blocks.json"),
+            r#"{"sources":[{"type":"minecraft:directory","source":"block","prefix":"block/"}]}"#,
+        )
+        .unwrap();
+
+        let mut atlas = HudAtlas::build_over(&temp, &temp).unwrap();
+        let rect = atlas.sprites["testmod:block/anim"];
+        assert_eq!(rect.texels((atlas.width, atlas.height)), (16, 16));
+
+        let original = atlas.pixels.clone();
+        assert!(atlas.has_pixels());
+        atlas.compact_pixels();
+        assert!(atlas.pixels.is_empty());
+        assert!(atlas.has_pixels());
+        assert_eq!(&*atlas.decode_pixels(), &original);
+        atlas.release_pixels();
+        assert!(!atlas.has_pixels());
+        assert!(atlas.decode_pixels().is_empty());
+
+        let _ = fs::remove_dir_all(&temp);
     }
 }

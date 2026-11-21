@@ -220,7 +220,11 @@ struct Shared {
     /// packs reload; each mesh job takes the current one.
     context: RwLock<Arc<WorkerContext>>,
     done: Mailbox,
+    mesh_pool: Mutex<Vec<SectionMesh>>,
 }
+
+const MAX_POOLED_MESHES: usize = 64;
+const MAX_RETAINED_VERTS: usize = 65536;
 /// Finished jobs, from the workers to the game thread, in the order they
 /// finished. Not an `mpsc` channel: its receiver waits for a sender it finds
 /// half way through a send, and a worker descheduled there on a busy machine
@@ -513,6 +517,7 @@ impl Streaming {
             stop: AtomicBool::new(false),
             context: RwLock::new(context.clone()),
             done: Mailbox::default(),
+            mesh_pool: Mutex::new(Vec::with_capacity(MAX_POOLED_MESHES)),
         });
         let light_tables = context.light.clone();
         let saves: Arc<dyn Saves> = generator.clone();
@@ -531,6 +536,7 @@ impl Streaming {
                         // the worker across mesh jobs, like vanilla's per-thread cache:
                         // cloning it per job copied every state and face shape.
                         let mut faces: Option<(Arc<MeshTables>, FaceVisibility)> = None;
+                        let mut mesh_scratch = crate::mesher::MeshScratch::default();
                         loop {
                             let job = {
                                 let mut queue = shared.queue.lock().unwrap();
@@ -566,7 +572,23 @@ impl Streaming {
                                     generator.save_protos(&refs);
                                     Done::Saved(protos)
                                 }
-                                Job::Free(meshes) => {
+                                Job::Free(mut meshes) => {
+                                    {
+                                        let mut pool = shared.mesh_pool.lock().unwrap();
+                                        for (_, mut mesh) in meshes.drain(..) {
+                                            if pool.len() >= MAX_POOLED_MESHES {
+                                                break;
+                                            }
+                                            if mesh.solid.capacity() <= MAX_RETAINED_VERTS
+                                                && mesh.translucent.capacity() <= MAX_RETAINED_VERTS
+                                                && (mesh.solid.capacity() > 0
+                                                    || mesh.translucent.capacity() > 0)
+                                            {
+                                                mesh.reset_keeping_capacity();
+                                                pool.push(mesh);
+                                            }
+                                        }
+                                    }
                                     drop(meshes);
                                     continue;
                                 }
@@ -595,8 +617,17 @@ impl Streaming {
                                         biomes: &context.biomes,
                                         visibility,
                                     };
-                                    let mut mesh = mesher.mesh(&borrow(&region), sy);
-                                    mesh.sort_solid();
+                                    let mut mesh = {
+                                        let mut pool = shared.mesh_pool.lock().unwrap();
+                                        pool.pop().unwrap_or_default()
+                                    };
+                                    mesher.mesh_into(
+                                        &borrow(&region),
+                                        sy,
+                                        &mut mesh_scratch,
+                                        &mut mesh,
+                                    );
+                                    mesh.sort_solid_with(&mut mesh_scratch.sides);
                                     faces = Some((context.tables.clone(), mesher.visibility));
                                     Done::Meshed(x, sy, z, mesh, seq)
                                 }

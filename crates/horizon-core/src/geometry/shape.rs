@@ -159,6 +159,11 @@ impl VoxelShape {
     pub fn same_identity(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.identity, &other.identity)
     }
+    /// An opaque identity for lookup tables. Valid while this shape or a clone
+    /// is alive; separately constructed equal grids have different keys.
+    pub fn identity_key(&self) -> *const () {
+        Arc::as_ptr(&self.identity).cast()
+    }
     /// A separately constructed shape with the same immutable grid. Storage is
     /// shared, while identity-sensitive vanilla join shortcuts remain distinct.
     pub fn fresh_identity(&self) -> Self {
@@ -520,6 +525,16 @@ fn clear_strip(bits: &mut [u64], sizes: [usize; 3], x: usize, y: usize, min: usi
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn identity_keys_follow_aliases_not_geometry() {
+        let a = VoxelShape::block();
+        let b = a.clone();
+        let c = a.fresh_identity();
+        assert_eq!(a.identity_key(), b.identity_key());
+        assert_ne!(a.identity_key(), c.identity_key());
+        assert_eq!(a.boxes(), c.boxes());
+    }
+
     #[test]
     fn stop_at_obstacle_and_reuse_boxes() {
         let shape = VoxelShape::block();

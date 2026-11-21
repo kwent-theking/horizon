@@ -87,8 +87,16 @@ pub(crate) const CLIENT: &str = if cfg!(windows) {
 /// The agent `url` is fetched with: the launcher's own user agent, through the player's proxy when
 /// one is set (`proxy`).
 fn agent(url: &str) -> ureq::Agent {
+    agent_following(url, DEFAULT_REDIRECTS)
+}
+
+/// ureq's own default redirect limit.
+const DEFAULT_REDIRECTS: u32 = 5;
+
+fn agent_following(url: &str, redirects: u32) -> ureq::Agent {
     crate::proxy::agent(
         ureq::AgentBuilder::new()
+            .redirects(redirects)
             .user_agent(&format!("horizon-launcher/{VERSION}"))
             // A connection that goes quiet fails instead of waiting for ever.
             .timeout_connect(std::time::Duration::from_secs(15))
@@ -109,23 +117,52 @@ pub fn get_bytes(url: &str) -> Result<Vec<u8>, String> {
 }
 
 pub(crate) fn get(url: &str) -> Result<ureq::Response, String> {
-    let mut request = agent(url).get(url);
-    // CI runners share addresses and hit GitHub's anonymous rate limit; they pass their own token.
-    if let Some(token) = std::env::var("HORIZON_GITHUB_TOKEN")
+    get_with_token(url, None)
+}
+
+pub(crate) fn get_with_token(url: &str, token: Option<&str>) -> Result<ureq::Response, String> {
+    let token = token.map(str::trim).filter(|t| !t.is_empty());
+    if token.is_some() && !url.starts_with("https://") {
+        return Err(format!(
+            "{url} is not https; refusing to send the friends token"
+        ));
+    }
+    // A token never follows a redirect: ureq would resend X-Horizon-Token to the new host, even over http.
+    let redirects = if token.is_some() { 0 } else { DEFAULT_REDIRECTS };
+    let mut request = agent_following(url, redirects).get(url);
+    if let Some(token) = token {
+        request = request
+            .set("Authorization", &format!("Bearer {token}"))
+            .set("X-Horizon-Token", token);
+    } else if let Some(token) = std::env::var("HORIZON_GITHUB_TOKEN")
         .ok()
         .filter(|t| !t.is_empty())
     {
+        // CI runners share addresses and hit GitHub's anonymous rate limit; they pass their own token.
         if url.starts_with("https://api.github.com/") {
             request = request.set("Authorization", &format!("Bearer {token}"));
         }
     }
-    request.call().map_err(|e| match e {
+    let has_token = token.is_some();
+    let response = request.call().map_err(|e| match e {
+        ureq::Error::Status(401, _) => {
+            format!("{url} answered 401 (unauthorized; check your friends token)")
+        }
+        ureq::Error::Status(403, _) if has_token => {
+            format!("{url} answered 403 (forbidden; check your friends token)")
+        }
         ureq::Error::Status(403, _) => {
             "GitHub's rate limit was reached. Try again in a few minutes.".into()
         }
         ureq::Error::Status(code, _) => format!("{url} answered {code}"),
         ureq::Error::Transport(t) => format!("No connection: {t}"),
-    })
+    })?;
+    if has_token && (300..400).contains(&response.status()) {
+        return Err(format!(
+            "{url} redirected elsewhere; refusing to send the friends token to another address"
+        ));
+    }
+    Ok(response)
 }
 
 /// A Horizon game tag: `v` then a digit (`v2026.10.13`). Launcher tags never match.
@@ -716,7 +753,7 @@ pub fn resources(tag: &str) -> PathBuf {
     resources_at(&version_dir(tag))
 }
 
-fn resources_at(dir: &Path) -> PathBuf {
+pub(crate) fn resources_at(dir: &Path) -> PathBuf {
     dir.join(".local/horizon-client").join(game_version_at(dir))
 }
 
@@ -1596,6 +1633,8 @@ pub enum MinecraftFrom {
     Install,
     /// Mojang, for the signed-in account that owns the game ("Download and prepare").
     Mojang,
+    /// An existing install only; never download Minecraft as a fallback.
+    LocalInstall,
 }
 
 /// Checks what the preparation needs and picks how to run it. PLAY.txt describes the same
@@ -1609,8 +1648,18 @@ pub fn preparer(
     from: MinecraftFrom,
     log: &dyn Fn(String),
 ) -> Result<(Preparer, PathBuf), String> {
-    let version = game_version(tag);
-    let dir = version_dir(tag);
+    preparer_at(&version_dir(tag), minecraft, from, log)
+}
+
+/// The same preparation for an isolated friends snapshot, outside the normal version list.
+pub(crate) fn preparer_at(
+    dir: &Path,
+    minecraft: &Path,
+    from: MinecraftFrom,
+    log: &dyn Fn(String),
+) -> Result<(Preparer, PathBuf), String> {
+    let version = game_version_at(dir);
+    let dir = dir.to_path_buf();
     let reused = horizon_prepare::artifacts::reuse_imported(&dir, &|line| log(line.to_string()))?;
     let chosen = minecraft.to_path_buf();
     // Resolved even when the game files are reused: the assets still come from the install.
@@ -1648,6 +1697,9 @@ pub fn preparer(
                     sources::Resolved::Folder(dir) => dir,
                     sources::Resolved::NotFound(checked) => {
                         let not_found = sources::not_found(&version, &checked, minecraft);
+                        if from == MinecraftFrom::LocalInstall {
+                            return Err(not_found);
+                        }
                         download_for_owner(&pins, &own, &fetch, log).map_err(|e| not_found + &e)?;
                         own
                     }

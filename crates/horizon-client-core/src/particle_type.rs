@@ -4,7 +4,7 @@
 macro_rules! particle_types {
     ($($variant:ident = $name:literal),* $(,)?) => {
         /// Vanilla particle types with a client implementation here.
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
         pub enum ParticleType { $($variant),* }
         impl ParticleType {
             pub const ALL: &'static [ParticleType] = &[$(ParticleType::$variant),*];

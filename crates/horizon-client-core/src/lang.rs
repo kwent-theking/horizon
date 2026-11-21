@@ -23,7 +23,7 @@ impl LanguageInfo {
         format!("{} ({})", self.name, self.region)
     }
 }
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 pub struct Language {
     pub code: String,
     /// `LanguageInfo.bidirectional`: text without a strong character reads
@@ -40,6 +40,11 @@ static BIDIRECTIONAL: AtomicBool = AtomicBool::new(false);
 /// A source of resource files: the prepared root plus packs, highest priority last.
 pub trait ResourceSource {
     fn read(&self, path: &str) -> Option<Vec<u8>>;
+    /// A filesystem tree whose stamp covers all reads from this source.
+    /// In-memory and other dynamic sources continue through the normal loader.
+    fn cache_root(&self) -> Option<&std::path::Path> {
+        None
+    }
     /// Whether `path` is there, without reading it where the source can tell.
     fn exists(&self, path: &str) -> bool {
         self.read(path).is_some()
@@ -75,6 +80,9 @@ impl ResourceSource for Bundled {
     }
 }
 impl ResourceSource for std::path::PathBuf {
+    fn cache_root(&self) -> Option<&std::path::Path> {
+        Some(self.as_path())
+    }
     fn read(&self, path: &str) -> Option<Vec<u8>> {
         std::fs::read(self.join(path)).ok()
     }
@@ -121,6 +129,34 @@ impl Language {
     /// from every namespace and every source in priority order (later sources
     /// override).
     pub fn load(sources: &[&dyn ResourceSource], code: &str) -> Self {
+        let started = std::time::Instant::now();
+        let cache = language_cache(sources, code);
+        if let Some(language) = cache
+            .as_ref()
+            .and_then(|c| c.read_value::<Self>())
+            .filter(|language| language.code == code)
+        {
+            log::info!(
+                "Horizon: stage=language cache=hit elapsed_ms={}",
+                started.elapsed().as_millis()
+            );
+            return language;
+        }
+        let language = Self::load_uncached(sources, code);
+        if let Some(cache) = cache
+            .as_ref()
+            .filter(|cache| Some(*cache) == language_cache(sources, code).as_ref())
+        {
+            let _ = cache.write_value(&language);
+        }
+        log::info!(
+            "Horizon: stage=language cache=miss elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
+        language
+    }
+
+    fn load_uncached(sources: &[&dyn ResourceSource], code: &str) -> Self {
         let mut map = HashMap::new();
         let mut codes = vec![DEFAULT];
         if code != DEFAULT {
@@ -178,6 +214,24 @@ impl Language {
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
     }
+}
+
+fn language_cache(
+    sources: &[&dyn ResourceSource],
+    code: &str,
+) -> Option<horizon_world::resource_cache::Cache> {
+    use horizon_world::resource_cache::Cache;
+    let root = sources.first()?.cache_root()?;
+    // Resource order is significant: later sources override earlier ones.
+    let mut identity = Vec::new();
+    identity.extend_from_slice(&(code.len() as u64).to_le_bytes());
+    identity.extend_from_slice(code.as_bytes());
+    identity.extend_from_slice(&(sources.len() as u64).to_le_bytes());
+    for source in sources {
+        let tree = Cache::for_tree(source.cache_root()?, "language-source-v1", &[])?;
+        identity.extend_from_slice(tree.identity());
+    }
+    Cache::new(root, "language-v1", &[], &identity)
 }
 
 /// Languages declared by `pack.mcmeta` files (the vanilla asset root first).
@@ -258,6 +312,52 @@ pub fn tr(key: &str, args: &[&dyn std::fmt::Display]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn snapshot_preserves_language_layering_and_falls_back_after_changes_or_corruption() {
+        use std::fs;
+        let root =
+            std::env::temp_dir().join(format!("horizon-language-snapshot-{}", std::process::id()));
+        let base = root.join("base");
+        let pack = root.join("pack");
+        for dir in [&base, &pack] {
+            fs::create_dir_all(dir.join("assets/minecraft/lang")).unwrap();
+            fs::write(dir.join("horizon-mod-content.stamp"), b"content").unwrap();
+        }
+        let file = "assets/minecraft/lang/en_us.json";
+        fs::write(base.join(file), br#"{"a":"base","fallback":"English"}"#).unwrap();
+        fs::write(pack.join(file), br#"{"a":"pack"}"#).unwrap();
+        fs::write(
+            pack.join("assets/minecraft/lang/fr_fr.json"),
+            br#"{"a":"French"}"#,
+        )
+        .unwrap();
+        let sources: [&dyn ResourceSource; 2] = [&base, &pack];
+        for code in ["en_us", "fr_fr"] {
+            let cold = Language::load(&sources, code);
+            let cache = language_cache(&sources, code).unwrap();
+            assert!(cache.read_value::<Language>().is_some());
+            let warm = Language::load(&sources, code);
+            assert_eq!(cold.map(), warm.map());
+            assert_eq!(warm.get("fallback"), Some("English"));
+            assert_eq!(
+                warm.get("a"),
+                Some(if code == "en_us" { "pack" } else { "French" })
+            );
+            cache.write(b"corrupt typed snapshot").unwrap();
+            assert_eq!(Language::load(&sources, code).map(), cold.map());
+        }
+        fs::write(pack.join(file), br#"{"a":"updated pack"}"#).unwrap();
+        assert_eq!(
+            Language::load(&sources, "en_us").get("a"),
+            Some("updated pack")
+        );
+        let reversed: [&dyn ResourceSource; 2] = [&pack, &base];
+        assert_eq!(Language::load(&reversed, "en_us").get("a"), Some("base"));
+        fs::write(base.join("horizon-mod-content.stamp"), b"new content").unwrap();
+        assert!(language_cache(&sources, "en_us").unwrap().read().is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
     struct Mem(HashMap<String, Vec<u8>>);
     impl ResourceSource for Mem {
         fn read(&self, path: &str) -> Option<Vec<u8>> {

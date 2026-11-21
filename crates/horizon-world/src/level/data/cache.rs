@@ -151,27 +151,7 @@ fn fingerprint(registry: &BlockRegistry, root: &Path) -> io::Result<[u8; 32]> {
     hasher.update(modified.as_nanos().to_le_bytes());
     hasher.update(sources_digest(root)?);
     // The registry argument may be modified independently of facts.json.
-    hasher.update((registry.len() as u64).to_le_bytes());
-    let mut seen = std::collections::HashSet::new();
-    for index in 0..registry.len() {
-        let state = registry
-            .state(BlockStateId(index as u32))
-            .ok_or_else(|| invalid("missing registry state"))?;
-        hash_str(&mut hasher, &state.name);
-        let mut props: Vec<_> = state.properties.iter().collect();
-        props.sort_by_key(|(key, _)| *key);
-        hasher.update((props.len() as u32).to_le_bytes());
-        for (key, value) in props {
-            hash_str(&mut hasher, key);
-            hash_str(&mut hasher, value);
-        }
-        if seen.insert(state.name.as_str()) {
-            let default = registry
-                .default_state(&state.name)
-                .ok_or_else(|| invalid("missing default state"))?;
-            hasher.update(default.0.to_le_bytes());
-        }
-    }
+    hasher.update(registry.cache_identity());
     Ok(hasher.finalize().into())
 }
 
@@ -185,6 +165,7 @@ type Sources = (Vec<(PathBuf, u64, Option<SystemTime>)>, [u8; 32]);
 static SOURCES: Mutex<Vec<Sources>> = Mutex::new(Vec::new());
 
 fn sources_digest(root: &Path) -> io::Result<[u8; 32]> {
+    let immutable = crate::resource_cache::Cache::is_immutable_mod_root(root);
     let mut paths: Vec<PathBuf> = [
         "facts.json",
         "block-behaviours.json",
@@ -195,6 +176,10 @@ fn sources_digest(root: &Path) -> io::Result<[u8; 32]> {
     .iter()
     .map(|relative| root.join(relative))
     .collect();
+    if immutable {
+        paths.push(root.join("horizon-mod-content.stamp"));
+        paths.push(root.join(".horizon-derived/installed-mods-v1"));
+    }
     let mut fluids: Vec<PathBuf> = fs::read_dir(root.join("data/minecraft/tags/fluid"))?
         .map(|entry| entry.map(|entry| entry.path()))
         .collect::<io::Result<_>>()?;
@@ -213,8 +198,23 @@ fn sources_digest(root: &Path) -> io::Result<[u8; 32]> {
     }
     drop(known);
     let mut hasher = Sha256::new();
-    for path in &paths {
-        hash_file(&mut hasher, root, path)?;
+    if immutable {
+        hash_file(&mut hasher, root, &root.join("horizon-mod-content.stamp"))?;
+        for (path, len, modified) in &stamps {
+            let relative = path
+                .strip_prefix(root)
+                .map_err(|e| invalid(e.to_string()))?;
+            hash_str(&mut hasher, &relative.to_string_lossy());
+            hasher.update(len.to_le_bytes());
+            let nanos = modified
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_nanos());
+            hasher.update(nanos.to_le_bytes());
+        }
+    } else {
+        for path in &paths {
+            hash_file(&mut hasher, root, path)?;
+        }
     }
     let digest: [u8; 32] = hasher.finalize().into();
     SOURCES
@@ -692,6 +692,31 @@ impl Snapshot {
             growth: Default::default(),
         })
     }
+}
+
+pub(in crate::level) fn is_valid(registry: &BlockRegistry, root: &Path) -> bool {
+    let Some(dir) = DIR.get() else {
+        return false;
+    };
+    let Ok(mut file) = fs::File::open(dir.join(FILE_NAME)) else {
+        return false;
+    };
+    let Ok(len) = file.metadata().map(|m| m.len()) else {
+        return false;
+    };
+    if len < 76 || len > MAX_FILE_BYTES as u64 {
+        return false;
+    }
+    let mut header = [0u8; 44];
+    if io::Read::read_exact(&mut file, &mut header).is_err() {
+        return false;
+    }
+    let Ok(fingerprint) = fingerprint(registry, root) else {
+        return false;
+    };
+    &header[..8] == MAGIC
+        && u32::from_le_bytes(header[8..12].try_into().unwrap()) == VERSION
+        && header[12..44] == fingerprint
 }
 
 pub(super) fn load(registry: &BlockRegistry, root: &Path) -> Option<Behaviours> {

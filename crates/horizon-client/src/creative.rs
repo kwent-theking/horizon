@@ -67,6 +67,13 @@ pub struct Names {
 }
 impl Names {
     pub fn load(root: &Path) -> Self {
+        let cache = horizon_world::resource_cache::Cache::for_tree(root, "en-names-v1", &[]);
+        if let Some(map) = cache
+            .as_ref()
+            .and_then(|c| c.read_value::<HashMap<String, String>>())
+        {
+            return Self { map };
+        }
         let read = |namespace: &str| {
             fs::read(root.join(format!("assets/{namespace}/lang/en_us.json")))
                 .ok()
@@ -77,6 +84,9 @@ impl Names {
         // Content mods' names (docs/modpacks.md); none in a vanilla root.
         for namespace in crate::mod_content::namespaces(root) {
             map.extend(read(&namespace));
+        }
+        if let Some(cache) = cache {
+            let _ = cache.write_value(&map);
         }
         Self { map }
     }
@@ -1296,5 +1306,69 @@ mod tests {
         assert!(!Creative::tab_wants_hand(&b, false, (169.0, 140.0)));
         assert!(Creative::tab_wants_hand(&b, false, (170.0, 140.0)));
         assert!(!Creative::tab_wants_hand(&b, false, (180.0, 132.0)));
+    }
+
+    #[test]
+    fn names_snapshot_hits_recovers_and_invalidates() {
+        let temp =
+            std::env::temp_dir().join(format!("horizon-en-names-cache-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp);
+        let lang_dir = temp.join("assets/minecraft/lang");
+        fs::create_dir_all(&lang_dir).unwrap();
+        fs::write(temp.join("horizon-mod-content.stamp"), "names-test-v1").unwrap();
+        let en_us = lang_dir.join("en_us.json");
+        fs::write(&en_us, r#"{"item.minecraft.stick":"Stick"}"#).unwrap();
+
+        let first = Names::load(&temp);
+        assert_eq!(
+            first.map.get("item.minecraft.stick").map(String::as_str),
+            Some("Stick")
+        );
+
+        let cache =
+            horizon_world::resource_cache::Cache::for_tree(&temp, "en-names-v1", &[]).unwrap();
+        let mut seeded = cache.read_value::<HashMap<String, String>>().unwrap();
+        seeded.insert("item.horizon.cached".into(), "Cached".into());
+        cache.write_value(&seeded).unwrap();
+        assert_eq!(
+            Names::load(&temp)
+                .map
+                .get("item.horizon.cached")
+                .map(String::as_str),
+            Some("Cached")
+        );
+
+        for entry in fs::read_dir(temp.join(".horizon-derived"))
+            .unwrap()
+            .flatten()
+        {
+            if entry.path().is_file() {
+                fs::write(entry.path(), b"corrupted").unwrap();
+            }
+        }
+        let recovered = Names::load(&temp);
+        assert_eq!(
+            recovered
+                .map
+                .get("item.minecraft.stick")
+                .map(String::as_str),
+            Some("Stick")
+        );
+        assert!(!recovered.map.contains_key("item.horizon.cached"));
+
+        fs::write(
+            &en_us,
+            r#"{"item.minecraft.stick":"Stick","item.minecraft.stone":"Stone"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            Names::load(&temp)
+                .map
+                .get("item.minecraft.stone")
+                .map(String::as_str),
+            Some("Stone")
+        );
+
+        let _ = fs::remove_dir_all(&temp);
     }
 }

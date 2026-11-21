@@ -302,12 +302,19 @@ pub fn find(dir: &Path, pins: &Pins) -> Result<Found, String> {
     })
 }
 
+const NOT_FOUND_TEXT: &str = " was not found. Horizon looked in:";
+
+/// Whether `error` is the one `not_found` builds (a sign-in can fix only this one).
+pub fn is_not_found(error: &str) -> bool {
+    error.starts_with("Minecraft ") && error.contains(NOT_FOUND_TEXT)
+}
+
 /// The error when no folder has the pinned version: every folder looked in with what it
 /// lacks, and what the player can do about it (#419, #693). When the chosen folder is inside a
 /// launcher Horizon knows, the advice names it: a Prism or MultiMC instance downloads the game
 /// only when it is launched once.
 pub fn not_found(version: &str, checked: &[(PathBuf, String)], chosen: &Path) -> String {
-    let mut text = format!("Minecraft {version} was not found. Horizon looked in:");
+    let mut text = format!("Minecraft {version}{NOT_FOUND_TEXT}");
     for (dir, missing) in checked {
         text += &format!("\n  {} ({missing})", dir.display());
     }
