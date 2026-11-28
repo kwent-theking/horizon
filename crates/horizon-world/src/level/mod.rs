@@ -540,6 +540,10 @@ impl Behaviours {
     pub fn set_cache_dir(dir: std::path::PathBuf) {
         data::set_cache_dir(dir);
     }
+    /// Whether the cached behaviour snapshot already matches `registry` and `resources_dir`.
+    pub fn is_cached(registry: &BlockRegistry, resources_dir: &Path) -> bool {
+        data::is_cached(registry, resources_dir)
+    }
     pub fn facts(&self, state: BlockStateId) -> &StateFacts {
         &self.facts[state.0 as usize]
     }

@@ -132,7 +132,7 @@ struct Env {
     grass: Vec<i32>,
     local_time: String,
     bundle_weight: bool,
-    prototypes: BTreeMap<String, Components>,
+    prototypes: ItemPrototypes,
 }
 impl ItemEnv for Env {
     fn grass_color(&self, temperature: f64, downfall: f64) -> i32 {
@@ -145,7 +145,11 @@ impl ItemEnv for Env {
     fn local_time(&self, _: &str, _: &str, _: Option<&str>) -> String {
         self.local_time.clone()
     }
-    fn bundle_fullness(&self, stack: &StackView, components: &Components) -> f32 {
+    fn bundle_fullness_from_view(
+        &self,
+        stack: &StackView,
+        components: &StackComponents<'_>,
+    ) -> f32 {
         // Sum of count / max stack size over the contents, as a double fraction.
         let Some(items) = components
             .get("minecraft:bundle_contents")
@@ -160,8 +164,7 @@ impl ItemEnv for Env {
             let count = item["count"].as_i64().unwrap_or(1) as f64;
             let max = self
                 .prototypes
-                .get(id)
-                .and_then(|c| c.get("minecraft:max_stack_size"))
+                .get(id, "minecraft:max_stack_size")
                 .and_then(Value::as_i64)
                 .unwrap_or(1) as f64;
             total += count / max;
@@ -178,7 +181,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let raw: BTreeMap<String, Components> = serde_json::from_slice(&fs::read(prototypes_path)?)?;
     let mut models = ItemModels {
-        prototypes: raw,
+        prototypes: raw.into(),
         ..Default::default()
     };
     writeln!(

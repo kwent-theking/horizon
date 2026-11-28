@@ -221,6 +221,25 @@ fn panic_text(payload: &(dyn std::any::Any + Send)) -> &str {
         .unwrap_or("Box<dyn Any>")
 }
 
+/// Loads the game's own menu bundle beside the content root build, so the
+/// window can show the start's progress instead of nothing for the minutes a
+/// mods' first build takes. Only with mods: without them the loader reads the
+/// same root and would build the same caches at once.
+fn spawn_boot_ui(sender: std::sync::mpsc::Sender<LoaderMsg>, vanilla_root: &std::path::Path, cap: u32) {
+    let root = vanilla_root.to_path_buf();
+    let spawned = std::thread::Builder::new()
+        .name("boot-ui".into())
+        .spawn(move || match UiResources::load_with_cap(&root, &root, cap) {
+            Ok(ui) => {
+                let _ = sender.send(LoaderMsg::BootUi(ui));
+            }
+            Err(e) => log::warn!("Horizon: no loading screen until the mods are ready: {e}"),
+        });
+    if let Err(e) = spawned {
+        log::warn!("Horizon: no loading screen until the mods are ready: {e}");
+    }
+}
+
 /// Each generation has its own channel and progress. Pack changes wait for the
 /// old tail before starting another generation, including cache/global writes.
 pub(super) fn spawn_loader(
@@ -238,6 +257,10 @@ pub(super) fn spawn_loader(
     let handle = std::thread::Builder::new()
         .name("resource-loader".into())
         .spawn(move || {
+            horizon_client::boot_progress::begin(horizon_client::boot_progress::Step::ModList, 0);
+            if mods::has_content_mods(&dev_mods) {
+                spawn_boot_ui(sender.clone(), &vanilla_root, settings.horizon.mod_texture_cap);
+            }
             let mut pack_error = None;
             let root = packs::startup_root(&vanilla_root, &settings.resource_packs, &[])
                 .unwrap_or_else(|error| {
@@ -273,6 +296,7 @@ impl Loading {
         if self.loaded.is_none() && !self.delivered {
             loop {
                 match self.receiver.try_recv() {
+                    Ok(LoaderMsg::BootUi(gui)) => self.set_boot_ui(gui),
                     Ok(LoaderMsg::Ui(gui, root)) => self.set_ui(gui, root),
                     Ok(LoaderMsg::Done(result)) => {
                         self.loaded = Some(result);
@@ -658,12 +682,23 @@ impl Loading {
     }
 
     pub(super) fn draw_menu(&mut self, batch: &mut HudBatch) {
-        let Some(gui) = &self.gui else { return };
+        let Some(gui) = &self.gui else {
+            // A mods' content root is still being built: show how far the start is.
+            if let Some(boot) = &self.boot_gui {
+                horizon_client::level_loading::draw_progress(
+                    batch,
+                    &boot.atlas,
+                    &self.progress.line(),
+                    self.progress.fraction(),
+                );
+            }
+            return;
+        };
         if self.menu.pending.is_some() {
             horizon_client::level_loading::draw_progress(
                 batch,
                 &gui.atlas,
-                self.progress.line(),
+                &self.progress.line(),
                 self.progress.fraction(),
             );
         } else if let Some((win, frame)) = &mut self.menu.win {
@@ -687,6 +722,13 @@ impl Loading {
                 batch,
                 self.menu.cursor,
                 self.settings.file.bool("hideSplashTexts"),
+            );
+            // The title is up while the rest still loads behind it.
+            horizon_client::level_loading::draw_progress_strip(
+                batch,
+                &gui.atlas,
+                &self.progress.line(),
+                self.progress.fraction(),
             );
         }
     }
@@ -749,6 +791,7 @@ mod tests {
             window: None,
             renderer: None,
             gui: None,
+            boot_gui: None,
             settings: Settings::default(),
             fullscreen: horizon_client::window::FullscreenState::new(false),
             options: None,

@@ -5,6 +5,7 @@ use horizon_client::{containers::BlockEntity, save, text::Text};
 use horizon_core::random::{LegacyRandom, RandomSource};
 use horizon_world::{
     compression::Compression,
+    content_view,
     nbt::{self, Limits, Tag},
     registry::BlockStateId,
     worldgen::structure::{Mirror, Rotation, StateTransforms, StructureTemplate},
@@ -48,7 +49,7 @@ impl Game<'_> {
         ];
         let transforms = self.state_transforms()?;
         for file in candidates {
-            let Ok(bytes) = std::fs::read(&file) else {
+            let Ok(bytes) = content_view::read(&file) else {
                 continue;
             };
             let Ok(raw) = Compression::Gzip.decode(&bytes, 1 << 28) else {

@@ -29,20 +29,34 @@ pub(super) struct ChunkFormat {
     has_skylight: bool,
     biome_map: Vec<u16>,
     biome_bits: u8,
+    /// Server state id to local state id (`server_states`); empty = the
+    /// server numbers states as we do.
+    block_map: &'static [u32],
 }
 
 impl ChunkFormat {
-    pub(super) fn new(dimension: &DimensionType, biome_map: Vec<u16>, biome_bits: u8) -> Self {
+    pub(super) fn new(
+        dimension: &DimensionType,
+        biome_map: Vec<u16>,
+        biome_bits: u8,
+        block_map: &'static [u32],
+    ) -> Self {
         Self {
             min_y: dimension.min_y,
             sections: dimension.sections(),
             has_skylight: dimension.has_skylight,
             biome_map,
             biome_bits,
+            block_map,
         }
     }
     pub(super) fn with_dimension(&self, dimension: &DimensionType) -> Self {
-        Self::new(dimension, self.biome_map.clone(), self.biome_bits)
+        Self::new(
+            dimension,
+            self.biome_map.clone(),
+            self.biome_bits,
+            self.block_map,
+        )
     }
 
     /// LevelChunkSection data into the client's fixed -64..320 column.
@@ -95,13 +109,25 @@ impl ChunkFormat {
                 let mut values = [0u32; 4096];
                 blocks.unpack(&mut values);
                 let limit = 1u64 << ours.global_bits;
-                let changed = values.iter().any(|&v| u64::from(v) >= limit);
-                if changed || strategy.global_bits != ours.global_bits {
+                let mut changed = false;
+                if self.block_map.is_empty() {
                     for v in &mut values {
                         if u64::from(*v) >= limit {
                             *v = 0;
+                            changed = true;
                         }
                     }
+                } else {
+                    // A modded 767 host: its ids through the oracle's table.
+                    for v in &mut values {
+                        let local = self.block_map.get(*v as usize).copied().unwrap_or(0);
+                        if local != *v {
+                            *v = local;
+                            changed = true;
+                        }
+                    }
+                }
+                if changed || strategy.global_bits != ours.global_bits {
                     blocks = PalettedContainer::from_values(ours, &values);
                 }
             }
@@ -236,7 +262,11 @@ impl Game<'_> {
     ) {
         // ClientChunkCache.replaceWithPacketData: a column outside the
         // storage around the view centre is ignored.
-        if !self.remote_chunk_in_range(p.x, p.z) {
+        let is_backing = self
+            .remote
+            .as_ref()
+            .is_some_and(|r| r.sublevels.is_backing_column(p.x, p.z));
+        if !is_backing && !self.remote_chunk_in_range(p.x, p.z) {
             log::warn!(
                 "Ignoring chunk since it's not in the view range: {}, {}",
                 p.x,
@@ -259,9 +289,49 @@ impl Game<'_> {
             }
         };
         let (x, z) = (p.x, p.z);
+        let tags = p.chunk.block_entities.iter().map(|info| {
+            let pos = [
+                x * 16 + i32::from(info.packed_xz as u8 >> 4),
+                i32::from(info.y),
+                z * 16 + i32::from(info.packed_xz as u8 & 15),
+            ];
+            (pos, (info.kind, info.tag.clone()))
+        });
+        let Some(remote) = self.remote.as_mut() else {
+            return;
+        };
+        let Some(chunk) = remote.sublevels.route_column(chunk, tags) else {
+            return;
+        };
         self.streaming.insert_remote(&mut self.world, chunk);
         self.world
             .block_entities
+            .retain(|k, _| (k.0 >> 4, k.2 >> 4) != (x, z));
+        self.world
+            .kinetic_speeds
+            .retain(|k, _| (k.0 >> 4, k.2 >> 4) != (x, z));
+        self.world
+            .kinetic_held_angles
+            .retain(|k, _| (k.0 >> 4, k.2 >> 4) != (x, z));
+        self.world
+            .kinetic_dials
+            .retain(|k, _| (k.0 >> 4, k.2 >> 4) != (x, z));
+        self.world
+            .kinetic_machines
+            .retain(|k, _| (k.0 >> 4, k.2 >> 4) != (x, z));
+        self.world
+            .kinetic_arms
+            .retain(|k, _| (k.0 >> 4, k.2 >> 4) != (x, z));
+        self.world
+            .retain_create_visuals(|cx, cz| (cx, cz) != (x, z));
+        self.world
+            .kinetic_aux
+            .retain(|k, _| (k.0 >> 4, k.2 >> 4) != (x, z));
+        self.world
+            .kinetic_logistics
+            .retain(|k, _| (k.0 >> 4, k.2 >> 4) != (x, z));
+        self.world
+            .kinetic_contraptions
             .retain(|k, _| (k.0 >> 4, k.2 >> 4) != (x, z));
         for info in &p.chunk.block_entities {
             let pos = (
@@ -278,9 +348,18 @@ impl Game<'_> {
 
     /// `handleLightUpdatePacket`: the sections it names take its light.
     pub(super) fn remote_light_update(&mut self, p: &play::LightUpdate) {
-        let Some(format) = self.remote.as_ref().map(|r| r.chunk_format.clone()) else {
+        let Some(r) = self.remote.as_mut() else {
             return;
         };
+        let format = &r.chunk_format;
+        if r.sublevels.is_backing_column(p.x, p.z) {
+            let (layers, _) = format.light(&p.light);
+            r.sublevels.update_light(p.x, p.z, |chunk| {
+                !horizon_client::light::update_light_layers(chunk, &layers, format.has_skylight)
+                    .is_empty()
+            });
+            return;
+        }
         if !self.world.chunks.contains_key(&(p.x, p.z)) {
             return;
         }
@@ -335,7 +414,7 @@ mod tests {
     #[test]
     fn the_decoder_returns_columns_in_order() {
         let overworld = DimensionType::vanilla("minecraft:overworld");
-        let format = Arc::new(ChunkFormat::new(&overworld, vec![0, 7, 9], 2));
+        let format = Arc::new(ChunkFormat::new(&overworld, vec![0, 7, 9], 2, &[]));
         let decoder = ChunkDecoder::new();
         for x in 0..20 {
             assert!(decoder.submit(format.clone(), packet(x, 1 + x)).is_none());

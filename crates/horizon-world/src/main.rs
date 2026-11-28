@@ -1,12 +1,11 @@
 use horizon_core::position::BlockPos;
 use horizon_world::{
-    chunk::{BlockState, ChunkData},
+    chunk::{BlockProperties, BlockState, ChunkData},
     compression::Compression,
     nbt::{self, Limits},
     region::{ChunkRecord, RegionFile, RegionWriter},
 };
 use std::{
-    collections::BTreeMap,
     error::Error,
     fs::{File, OpenOptions},
     io::{Read, Write},
@@ -141,14 +140,14 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
                 .block(block)?
                 .ok_or("section has no block-state data")?;
             print!("{}", state.name);
-            for (name, value) in state.properties {
+            for (name, value) in &state.properties {
                 print!(" {name}={value}");
             }
             println!();
         }
         "edit-block-data" if args.len() >= 7 => {
             let block = BlockPos::new(args[3].parse()?, args[4].parse()?, args[5].parse()?);
-            let mut properties = BTreeMap::new();
+            let mut properties = BlockProperties::default();
             for arg in &args[7..] {
                 let (key, value) = arg.split_once('=').ok_or("expected property=value")?;
                 if key.is_empty()

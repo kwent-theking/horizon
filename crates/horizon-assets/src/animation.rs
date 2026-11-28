@@ -133,7 +133,7 @@ impl AnimationMetadata {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct AnimationClip {
     sequence: Vec<(u32, u32)>,
     ends: Vec<u64>,
@@ -153,6 +153,27 @@ pub struct AnimationSample {
     pub interpolation_millis: u32,
 }
 impl AnimationClip {
+    /// Check persisted timing before modulo/indexing in sample().
+    pub fn valid(&self, frames: usize) -> bool {
+        if self.sequence.is_empty() || self.sequence.len() != self.ends.len() {
+            return false;
+        }
+        let mut end = 0u64;
+        for ((frame, time), expected) in self.sequence.iter().zip(&self.ends) {
+            if *frame as usize >= frames || *time == 0 {
+                return false;
+            }
+            let Some(next) = end.checked_add(u64::from(*time)) else {
+                return false;
+            };
+            end = next;
+            if end != *expected {
+                return false;
+            }
+        }
+        end == self.duration
+    }
+
     pub fn sequence(&self) -> &[(u32, u32)] {
         &self.sequence
     }

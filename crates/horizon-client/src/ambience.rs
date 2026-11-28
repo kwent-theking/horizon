@@ -5,8 +5,9 @@
 //! `UnderLiquidAmbientSoundInstance` loop), played through the sound engine.
 use crate::sound_engine::{AMBIENT, InstanceId, PLAYERS, SoundEngine, SoundInstance, Sounds};
 use horizon_core::random::{LegacyRandom, RandomSource};
+use horizon_world::content_view;
 use serde_json::Value;
-use std::{collections::HashMap, fs, path::Path};
+use std::{collections::HashMap, path::Path};
 
 /// `AmbientMoodSettings`.
 #[derive(Clone, Debug, PartialEq)]
@@ -54,15 +55,16 @@ pub struct AmbientTables {
 impl AmbientTables {
     pub fn load(root: &Path) -> Self {
         let read = |dir: &str| -> HashMap<String, AmbientSounds> {
-            let Ok(entries) = fs::read_dir(root.join("data/minecraft").join(dir)) else {
+            let Ok(entries) = content_view::read_dir(root.join("data/minecraft").join(dir)) else {
                 return HashMap::new();
             };
             entries
-                .flatten()
+                .into_iter()
                 .filter_map(|e| {
                     let path = e.path();
                     let name = path.file_stem()?.to_str()?.to_owned();
-                    let json: Value = serde_json::from_slice(&fs::read(&path).ok()?).ok()?;
+                    let json: Value =
+                        serde_json::from_slice(&content_view::read(&path).ok()?).ok()?;
                     let v = &json["attributes"]["minecraft:audio/ambient_sounds"];
                     (!v.is_null()).then(|| (format!("minecraft:{name}"), AmbientSounds::parse(v)))
                 })

@@ -1,5 +1,6 @@
 //! Cuboid geometry in block units, including blockstate rotation and UV locking.
 use crate::{json::*, model::*, resolve::ResolvedCuboidModel};
+mod obj;
 mod transform;
 pub use transform::BlockModelTransform;
 
@@ -211,6 +212,12 @@ fn bake_elements(
             )?);
         }
     }
+    output.extend(
+        model
+            .obj_quads()
+            .iter()
+            .map(|draw| obj::bake_obj_quad(draw, transform)),
+    );
     Ok(output)
 }
 /// `FaceBakery.bakeQuad` for a quad with explicit corners and unit-atlas UVs

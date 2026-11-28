@@ -64,6 +64,25 @@ public final class FactsExporter {
 
     private void started(ServerStartedEvent event) {
         MinecraftServer server = event.getServer();
+        String stateIds = System.getProperty("horizon.oracle.stateids");
+        if (stateIds != null) {
+            try {
+                StateIds.write(Path.of(stateIds));
+            } catch (Throwable e) {
+                fail(e);
+            }
+            System.out.println("horizon-oracle: wrote state ids to " + stateIds);
+            // Apart, so a codec the describer chokes on can't cost the state ids.
+            try {
+                Path codecs = StateIds.sibling(Path.of(stateIds), "codecs");
+                CodecTrees.write(codecs, server.registryAccess());
+                System.out.println("horizon-oracle: wrote codec trees to " + codecs);
+            } catch (Throwable e) {
+                e.printStackTrace();
+            }
+            server.halt(false);
+            return;
+        }
         Path out = Path.of(System.getProperty("horizon.oracle.out", "horizon-oracle.json"));
         Set<String> namespaces =
                 new TreeSet<>(Arrays.asList(System.getProperty("horizon.oracle.namespaces", "").split(",")));
@@ -72,11 +91,21 @@ public final class FactsExporter {
                 JsonWriter json = new JsonWriter(w)) {
             new Export(server, namespaces, json).run();
         } catch (Throwable e) {
-            e.printStackTrace();
-            System.exit(3);
+            fail(e);
         }
         System.out.println("horizon-oracle: wrote " + out);
         server.halt(false);
+    }
+
+    /**
+     * Ends the JVM at once with status 3. Not System.exit: its shutdown hook waits for the
+     * server thread, which is this one, so the server would hang until the caller's timeout.
+     */
+    private static void fail(Throwable e) {
+        e.printStackTrace();
+        System.out.flush();
+        System.err.flush();
+        Runtime.getRuntime().halt(3);
     }
 
     private static final class Export {
@@ -191,10 +220,15 @@ public final class FactsExporter {
                     json.name("map_color").value(color.col);
                     json.name("map_color_id").value(color.id);
                     sound(state.getSoundType(level, FLOOR.above(), null));
-                    json.name("outline");
-                    boxes(state.getShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO));
-                    json.name("collision");
-                    boxes(state.getCollisionShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO));
+                    VoxelShape outline = state.getShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO);
+                    VoxelShape collision = state.getCollisionShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO);
+                    List<AABB> outlineBoxes = outline.toAabbs();
+                    List<AABB> collisionBoxes = collision.toAabbs();
+                    NeighbourShapes.boxes(json.name("outline"), outlineBoxes);
+                    NeighbourShapes.boxes(json.name("collision"), collisionBoxes);
+                    if (mod && !id.getNamespace().equals("minecraft")) {
+                        NeighbourShapes.write(json, state, level, outline, collision, outlineBoxes, collisionBoxes);
+                    }
                     if (mod && lootSample(block, state)) drops(state);
                     json.endObject();
                 }
@@ -216,21 +250,35 @@ public final class FactsExporter {
             return differ <= 1;
         }
 
+        /**
+         * The drops per tool, all computed before any is written. A block whose loot needs
+         * more than this context has (CBC's built-up cannons read the block entity) records
+         * the exception's class as drops_error instead, so it can't end the export.
+         */
         void drops(BlockState state) throws IOException {
+            List<Map<String, Integer>> perTool = new ArrayList<>();
+            try {
+                for (ItemStack tool : tools) {
+                    LootParams.Builder params =
+                            new LootParams.Builder(level)
+                                    .withParameter(LootContextParams.ORIGIN, Vec3.atCenterOf(FLOOR.above()))
+                                    .withParameter(LootContextParams.TOOL, tool.copy());
+                    Map<String, Integer> counts = new TreeMap<>();
+                    for (ItemStack s : state.getDrops(params)) {
+                        counts.merge(BuiltInRegistries.ITEM.getKey(s.getItem()).toString(), s.getCount(), Integer::sum);
+                    }
+                    perTool.add(counts);
+                }
+            } catch (RuntimeException e) {
+                json.name("drops_error").value(e.getClass().getName());
+                return;
+            }
             json.name("drops");
             json.beginObject();
-            for (int i = 0; i < tools.size(); i++) {
-                LootParams.Builder params =
-                        new LootParams.Builder(level)
-                                .withParameter(LootContextParams.ORIGIN, Vec3.atCenterOf(FLOOR.above()))
-                                .withParameter(LootContextParams.TOOL, tools.get(i).copy());
-                Map<String, Integer> counts = new TreeMap<>();
-                for (ItemStack s : state.getDrops(params)) {
-                    counts.merge(BuiltInRegistries.ITEM.getKey(s.getItem()).toString(), s.getCount(), Integer::sum);
-                }
+            for (int i = 0; i < perTool.size(); i++) {
                 json.name(toolNames.get(i));
                 json.beginObject();
-                for (Map.Entry<String, Integer> e : counts.entrySet()) json.name(e.getKey()).value(e.getValue());
+                for (Map.Entry<String, Integer> e : perTool.get(i).entrySet()) json.name(e.getKey()).value(e.getValue());
                 json.endObject();
             }
             json.endObject();
@@ -313,16 +361,6 @@ public final class FactsExporter {
             json.name(name).value(e.getLocation().toString());
         }
 
-        void boxes(VoxelShape shape) throws IOException {
-            json.beginArray();
-            for (AABB b : shape.toAabbs()) {
-                json.beginArray();
-                json.value(b.minX).value(b.minY).value(b.minZ).value(b.maxX).value(b.maxY).value(b.maxZ);
-                json.endArray();
-            }
-            json.endArray();
-        }
-
         void items() throws IOException {
             json.name("items");
             json.beginObject();
@@ -357,18 +395,41 @@ public final class FactsExporter {
             for (RecipeHolder<?> holder : server.getRecipeManager().getRecipes()) {
                 if (!ours(holder.id())) continue;
                 var recipe = holder.value();
+                // Everything is read before anything is written: a mod's recipe whose type,
+                // serializer or result is not registered (or that throws) records only an error.
+                String type, serializer, result;
+                int count;
+                List<Set<String>> ingredients = new ArrayList<>();
+                try {
+                    type = key(BuiltInRegistries.RECIPE_TYPE, recipe.getType());
+                    serializer = key(BuiltInRegistries.RECIPE_SERIALIZER, recipe.getSerializer());
+                    ItemStack stack = recipe.getResultItem(server.registryAccess());
+                    result = key(BuiltInRegistries.ITEM, stack.getItem());
+                    count = stack.getCount();
+                    for (Ingredient ing : recipe.getIngredients()) {
+                        Set<String> ids = new TreeSet<>();
+                        for (ItemStack s : ing.getItems()) {
+                            String id = key(BuiltInRegistries.ITEM, s.getItem());
+                            if (id != null) ids.add(id);
+                        }
+                        ingredients.add(ids);
+                    }
+                } catch (RuntimeException e) {
+                    json.name(holder.id().toString());
+                    json.beginObject();
+                    json.name("error").value(e.getClass().getName());
+                    json.endObject();
+                    continue;
+                }
                 json.name(holder.id().toString());
                 json.beginObject();
-                json.name("type").value(BuiltInRegistries.RECIPE_TYPE.getKey(recipe.getType()).toString());
-                json.name("serializer").value(BuiltInRegistries.RECIPE_SERIALIZER.getKey(recipe.getSerializer()).toString());
-                ItemStack result = recipe.getResultItem(server.registryAccess());
-                json.name("result").value(BuiltInRegistries.ITEM.getKey(result.getItem()).toString());
-                json.name("count").value(result.getCount());
+                json.name("type").value(type);
+                json.name("serializer").value(serializer);
+                json.name("result").value(result);
+                json.name("count").value(count);
                 json.name("ingredients");
                 json.beginArray();
-                for (Ingredient ing : recipe.getIngredients()) {
-                    Set<String> ids = new TreeSet<>();
-                    for (ItemStack s : ing.getItems()) ids.add(BuiltInRegistries.ITEM.getKey(s.getItem()).toString());
+                for (Set<String> ids : ingredients) {
                     json.beginArray();
                     for (String i : ids) json.value(i);
                     json.endArray();
@@ -377,6 +438,12 @@ public final class FactsExporter {
                 json.endObject();
             }
             json.endObject();
+        }
+
+        /** A registry id, or null when the value is not registered (a mod's own unregistered type). */
+        static <T> String key(net.minecraft.core.Registry<T> registry, T value) {
+            ResourceLocation id = registry.getKey(value);
+            return id == null ? null : id.toString();
         }
 
         /** Tags that hold one of our ids, with only those members; and every `c` tag, whole. */

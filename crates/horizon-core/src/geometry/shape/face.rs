@@ -16,6 +16,17 @@ impl VoxelShape {
             .get_or_init(|| self.calculate_face(direction))
             .clone()
     }
+
+    /// Project one face for a caller that retains the result itself.
+    pub fn project_face(&self, direction: Direction) -> Result<Self, ShapeError> {
+        let (axis, _) = face_axis(direction);
+        if self.is_empty() || self.cube_like_along(axis) {
+            Ok(self.clone())
+        } else {
+            self.calculate_face(direction)
+        }
+    }
+
     fn cube_like_along(&self, axis: Axis) -> bool {
         let coords = self.coordinates(axis);
         coords.len() == 2
@@ -102,6 +113,26 @@ fn face_axis(direction: Direction) -> (Axis, bool) {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn uncached_projections_keep_canonical_and_source_aliases() {
+        let shape = VoxelShape::from_cube([2, 1, 1], &[true, false]).unwrap();
+        assert!(
+            shape
+                .project_face(Direction::Down)
+                .unwrap()
+                .same_identity(&shape)
+        );
+        assert!(shape.project_face(Direction::West).unwrap().is_block());
+        assert!(
+            shape
+                .project_face(Direction::East)
+                .unwrap()
+                .same_identity(&VoxelShape::empty())
+        );
+        assert!(shape.identity.faces.get().is_none());
+    }
+
     #[test]
     fn face_cache_is_lazy_shared_and_does_not_retain_parent() {
         let shape = VoxelShape::from_cube(
@@ -109,9 +140,13 @@ mod tests {
             &[true, false, false, false, false, false, false, false],
         )
         .unwrap();
+        let mut projected = shape.project_face(Direction::Down).unwrap();
         assert!(shape.identity.faces.get().is_none());
         let weak = Arc::downgrade(&shape.identity);
         let face = shape.face_shape(Direction::Down).unwrap();
+        assert!(projected.share_grid(&face));
+        assert_eq!(projected.discrete_bounds(), face.discrete_bounds());
+        assert_eq!(projected.bounds(), face.bounds());
         assert!(!face.same_identity(&shape));
         assert!(face.same_identity(&shape.clone().face_shape(Direction::Down).unwrap()));
         assert!(shape.fresh_identity().identity.faces.get().is_none());

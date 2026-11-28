@@ -1,0 +1,1185 @@
+name: Horizon live stand (CI)
+# A real NeoForge 21.1.265 server (Create, Create Big Cannons, Ritchie's Projectile Lib, loginbypass)
+# and a real Horizon client on one runner: software Vulkan (lavapipe) under Xvfb, sound into a
+# PulseAudio null sink recorded to WAV. Screenshots, status, logs and the WAV are encrypted to a
+# throwaway certificate (the fork is public); only a summary of booleans and counts is printed.
+on:
+  push:
+    branches: [ci/proto-d]
+jobs:
+  automation:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Test the stand automation
+        run: |
+          python3 -I -S -B - <<'PY'
+          import base64
+          import json
+          import os
+          from pathlib import Path
+          import zlib
+
+          sources = json.loads(zlib.decompress(base64.b64decode("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")))
+          directory = Path(os.environ["RUNNER_TEMP"], "horizon-stand-automation")
+          directory.mkdir()
+          for name, source in sources.items():
+              (directory / name).write_text(source, encoding="utf-8")
+          PY
+          python3 -I -S -B "$RUNNER_TEMP/horizon-stand-automation/test_stand_ci_driver.py" -v
+  stand:
+    if: ${{ true }}
+    needs: automation
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include: [{"artifact": "stand-encrypted", "aeronautics": "0", "riders": "0", "bearing": "0", "steering": "0"}]
+    env:
+      STAND_AERONAUTICS: ${{ matrix.aeronautics }}
+      STAND_RIDERS: ${{ matrix.riders }}
+      STAND_BEARING: ${{ matrix.bearing }}
+      STAND_STEERING: ${{ matrix.steering }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libudev-dev pkg-config mesa-vulkan-drivers libvulkan1 \
+            xvfb pulseaudio pulseaudio-utils libasound2-plugins \
+            libxkbcommon-x11-0 libxkbcommon0 libx11-xcb1 libxcursor1 libxi6 libxrandr2
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Build Horizon
+        env:
+          CARGO_TERM_COLOR: never
+        run: |
+          cargo build --profile fast -p horizon-client --bin horizon-client --bin horizon-ctl
+          cargo build --profile fast -p horizon-prepare --bin horizon-prepare
+          cargo build --profile fast -p horizon-port-pack --bin horizon-port-pack
+      - name: Game files, as the official launcher installs them (sha1-checked)
+        run: |
+          python3 - <<'PY'
+          import concurrent.futures, hashlib, json, os, urllib.request
+          MC = os.path.expanduser("~/.minecraft")
+
+          def get(url, sha1=None, path=None):
+              for attempt in range(4):
+                  try:
+                      data = urllib.request.urlopen(url, timeout=120).read()
+                      break
+                  except OSError:
+                      if attempt == 3:
+                          raise
+              if sha1 and hashlib.sha1(data).hexdigest() != sha1:
+                  raise SystemExit(f"sha1 mismatch: {url}")
+              if path:
+                  os.makedirs(os.path.dirname(path), exist_ok=True)
+                  with open(path, "wb") as f:
+                      f.write(data)
+              return data
+
+          def allowed(rules):
+              if not rules:
+                  return True
+              ok = False
+              for rule in rules:
+                  osr = rule.get("os")
+                  if osr is None or osr.get("name") in (None, "linux"):
+                      if "features" not in rule:
+                          ok = rule["action"] == "allow"
+              return ok
+
+          # The version JSON Horizon's research lock pins (Mojang republishes the live one).
+          pinned = json.load(open("research-lock.json", encoding="utf-8"))["minecraft"]["manifest_sha1"]
+          raw = get(f"https://piston-meta.mojang.com/v1/packages/{pinned}/26.3.json", pinned,
+                    f"{MC}/versions/26.3/26.3.json")
+          version = json.loads(raw)
+          d = version["downloads"]
+          get(d["client"]["url"], d["client"]["sha1"], f"{MC}/versions/26.3/26.3.jar")
+          server = os.path.join(os.environ["RUNNER_TEMP"], "server-26.3.jar")
+          get(d["server"]["url"], d["server"]["sha1"], server)
+          jobs = []
+          for lib in version["libraries"]:
+              art = lib.get("downloads", {}).get("artifact")
+              if art and allowed(lib.get("rules")):
+                  jobs.append((art["url"], art["sha1"], f"{MC}/libraries/{art['path']}"))
+          ai = version["assetIndex"]
+          index = json.loads(get(ai["url"], ai["sha1"], f"{MC}/assets/indexes/{ai['id']}.json"))
+          for obj in index["objects"].values():
+              h = obj["hash"]
+              jobs.append((f"https://resources.download.minecraft.net/{h[:2]}/{h}", h, f"{MC}/assets/objects/{h[:2]}/{h}"))
+          with concurrent.futures.ThreadPoolExecutor(32) as pool:
+              list(pool.map(lambda j: get(*j), jobs))
+          with open(os.environ["GITHUB_ENV"], "a") as env:
+              env.write(f"HORIZON_SERVER_JAR={server}\n")
+          print(f"26.3: client, server, {len(jobs)} libraries and asset objects")
+          PY
+      - name: Prepare Minecraft 26.3 resources
+        run: |
+          start=$(date +%s)
+          if ! target/fast/horizon-prepare --prepare --root "$GITHUB_WORKSPACE" > "$RUNNER_TEMP/prepare.log" 2>&1; then
+            tail -40 "$RUNNER_TEMP/prepare.log"; exit 1
+          fi
+          echo "prepared in $(( $(date +%s) - start )) s"
+          # The sounds come from the launcher's asset objects, in a step of their own.
+          if ! target/fast/horizon-prepare sounds --root "$GITHUB_WORKSPACE" >> "$RUNNER_TEMP/prepare.log" 2>&1; then
+            tail -20 "$RUNNER_TEMP/prepare.log"; exit 1
+          fi
+          ls .local/horizon-client .local/horizon-client/26.3/assets | head -20
+      - name: Fetch the stand's mods (official releases, sha512-checked)
+        env:
+          LOGINBYPASS_JAR_B64: ${{ secrets.LOGINBYPASS_JAR_B64 }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/mods"
+          fetch() {
+            curl --fail --location --retry 4 --max-time 180 "$1" --output "$RUNNER_TEMP/mods/$2"
+            printf '%s  %s\n' "$3" "$RUNNER_TEMP/mods/$2" | sha512sum --check
+          }
+          fetch 'https://cdn.modrinth.com/data/LNytGWDc/versions/UjX6dr61/create-1.21.1-6.0.10.jar' \
+            create-1.21.1-6.0.10.jar 11cc8fc049d2f67f6548c7abfada6b82a3adb5c7ca410a742de04bbca76e03862c518721b88d806f6e6d768a4d68531fdb903a85859b25d1484d550cc7bafd4b
+          fetch 'https://cdn.modrinth.com/data/GWp4jCJj/versions/bOiDu0LS/createbigcannons-5.11.7%2Bmc.1.21.1.jar' \
+            createbigcannons-5.11.7.jar 24f414dfbb973a0f4d9c9b2aa059edc7bed4d23b4f39eb1f7d23a1d6b437e3b5d64cca6e4b85ff7eb2815743fa711d54ad652bffe96d1eb1234544716006440d
+          fetch 'https://cdn.modrinth.com/data/B3pb093D/versions/hZ6B2Z0x/ritchiesprojectilelib-2.1.2%2Bmc.1.21.1-neoforge.jar' \
+            ritchiesprojectilelib-2.1.2.jar 6d64c84505a5a8fbb96d106603065465c5a2314ec09636900c5c1a31014c12fa68f1a41e758313cbf0d6f95d9a1f53bd67339020f7d8db0e184c23f66aee0330
+          fetch 'https://cdn.modrinth.com/data/T9PomCSv/versions/fg9dTRz9/sable-neoforge-1.21.1-2.0.6.jar' \
+            sable-neoforge-1.21.1-2.0.6.jar 76d293ce751a01cb9c095a3659b0a41e03e005480bc9d76dfdc73ec7c2eabf7923740c7b077921d42616673c496cd5143569f2085ddcebe174fd91d81e2a04b8
+          if [ "$STAND_AERONAUTICS" = 1 ]; then
+            fetch 'https://cdn.modrinth.com/data/oWaK0Q19/versions/44pLdPGg/create-aeronautics-bundled-1.21.1-1.3.2.jar' \
+              aeronautics-bundle.jar dc7e8e1148fa442243889ba29412207137e1bb86206e6c92bc0a589f1374a466e93de22bdbf14f753984d86c29308fbbdc0f14a4b9618b14c0ac1666a36b46f5
+          fi
+          if [ -n "$LOGINBYPASS_JAR_B64" ]; then
+            printf '%s' "$LOGINBYPASS_JAR_B64" | base64 -d > "$RUNNER_TEMP/mods/loginbypass-1.0.9.jar"
+            printf '%s  %s\n' cedee1a81da564db5ef17accc81864ce1fd6c470319a41a3d16d9dadf803595421616f53a85f72c9c4a442ba1e4b803b9b893c91f141c73611dd9338be187507 \
+              "$RUNNER_TEMP/mods/loginbypass-1.0.9.jar" | sha512sum --check
+          else
+            echo "no loginbypass: NeoForge's negotiation will refuse the Horizon client (smoke still checks the rest)"
+          fi
+      - name: Carry client content mods (horizon-port-pack)
+        run: |
+          trap 'tail -40 "$RUNNER_TEMP/port.log"' ERR
+          mkdir -p "$RUNNER_TEMP/pack/mods" "$RUNNER_TEMP/game/horizon-mods"
+          cp "$RUNNER_TEMP"/mods/create-*.jar "$RUNNER_TEMP"/mods/createbigcannons-*.jar \
+             "$RUNNER_TEMP"/mods/ritchiesprojectilelib-*.jar "$RUNNER_TEMP/pack/mods/"
+          ids=(create createbigcannons)
+          if [ "$STAND_AERONAUTICS" = 1 ]; then
+            # NeoForge loads the bundle. The pack importer reads individual mod jars.
+            for id in aeronautics simulated offroad; do
+              unzip -p "$RUNNER_TEMP/mods/aeronautics-bundle.jar" \
+                "META-INF/jarjar/*.$id-neoforge-1.21.1-1.3.2.jar" > "$RUNNER_TEMP/pack/mods/$id.jar"
+              test -s "$RUNNER_TEMP/pack/mods/$id.jar"
+              ids+=("$id")
+            done
+          fi
+          pp=target/fast/horizon-port-pack
+          work="$RUNNER_TEMP/port"
+          $pp import "$RUNNER_TEMP/pack" "$work" > "$RUNNER_TEMP/port.log" 2>&1
+          $pp inventory "$work" >> "$RUNNER_TEMP/port.log" 2>&1
+          $pp fetch "$work" --from "$RUNNER_TEMP/pack/mods" "${ids[@]}" >> "$RUNNER_TEMP/port.log" 2>&1
+          start=$(date +%s)
+          if ! $pp carry "$work" --resources .local/horizon-client/26.3 "${ids[@]}" >> "$RUNNER_TEMP/port.log" 2>&1; then
+            tail -30 "$RUNNER_TEMP/port.log"; exit 1
+          fi
+          echo "carried in $(( $(date +%s) - start )) s"
+          # Each carried mod is a folder mod (horizon-mod.toml inside), which horizon-mods/ takes as is.
+          for id in "${ids[@]}"; do
+            cp -r "$work/mods/$id/carry" "$RUNNER_TEMP/game/horizon-mods/$id"
+            test -f "$RUNNER_TEMP/game/horizon-mods/$id/horizon-mod.toml"
+          done
+          ls -la "$RUNNER_TEMP/game/horizon-mods"
+      - name: NeoForge server and the oracle jar
+        env:
+          HORIZON_NEOFORGE: '21.1.265'
+        run: |
+          python3 - <<'PY'
+          import os, sys
+          sys.path.insert(0, "tools")
+          import neoforge_oracle as oracle
+          home = oracle.install()
+          jar = oracle.build(home)
+          with open(os.environ["GITHUB_ENV"], "a") as env:
+              env.write(f"NEOFORGE_HOME={home}\nORACLE_JAR={jar}\n")
+          print("neoforge home and oracle jar ready")
+          PY
+      - name: Display and sound
+        run: |
+          Xvfb :99 -screen 0 1600x900x24 > "$RUNNER_TEMP/xvfb.log" 2>&1 &
+          echo "DISPLAY=:99" >> "$GITHUB_ENV"
+          # The runtime dir first: PulseAudio puts its socket there, and the client looks there.
+          mkdir -m 700 -p "$RUNNER_TEMP/xdg"
+          export XDG_RUNTIME_DIR="$RUNNER_TEMP/xdg"
+          echo "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR" >> "$GITHUB_ENV"
+          pulseaudio --start --exit-idle-time=-1
+          pactl load-module module-null-sink sink_name=horizon sink_properties=device.description=horizon
+          pactl set-default-sink horizon
+          printf 'pcm.!default pulse\nctl.!default pulse\n' > ~/.asoundrc
+          pactl info | grep -E "Server Name|Default Sink"
+      - name: Live stand
+        timeout-minutes: 45
+        run: |
+          cat > "$RUNNER_TEMP/stand.py" <<'PY'
+          """The CI live stand's driver (embedded into stand-ci-template.yml by build-stand-ci.py).
+
+          Sets up the NeoForge server from $RUNNER_TEMP/mods, writes its state ids with the oracle, starts
+          it with a per-run RCON password (masked), starts Horizon offscreen under Xvfb, records the
+          PulseAudio null sink, joins, fires CBC's firing effects through RCON, and saves screenshots,
+          status JSON, logs and the WAV to $RUNNER_TEMP/out-plain (encrypted by the next step). Prints only
+          a summary of booleans and counts: the fork's logs are public.
+          """
+          import json
+          import math
+          import os
+          import re
+          import secrets
+          import shutil
+          import signal
+          import socket
+          import struct
+          import subprocess
+          import sys
+          import time
+          import wave
+          import zipfile
+
+          T = os.environ["RUNNER_TEMP"]
+          W = os.environ["GITHUB_WORKSPACE"]
+          HOME = os.environ["NEOFORGE_HOME"]
+          ORACLE = os.environ["ORACLE_JAR"]
+          OUT = os.path.join(T, "out-plain")
+          SERVER = os.path.join(T, "server")
+          GAME = os.path.join(T, "game")
+          STATES = os.path.join(T, "states", "server-states.tsv")
+          CLIENT = os.path.join(W, "target", "fast", "horizon-client")
+          CTL = os.path.join(W, "target", "fast", "horizon-ctl")
+          RES = os.path.join(W, ".local", "horizon-client", "26.3")
+          ARGS = "@libraries/net/neoforged/neoforge/21.1.265/unix_args.txt"
+          NAME = "tester"
+          PORT, RCON_PORT = 25566, 25575
+          os.makedirs(OUT, exist_ok=True)
+          os.makedirs(GAME, exist_ok=True)
+          summary = {"events": []}
+          started = time.monotonic()
+          procs = {}
+
+
+          def log(msg):
+              print(f"[{time.monotonic() - started:7.1f}s] {msg}", flush=True)
+
+
+          def mark(name):
+              """A timeline mark, to line the WAV up with what happened."""
+              summary["events"].append([name, round(time.monotonic() - summary.get("audio_t0", started), 2)])
+
+
+          def ctl(*args, timeout=15):
+              r = subprocess.run([CTL, "--timeout", str(timeout), *args], cwd=GAME, capture_output=True,
+                                 text=True, errors="replace", timeout=timeout + 30)
+              return r.returncode, r.stdout.strip(), r.stderr.strip()
+
+
+          def save(name, text):
+              with open(os.path.join(OUT, name), "w", encoding="utf-8") as f:
+                  f.write(text)
+
+
+          def status(name):
+              rc, out, _ = ctl("status", timeout=10)
+              save(name, out)
+              try:
+                  return json.loads(out)
+              except ValueError:
+                  return {}
+
+
+          def check_bearing_assembly(rcon, bx, by, bz):
+              """Capture the pinned server's vanilla NBT when a real bearing assembles."""
+              x, y, z = bx - 4, by, bz + 3
+              pos = f"{x} {y} {z}"
+              rotor = f"{x} {y} {z-1}"
+              adjacent_sail = f"{x+1} {y} {z-1}"
+              entity = "@e[type=aeronautics:propeller_bearing_contraption,limit=1]"
+              initially_clear = entity_uuid(rcon, f"data get entity {entity} UUID") is None
+              rcon.cmd(f"setblock {pos} aeronautics:propeller_bearing[facing=north]")
+              # This bearing needs at least two blocks that count as sails.
+              rcon.cmd(f"fill {rotor} {adjacent_sail} create:white_sail[facing=north]")
+              rotor_present = rcon.cmd(f"execute if block {rotor} create:white_sail "
+                                       f"if block {adjacent_sail} create:white_sail").strip() == "Test passed"
+              rcon.cmd(f"setblock {x} {y} {z+1} create:shaft[axis=z]")
+              rcon.cmd(f"setblock {x} {y} {z+2} create:creative_motor[facing=north]")
+              rcon.cmd(f"clear {NAME}")
+              rcon.cmd(f"tp {NAME} {x+2.5} {y} {z+0.5}")
+              time.sleep(1)
+              before = rcon.cmd(f"data get block {pos}")
+              spawned = entity_uuid(rcon, f"data get entity {entity} UUID") is not None
+              ctl("look-at-block", str(x), str(y), str(z), "east", timeout=10)
+              target = status("status-before-bearing.json").get("target")
+              aimed = isinstance(target, dict) and target.get("pos") == [x, y, z]
+              clicked = not spawned and aimed and ctl("mouse", "right", "click", timeout=10)[0] == 0
+              after = before
+              if clicked:
+                  deadline = time.monotonic() + 6
+                  while time.monotonic() < deadline:
+                      after = rcon.cmd(f"data get block {pos}")
+                      if entity_uuid(rcon, f"data get entity {entity} UUID") is not None:
+                          spawned = True
+                          break
+                      time.sleep(0.2)
+              if spawned:
+                  rcon.cmd(f"data get entity {entity}")
+              assembled = (initially_clear and rotor_present and spawned
+                           and rcon.cmd(f"execute if block {rotor} minecraft:air "
+                                        f"if block {adjacent_sail} minecraft:air").strip() == "Test passed")
+              save("bearing-block-before.txt", before)
+              save("bearing-block-after.txt", after)
+              shots("07-bearing-assembly", [0.2])
+              summary["bearing_assembly"] = {"aimed": aimed, "clicked": clicked, "spawned": spawned,
+                                             "rotor_transferred": assembled}
+              # The bearing and its source are separate from the later raft fixture.
+              rcon.cmd(f"setblock {pos} minecraft:air")
+              rcon.cmd(f"kill {entity}")
+              rcon.cmd(f"fill {x} {y} {z-1} {x+1} {y} {z+2} minecraft:air")
+
+
+          def steering_target_angle(rcon, pos):
+              reply = rcon.cmd(f"data get block {pos} TargetAngle")
+              match = re.search(r"(-?\d+(?:\.\d+)?(?:[Ee][+-]?\d+)?)f\s*$", reply)
+              return float(match[1]) if match else None
+
+
+          def check_steering_wheel(rcon, bx, by, bz):
+              """Check server input receipt and release using the server's update tag."""
+              x, y, z = bx - 4, by, bz + 4
+              pos = f"{x} {y} {z}"
+              rcon.cmd(f"setblock {pos} simulated:steering_wheel[facing=north,on_floor=true,waterlogged=false]")
+              rcon.cmd(f"clear {NAME}")
+              rcon.cmd(f"tp {NAME} {x+0.5} {y} {z-1.5}")
+              time.sleep(1)
+              ctl("look-at-block", str(x), str(y), str(z), "north", timeout=10)
+              target = status("status-before-steering.json").get("target")
+              aimed = isinstance(target, dict) and target.get("pos") == [x, y, z]
+              start = steering_target_angle(rcon, pos)
+
+              def held(name, expected):
+                  update = status(name).get("steering_wheel_server")
+                  return (isinstance(update, dict) and update.get("pos") == [x, y, z]
+                          and update.get("held") is expected)
+
+              held_after_input = False
+              released = False
+              changed = False
+              if aimed and start is not None and ctl("mouse", "right", "down", timeout=10)[0] == 0:
+                  try:
+                      ctl("mouse-move", "240", "0", timeout=10)
+                      deadline = time.monotonic() + 6
+                      while time.monotonic() < deadline:
+                          held_after_input = held("status-holding-steering.json", True)
+                          current = steering_target_angle(rcon, pos)
+                          changed = current is not None and abs(current - start) >= 2
+                          if held_after_input and changed:
+                              break
+                          time.sleep(0.2)
+                  finally:
+                      ctl("mouse", "right", "up", timeout=10)
+                  if held_after_input:
+                      deadline = time.monotonic() + 6
+                      while time.monotonic() < deadline:
+                          released = held("status-after-steering.json", False)
+                          if released:
+                              break
+                          time.sleep(0.2)
+              summary["steering"] = {"aimed": aimed, "held": held_after_input,
+                                     "angle_changed": changed, "released": released}
+              rcon.cmd(f"setblock {pos} minecraft:air")
+
+
+          class Rcon:
+              def __init__(self, password):
+                  self.s = socket.create_connection(("127.0.0.1", RCON_PORT), timeout=20)
+                  self.id = 0
+                  if self._send(3, password)[0] == -1:
+                      raise SystemExit("rcon auth failed")
+
+              def _send(self, kind, body):
+                  self.id += 1
+                  data = body.encode("utf-8")
+                  self.s.sendall(struct.pack("<iii", len(data) + 10, self.id, kind) + data + b"\0\0")
+                  size = struct.unpack("<i", self._read(4))[0]
+                  payload = self._read(size)
+                  rid, _ = struct.unpack("<ii", payload[:8])
+                  return rid, payload[8:-2].decode("utf-8", "replace")
+
+              def _read(self, n):
+                  buf = b""
+                  while len(buf) < n:
+                      chunk = self.s.recv(n - len(buf))
+                      if not chunk:
+                          raise ConnectionError("rcon closed")
+                      buf += chunk
+                  return buf
+
+              def cmd(self, c):
+                  out = self._send(2, c)[1]
+                  with open(os.path.join(OUT, "rcon.log"), "a", encoding="utf-8") as f:
+                      f.write(f"> {c}\n{out}\n")
+                  return out
+
+
+          def setup_server(password):
+              os.makedirs(os.path.join(SERVER, "mods"))
+              os.symlink(os.path.join(HOME, "libraries"), os.path.join(SERVER, "libraries"))
+              for jar in os.listdir(os.path.join(T, "mods")):
+                  shutil.copy(os.path.join(T, "mods", jar), os.path.join(SERVER, "mods", jar))
+              with open(os.path.join(SERVER, "eula.txt"), "w") as f:
+                  f.write("eula=true\n")
+              # CBC's impact fuze detonates with chance 0.67 by default: always, for a repeatable stand.
+              os.makedirs(os.path.join(SERVER, "defaultconfigs"))
+              with open(os.path.join(SERVER, "defaultconfigs", "createbigcannons-server.toml"), "w") as f:
+                  f.write("[munitions.fuzes]\n\timpactFuzeDetonationChance = 1.0\n")
+              # The rider and gas fixtures both need summoned animals to survive on the server.
+              with open(os.path.join(SERVER, "server.properties"), "w") as f:
+                  f.write("\n".join([
+                      "online-mode=false", f"server-port={PORT}", "enable-rcon=true", f"rcon.port={RCON_PORT}",
+                      f"rcon.password={password}", "level-type=minecraft\\:flat", "view-distance=4",
+                      "simulation-distance=4", "spawn-protection=0", "generate-structures=false",
+                      "spawn-monsters=false", "spawn-animals=true", "max-tick-time=-1", ""]))
+
+
+          def write_states():
+              jar = os.path.join(SERVER, "mods", "horizon-oracle.jar")
+              shutil.copy(ORACLE, jar)
+              os.makedirs(os.path.dirname(STATES), exist_ok=True)
+              with open(os.path.join(OUT, "oracle.log"), "wb") as f:
+                  r = subprocess.run(["java", "-Xmx2G", f"-Dhorizon.oracle.stateids={STATES}", ARGS, "nogui"],
+                                     cwd=SERVER, stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.STDOUT,
+                                     timeout=600)
+              os.remove(jar)
+              shutil.rmtree(os.path.join(SERVER, "world"), ignore_errors=True)
+              summary["states"] = os.path.exists(STATES)
+              log(f"oracle state ids: rc={r.returncode} written={summary['states']}")
+
+
+          def start_server():
+              path = os.path.join(OUT, "server.log")
+              procs["server"] = subprocess.Popen(["java", "-Xmx3G", ARGS, "nogui"], cwd=SERVER,
+                                                 stdin=subprocess.PIPE, stdout=open(path, "wb"),
+                                                 stderr=subprocess.STDOUT)
+              t0 = time.time()
+              while time.time() - t0 < 600:
+                  if procs["server"].poll() is not None:
+                      return False
+                  with open(path, encoding="utf-8", errors="replace") as f:
+                      if "Done (" in f.read():
+                          return True
+                  time.sleep(2)
+              return False
+
+
+          def start_client():
+              # Content mods are off until turned on (horizon-mods.txt beside options.txt).
+              mods = sorted(os.listdir(os.path.join(GAME, "horizon-mods"))) if os.path.isdir(
+                  os.path.join(GAME, "horizon-mods")) else []
+              with open(os.path.join(GAME, "horizon-mods.txt"), "w") as f:
+                  f.write("".join(f"mod.{m}:true\n" for m in mods))
+              summary["content_mods"] = mods
+              env = dict(os.environ, HORIZON_SERVER_STATES=STATES)
+              procs["client"] = subprocess.Popen(
+                  [CLIENT, "--resources", RES, "--control", "--offscreen", "--width", "1600", "--height", "900"],
+                  cwd=GAME, env=env, stdout=open(os.path.join(OUT, "client.log"), "wb"),
+                  stderr=open(os.path.join(OUT, "client.err.log"), "wb"))
+              t0 = time.time()
+              while time.time() - t0 < 1500:
+                  if procs["client"].poll() is not None:
+                      return False
+                  if ctl("wait-for", "screen", "title", "--timeout", "20", timeout=40)[0] == 0:
+                      return True
+                  time.sleep(3)
+              return False
+
+
+          def start_audio():
+              summary["audio_t0"] = time.monotonic()
+              procs["parec"] = subprocess.Popen(["parec", "-d", "horizon.monitor", "--file-format=wav",
+                                                 "--rate=44100", "--channels=2", os.path.join(OUT, "audio.wav")])
+
+
+          def stop_audio():
+              p = procs.get("parec")
+              if p and p.poll() is None:
+                  p.send_signal(signal.SIGINT)
+                  try:
+                      p.wait(timeout=10)
+                  except subprocess.TimeoutExpired:
+                      p.kill()
+
+
+          def audio_peaks():
+              """Loudness per 100 ms (peak of |sample|, 0..32767), and the louder windows' times."""
+              path = os.path.join(OUT, "audio.wav")
+              try:
+                  w = wave.open(path, "rb")
+              except (OSError, EOFError, wave.Error) as e:
+                  return {"error": type(e).__name__}
+              rate, channels, width = w.getframerate(), w.getnchannels(), w.getsampwidth()
+              frames = w.readframes(w.getnframes())
+              w.close()
+              if width != 2:
+                  return {"error": f"sample width {width}"}
+              step = rate // 10 * channels
+              samples = struct.unpack(f"<{len(frames) // 2}h", frames[: len(frames) // 2 * 2])
+              windows = [max(map(abs, samples[i:i + step]), default=0) for i in range(0, len(samples), step)]
+              loud = [[round(i / 10, 1), v] for i, v in enumerate(windows) if v > 300]
+              return {"seconds": round(len(windows) / 10, 1), "max": max(windows, default=0),
+                      "loud_windows": len(loud), "first_loud": loud[:40]}
+
+
+          def fire(rcon):
+              rc, state, _ = ctl("state", timeout=10)
+              st = json.loads(state) if rc == 0 and state.startswith("{") else {}
+              pos = (st.get("player") or {}).get("position") or st.get("position")
+              bx, by, bz = 0, 300, 0
+              if isinstance(pos, list) and len(pos) == 3:
+                  bx, bz = int(pos[0]), int(pos[2])
+              rcon.cmd("gamerule doMobSpawning false")
+              for c in [f"gamemode creative {NAME}", "time set 6000", "weather clear",
+                        f"fill {bx-6} {by-1} {bz-6} {bx+6} {by-1} {bz+20} minecraft:smooth_stone",
+                        f"fill {bx-6} {by} {bz-6} {bx+6} {by+8} {bz+20} minecraft:air",
+                        f"tp {NAME} {bx+4.5} {by} {bz-2.5} 25 10"]:
+                  rcon.cmd(c)
+              if os.environ.get("STAND_AERONAUTICS") == "1":
+                  # Exercise the server registries and the three imported client content packs.
+                  probe = f"{bx-4} {by} {bz+2}"
+                  installed = {}
+                  for block in ("aeronautics:wooden_propeller", "simulated:steering_wheel", "offroad:wheel_mount"):
+                      rcon.cmd(f"setblock {probe} {block}")
+                      present = rcon.cmd(f"execute if block {probe} {block}").strip() == "Test passed"
+                      installed[block] = present and block.split(":")[0] in summary["content_mods"]
+                  rcon.cmd(f"setblock {probe} minecraft:air")
+                  summary["aeronautics_blocks"] = installed
+                  if os.environ.get("STAND_BEARING") == "1":
+                      check_bearing_assembly(rcon, bx, by, bz)
+                  if os.environ.get("STAND_STEERING") == "1":
+                      check_steering_wheel(rcon, bx, by, bz)
+                  rcon.cmd(f"tp {NAME} {bx+4.5} {by} {bz-2.5} 25 10")
+              if any(os.environ.get(test) == "1" for test in ("STAND_RIDERS", "STAND_BEARING", "STAND_STEERING")):
+                  sable_ship(rcon, bx, by, bz)
+                  return
+              time.sleep(4)
+              ctl("look", "25", "10", timeout=10)
+              time.sleep(1)
+              ctl("screenshot", os.path.join(OUT, "10-before.png"), timeout=30)
+              plume = (f"particle createbigcannons:big_cannon_plume{{size:2.0f,power:2.0f,lifetime:10}} "
+                       f"{bx+0.5} {by+1.5} {bz+3.5} 0 0 1 1 0 force")
+              blast = (f"particle createbigcannons:cannon_blast_wave{{blast_radius:20d,"
+                       f"sound_event:\"createbigcannons:fire_big_cannon\",sound_source:\"block\","
+                       f"volume:5.0f,pitch:1.0f,air_absorption:2.0f,power:2.0f}} "
+                       f"{bx+0.5} {by+1.5} {bz+2.0} 0 0 0 1 0 force")
+              mark("fire")
+              rcon.cmd(plume)
+              rcon.cmd(blast)
+              rcon.cmd(f"summon createbigcannons:shot {bx+0.5} {by+1.5} {bz+4.0} {{Motion:[0.0d,0.03d,1.5d]}}")
+              for i, delay in enumerate([0.15, 0.4, 1.0, 2.5]):
+                  time.sleep(delay)
+                  ctl("screenshot", os.path.join(OUT, f"{11+i}-after-fire.png"), timeout=30)
+              st = status("status-after-fire.json")
+              summary["heard_after_fire"] = st.get("heard")
+              summary["particles_after_fire"] = st.get("particles")
+              explosions(rcon, bx, by, bz)
+              hits(rcon, bx, by, bz)
+              if os.environ.get("STAND_PHASES") == "sable":
+                  sable_ship(rcon, bx, by, bz)
+                  return
+              sable_ship(rcon, bx, by, bz)
+              cracks(rcon, bx, by, bz)
+              clouds(rcon, bx, by, bz)
+              cbc_tracers(rcon, bx, by, bz)
+
+
+          def shots(prefix, delays, status_name=None):
+              for i, delay in enumerate(delays):
+                  time.sleep(delay)
+                  ctl("screenshot", os.path.join(OUT, f"{prefix}-{i}.png"), timeout=30)
+              if status_name:
+                  st = status(status_name)
+                  summary.setdefault("phases", {})[prefix] = {"heard": st.get("heard"), "playing": (st.get("sounds") or {}).get("events")}
+
+
+          def explosions(rcon, bx, by, bz):
+              """CBC packets 20/23/24 and the shell blast wave: a tracer shot, an HE shell with an impact fuze,
+              a mortar stone and a drop mortar shell falling onto the platform."""
+              rcon.cmd(f"tp {NAME} {bx+4.5} {by} {bz-2.5} 25 10")
+              time.sleep(1.5)
+              ctl("look", "25", "10", timeout=10)
+              fuze = '{id:"createbigcannons:impact_fuze",count:1}'
+              mark("he_shell")
+              rcon.cmd(f"summon createbigcannons:he_shell {bx+0.5} {by+8.0} {bz+10.5} {{Motion:[0.0d,-1.5d,0.0d],Fuze:{fuze}}}")
+              shots("21-he-shell", [0.3, 0.3, 0.4, 1.0], "status-he-shell.json")
+              mark("mortar_stone")
+              before = status("status-mortar-stone-before.json")
+              reply = rcon.cmd(f"summon createbigcannons:mortar_stone {bx-2.5} {by+8.0} {bz+8.5} "
+                               '{Tags:["cbc_mortar"],Motion:[0.0d,-1.0d,0.0d]}')
+              shots("22-mortar-stone", [0.5, 1.0], "status-mortar-stone.json")
+              summary.setdefault("cbc_5", {})["mortar_stone"] = cbc_explosion_proof(
+                  rcon, "mortar_stone", "cbc_mortar", reply, before, "22-mortar-proof",
+                  ["mortar_stone_explode"])
+              # A shell with no fuze lands as a dud: where the server has it, against what the client draws.
+              mark("dud")
+              rcon.cmd(f"summon createbigcannons:he_shell {bx+3.5} {by+8.0} {bz+9.5} {{Motion:[0.0d,-1.5d,0.0d]}}")
+              shots("23-dud", [3.0])
+              summary["dud_server_pos"] = rcon.cmd(
+                  f"data get entity @e[type=createbigcannons:he_shell,limit=1,sort=nearest,x={bx+3.5},y={by},z={bz+9.5}] Pos")[-120:]
+              rc, ents, _ = ctl("entities", timeout=10)
+              save("entities-dud.json", ents)
+              summary["dud_client_entities"] = [line for line in ents.splitlines() if "he_shell" in line][:4]
+
+
+          def hits(rcon, bx, by, bz):
+              """An obsidian wall: machine gun bullets with tracers and a solid shot (block hit effects,
+              packet 23; cracks, packet 24, when the server damages a block), then a drop mortar shell
+              hung in view."""
+              wall_z = bz + 12
+              rcon.cmd(f"fill {bx-2} {by} {wall_z} {bx+4} {by+4} {wall_z} minecraft:obsidian")
+              rcon.cmd(f"tp {NAME} {bx+1.5} {by} {bz+2.5} 0 0")
+              time.sleep(1.5)
+              ctl("look", "0", "0", timeout=10)
+              before = status("status-shot-hit-before.json")
+              mark("shot_hit")
+              rcon.cmd(f"summon createbigcannons:shot {bx+1.5} {by+1.5} {bz+5.0} {{NoGravity:1b,Motion:[0.0d,0.0d,2.5d]}}")
+              shots("31-shot-hit", [0.25, 0.5, 4.0], "status-shot-hit.json")
+              impact = status("status-shot-hit-proof.json").get("cbc", {}).get("impact")
+              previous = before.get("cbc", {}).get("impact")
+              summary["cbc_7_impact"] = bool(
+                  impact and (not previous or impact[1] > previous[1])
+                  and math.dist(impact[0], [bx+1.5, by+1.5, wall_z]) < 1)
+              rcon.cmd(f"summon createbigcannons:drop_mortar_shell {bx+1.5} {by+1.8} {bz+6.5} "
+                       f"{{NoGravity:1b,Motion:[0.0d,0.0d,0.0d]}}")
+              shots("32-drop-mortar", [1.0])
+
+
+          def cbc_delta(before, after, section, name):
+              return after.get(section, {}).get(name, 0) - before.get(section, {}).get(name, 0)
+
+
+          def cbc_explosion_proof(rcon, kind, tag, summon, before, prefix, sounds, witness=None):
+              after = status(f"status-{prefix}.json")
+              cbc_before, cbc_after = before.get("cbc", {}), after.get("cbc", {})
+              selector = f"@e[tag={tag},limit=1]"
+              server = {"summon": summon[-160:], "projectile": rcon.cmd(f"data get entity {selector} Pos")[-160:]}
+              if witness:
+                  server["witness"] = rcon.cmd(f"data get entity {witness} Pos")[-160:]
+              save(f"server-{prefix}.json", json.dumps(server))
+              packets = cbc_delta(cbc_before, cbc_after, "explosions", kind)
+              heard = {sound: cbc_delta(before, after, "heard", f"createbigcannons:{sound}") for sound in sounds}
+              particle_names = {
+                  "shrapnel": ("shrapnel_cloud", "shrapnel_smoke"),
+                  "flak": ("flak_cloud", "flak_smoke"),
+                  "fluid": ("fluid_cloud", "shrapnel_smoke"),
+                  "mortar_stone": ("debris_smoke",),
+                  "smoke": ("smoke_shell_smoke",),
+              }[kind]
+              particles = {name: cbc_delta(before, after, "particles", f"createbigcannons:{name}")
+                           for name in particle_names}
+              server_ok = "Summoned new " in server["summon"] and server["projectile"].strip() == "No entity was found"
+              if witness:
+                  server_ok = server_ok and bool(re.search(r"\[[^\[\]]+\]\s*$", server["witness"]))
+              return {"packets": packets, "heard": heard, "particles": particles, "server": server_ok,
+                      "passed": server_ok and packets == 1 and all(n > 0 for n in particles.values()) and all(n == 1 for n in heard.values())}
+
+
+          def cbc_tracer_mesh(flight, previous):
+              if not flight or (previous and flight["id"] == previous["id"]) or not flight.get("last"):
+                  return False
+              first, last = flight["first"], flight["last"]
+              if last["position"][2] - first["position"][2] < 0.25:
+                  return False
+              # Both visible meshes must be anchored to the moving entity on the horizontal flight path.
+              return all(sample["vertices"] >= 4 and all(lo <= 0.01 and hi >= -0.01
+                                                          for lo, hi in zip(sample["min_offset"], sample["max_offset"]))
+                         for sample in (first, last))
+
+
+          def cbc_tracers(rcon, bx, by, bz):
+              proof = summary["cbc_6"] = {}
+              # Look east across the southbound flight path. The stand has terrain far below this view.
+              rcon.cmd(f"fill {bx-12} {by-1} {bz+2} {bx-7} {by-1} {bz+13} minecraft:smooth_stone")
+              rcon.cmd(f"tp {NAME} {bx-7.5} {by} {bz+7.5} -90 0")
+              time.sleep(1.5)
+              ctl("look", "-90", "0", timeout=10)
+              for kind, tracer in (
+                  ("ap_autocannon", "Tracer:1b,Age:100"),
+                  ("machine_gun_bullet", "Tracer:1b,Age:100"),
+                  ("shot", 'Tracer:{id:"createbigcannons:tracer_tip",count:1}'),
+              ):
+                  rcon.cmd("kill @e[tag=cbc_tracer]")
+                  mark(f"tracer_{kind}")
+                  before = status(f"status-cbc-tracer-{kind}-before.json").get("cbc", {}).get("tracers", {}).get(kind)
+                  reply = rcon.cmd(f"summon createbigcannons:{kind} {bx+1.5} {by+1.62} {bz+3.5} "
+                                   f'{{Tags:["cbc_tracer"],NoGravity:1b,Motion:[0.0d,0.0d,0.22d],{tracer}}}')
+                  server = rcon.cmd("data get entity @e[tag=cbc_tracer,limit=1] Pos")
+                  save(f"server-cbc-tracer-{kind}.txt", reply[-160:] + "\n" + server[-160:])
+                  shots(f"cbc-tracer-{kind}", [0.35, 0.35, 0.35])
+                  after = status(f"status-cbc-tracer-{kind}.json").get("cbc", {}).get("tracers", {}).get(kind)
+                  proof[kind] = ("Summoned new " in reply and bool(re.search(r"\[[^\[\]]+\]\s*$", server))
+                                 and cbc_tracer_mesh(after, before))
+              rcon.cmd("kill @e[tag=cbc_tracer]")
+
+
+          def cbc_crack_stage(cbc, position):
+              stages = [row["stage"] for row in cbc.get("cracks", []) if row["pos"] == position]
+              return stages[0] if stages else None
+
+
+          def cracks(rcon, bx, by, bz):
+              wall_z = bz + 7
+              target = [bx+1, by+1, wall_z]
+              block_check = f"execute if block {target[0]} {target[1]} {target[2]} minecraft:white_concrete"
+              rcon.cmd("kill @e[type=!minecraft:player]")
+              rcon.cmd(f"fill {bx-1} {by} {wall_z} {bx+3} {by+3} {wall_z} minecraft:white_concrete")
+              rcon.cmd(f"tp {NAME} {bx+1.5} {by} {bz+2.5} 0 0")
+              time.sleep(1.5)
+              ctl("look", "0", "0", timeout=10)
+              shots("40-cracks-before", [0.3])
+              before = status("status-cbc-crack-before.json").get("cbc", {})
+              proof = summary["cbc_7_cracks"] = {
+                  "baseline_visible": cbc_crack_stage(before, target) is not None, "stage": None, "passed": False}
+              # A summoned round must load the pinned JAR's durability_mass through ProjectileMass NBT.
+              kind = "ap_autocannon"
+              with zipfile.ZipFile(os.path.join(T, "mods", "createbigcannons-5.11.7.jar")) as jar:
+                  with jar.open(f"data/createbigcannons/munition_properties/projectiles/{kind}.json") as data:
+                      mass = float(json.load(data)["durability_mass"])
+              proof["projectile_mass"] = mass
+              shot_time = time.monotonic()
+              clear_at_positive_stage = None
+              for i in range(4):
+                  mark(f"crack_shot_{i}")
+                  rcon.cmd(f"summon createbigcannons:{kind} {bx+1.5} {by+1.6} {bz+4.0} "
+                           f"{{Age:60,ProjectileMass:{mass}f,NoGravity:1b,Motion:[0.0d,0.0d,2.0d]}}")
+                  time.sleep(0.15)
+                  current = status(f"status-cbc-crack-shot-{i}.json").get("cbc", {})
+                  stage = cbc_crack_stage(current, target)
+                  intact = rcon.cmd(block_check).strip() == "Test passed"
+                  if not intact:
+                      break
+                  if stage is not None and 1 <= stage <= 9:
+                      clear_at_positive_stage = current.get("crack_clear")
+                      proof["stage"] = stage
+                      proof["stage_seconds"] = round(time.monotonic() - shot_time, 2)
+                      shots("41-cracks-positive", [0])
+                      break
+
+              if proof["stage"] is None:
+                  return
+              # CBC heals 3 damage per second. The target must survive and an explicit packet must clear it.
+              for i in range(24):
+                  after = status("status-cbc-crack-healing.json").get("cbc", {})
+                  if cbc_crack_stage(after, target) is None:
+                      cleared = after.get("crack_clear")
+                      proof["clear_packet"] = bool(cleared and cleared != clear_at_positive_stage and cleared[0] == target)
+                      proof["intact_after"] = rcon.cmd(block_check).strip() == "Test passed"
+                      proof["clear_seconds"] = round(time.monotonic() - shot_time, 2)
+                      proof["passed"] = not proof["baseline_visible"] and proof["clear_packet"] and proof["intact_after"]
+                      shots("42-cracks-cleared", [0])
+                      break
+                  time.sleep(0.5)
+
+
+          def clouds(rcon, bx, by, bz):
+              """Exercise each CBC explosion and the potion-bearing gas cloud separately."""
+              rcon.cmd("kill @e[type=!minecraft:player]")
+              rcon.cmd(f"fill {bx-6} {by} {bz-6} {bx+6} {by+8} {bz+20} minecraft:air")
+              rcon.cmd(f"fill {bx-6} {by-1} {bz-6} {bx+6} {by-1} {bz+20} minecraft:smooth_stone")
+              rcon.cmd(f"tp {NAME} {bx+4.5} {by} {bz-2.5} 25 10")
+              time.sleep(1.5)
+              ctl("look", "25", "10", timeout=10)
+              fuze = '{id:"createbigcannons:impact_fuze",count:1}'
+              timed_fuze = '{id:"createbigcannons:timed_fuze",count:1,components:{"createbigcannons:fuze_timer":3}}'
+              proof = summary.setdefault("cbc_5", {})
+              smoke_sound = ["smoke_shell_detonate"]
+              bursts = {"shrapnel": "shrapnel_burst", "fluid": "fluid_blob_burst", "flak": "flak_burst"}
+              for name, entity, x, z, velocity, extra, effects, sounds in [
+                  ("50-shrapnel", "shrapnel_shell", bx+0.5, bz+10.5, -1.5, "",
+                   "shrapnel", ["shrapnel_shell_explosion"]),
+                  ("51-smoke", "smoke_shell", bx-2.5, bz+9.5, -1.5, "", "smoke", smoke_sound),
+                  ("52-fluid", "fluid_shell", bx+3.5, bz+11.5, -1.5,
+                   ',Fluid:{Fluid:"minecraft:water",FluidAmount:1000}', "fluid", ["fluid_shell_explosion", "water_fluid_release"]),
+                  ("53-flak", "flak_autocannon", bx+1.5, bz+9.5, -1.5, ",Age:60", "flak", ["flak_round_explosion"]),
+                  ("54-smoke-fast", "smoke_shell", bx-2.5, bz+9.5, -3.0, "", "smoke", smoke_sound),
+              ]:
+                  if name == "54-smoke-fast":
+                      rcon.cmd("kill @e[type=!minecraft:player]")
+                  mark(name)
+                  before = status(f"status-{name}-before.json")
+                  # Cover smoke's timed detonation as well as the separate fast impact case.
+                  projectile_fuze = timed_fuze if name in ("50-shrapnel", "51-smoke") else fuze
+                  reply = rcon.cmd(f"summon createbigcannons:{entity} {x} {by+8.0} {z} "
+                                   f'{{Tags:["cbc_drop"],Motion:[0.0d,{velocity}d,0.0d],Fuze:{projectile_fuze}{extra}}}')
+                  if effects in bursts:
+                      selector = f"@e[type=createbigcannons:{bursts[effects]},limit=1,x={x},y={by},z={z},distance=..12]"
+                      samples = []
+                      for _ in range(10):
+                          time.sleep(0.075)
+                          pos = rcon.cmd(f"data get entity {selector} Pos")[-160:]
+                          samples.append(pos)
+                          if re.search(r"\[[^\[\]]+\]\s*$", pos):
+                              break
+                      save(f"server-{name}-burst.json", json.dumps(samples))
+                  shots(name, [0.25, 0.65, 1.0], f"status-{name}.json")
+                  emitter = "@e[type=createbigcannons:smoke_emitter,limit=1]" if effects == "smoke" else None
+                  item = proof[name] = cbc_explosion_proof(rcon, effects, "cbc_drop", reply, before, name + "-proof", sounds, emitter)
+                  if effects == "smoke":
+                      after = status(f"status-{name}-emitter.json")
+                      item["smoke_emission"] = after.get("cbc", {}).get("smoke_particles_requested", 0) > before.get(
+                          "cbc", {}).get("smoke_particles_requested", 0)
+                      item["passed"] = item["passed"] and item["smoke_emission"]
+                  rcon.cmd("kill @e[tag=cbc_drop]")
+
+              rcon.cmd("kill @e[type=createbigcannons:smoke_emitter]")
+              mark("55-emitter-gas")
+              before = status("status-55-gas-before.json")
+              victim = "@e[type=minecraft:pig,tag=cbc_gas_witness,limit=1]"
+              rcon.cmd(f"summon minecraft:pig {bx+3.5} {by+0.5} {bz+10.5} "
+                       '{NoAI:1b,NoGravity:1b,Silent:1b,Tags:["cbc_gas_witness"]}')
+              effect = f"data get entity {victim} active_effects"
+              before_effect = rcon.cmd(effect)
+              reply = rcon.cmd(f"summon createbigcannons:gas_cloud {bx+3.5} {by+1.0} {bz+10.5} "
+                               '{Duration:200,Size:[4.0d,4.0d,4.0d],WaitTime:0,ReapplicationDelay:20,'
+                               'potion_contents:{potion:"minecraft:slowness"}}')
+              cloud = rcon.cmd("data get entity @e[type=createbigcannons:gas_cloud,limit=1] potion_contents")
+              shots("55-emitter-gas", [0.35, 1.0], "status-55-emitter-gas.json")
+              after_effect = rcon.cmd(effect)
+              after = status("status-55-gas-proof.json")
+              save("server-55-gas.json", json.dumps({"summon": reply[-160:], "cloud": cloud[-160:],
+                                                    "before": before_effect[-160:], "after": after_effect[-300:]}))
+              gas = proof["gas"] = {
+                  "victim_affected": ("Summoned new " in reply and "minecraft:slowness" in cloud
+                                      and "minecraft:slowness" not in before_effect and "minecraft:slowness" in after_effect),
+                  "client_particles": cbc_delta(before, after, "particles", "createbigcannons:gas_cloud"),
+                  "smoke_detonations": cbc_delta(before, after, "heard", "createbigcannons:smoke_shell_detonate"),
+              }
+              gas["passed"] = gas["victim_affected"] and gas["client_particles"] > 0 and gas["smoke_detonations"] == 0
+
+
+          def check_ship_break(rcon, target):
+              proof = {"plot_pos": None, "marker_before": False, "click_ok": False, "air_after": False}
+              pos = target.get("pos") if isinstance(target, dict) else None
+              if not isinstance(pos, list) or len(pos) != 3 or not all(type(v) is int for v in pos):
+                  return proof
+              x, y, z = pos
+              # Default Sable 2.0.6 plot grid on this stand. A hit on ordinary terrain cannot pass.
+              if not (20480000 <= x < 20742144 and 20480000 <= z < 20742144):
+                  return proof
+              proof["plot_pos"] = pos
+
+              def matches(block):
+                  # Keep the deck and its gold centre as witnesses if the plot disappears or changes.
+                  cmd = (f"execute if block {x} {y-1} {z} minecraft:oak_planks "
+                         f"if block {x+1} {y} {z+1} minecraft:gold_block "
+                         f"if block {x} {y} {z} minecraft:{block}")
+                  return rcon.cmd(cmd).strip() == "Test passed"
+
+              proof["marker_before"] = matches("red_stained_glass")
+              if not proof["marker_before"]:
+                  return proof
+              rc, out, err = ctl("mouse", "left", "click", timeout=15)
+              summary["ship_break"] = (rc, out[:120], err[:120])
+              try:
+                  reply = json.loads(out)
+              except ValueError:
+                  reply = None
+              proof["click_ok"] = rc == 0 and isinstance(reply, dict) and reply.get("ok") is True
+              if proof["click_ok"]:
+                  deadline = time.monotonic() + 5
+                  while not matches("air"):
+                      if time.monotonic() >= deadline:
+                          return proof
+                      time.sleep(0.2)
+                  proof["air_after"] = True
+              return proof
+
+
+          def sample_ship_mobs(rcon, label):
+              positions = {}
+              for kind in ("pig", "chicken"):
+                  selector = f"@e[type=minecraft:{kind},tag=ship_qa,limit=1]"
+                  reply = rcon.cmd(f"data get entity {selector} Pos")
+                  match = re.search(r"\[([^\[\]]+)\]\s*$", reply)
+                  if match:
+                      try:
+                          xyz = [float(s.strip().rstrip("dD")) for s in match[1].split(",")]
+                      except ValueError:
+                          continue
+                      if len(xyz) == 3 and all(math.isfinite(v) for v in xyz):
+                          positions[kind] = xyz
+              result = {"server": positions, "client": {}, "matches": False}
+              deadline = time.monotonic() + 5
+              while len(positions) == 2:
+                  rc, out, _ = ctl("entities", "24", timeout=10)
+                  if rc == 0:
+                      try:
+                          observed = json.loads(out)["entities"]
+                      except (ValueError, KeyError, TypeError):
+                          observed = []
+                      if not isinstance(observed, list):
+                          observed = []
+                      client = {}
+                      for kind in positions:
+                          rows = [v for v in observed if isinstance(v, dict) and v.get("type") == f"minecraft:{kind}"]
+                          if len(rows) == 1:
+                              xyz = rows[0].get("pos")
+                              if isinstance(xyz, list) and len(xyz) == 3 and all(
+                                      type(v) in (int, float) and math.isfinite(v) for v in xyz):
+                                  client[kind] = xyz
+                      result["client"] = client
+                      if len(client) == 2 and all(math.dist(client[k], p) <= 0.3 for k, p in positions.items()):
+                          result["matches"] = True
+                          break
+                  if time.monotonic() >= deadline:
+                      break
+                  time.sleep(0.2)
+              save(f"riders-{label}.json", json.dumps(result))
+              return result
+
+
+          def entity_uuid(rcon, command):
+              match = re.search(r"\[I;\s*(-?\d+(?:,\s*-?\d+){3})\]\s*$", rcon.cmd(command))
+              return tuple(map(int, match[1].split(","))) if match else None
+
+
+          def sable_riders(rcon, x0, by, z0):
+              pig = "@e[type=minecraft:pig,tag=ship_qa,limit=1]"
+              chicken = "@e[type=minecraft:chicken,tag=ship_qa,limit=1]"
+              rcon.cmd(f"summon minecraft:pig {x0+1.5} {by+2.2} {z0+1.5} "
+                       '{Silent:1b,PersistenceRequired:1b,Tags:["ship_qa"]}')
+              # Keep the carrier's normal movement tick so Sable can inherit the ship's motion.
+              rcon.cmd(f"attribute {pig} minecraft:generic.movement_speed base set 0")
+              rcon.cmd(f"summon minecraft:chicken {x0+1.5} {by+2.2} {z0+2.5} "
+                       '{NoAI:1b,Silent:1b,Tags:["ship_qa"]}')
+              time.sleep(2)
+              pig_id = entity_uuid(rcon, f"data get entity {pig} UUID")
+              chicken_id = entity_uuid(rcon, f"data get entity {chicken} UUID")
+              mounted_cmd = f"execute as {chicken} on vehicle run data get entity @s UUID"
+              mount_reply = rcon.cmd(f"ride {chicken} mount {pig}")
+              mounted = (pig_id is not None and chicken_id is not None and pig_id != chicken_id
+                         and " started riding " in mount_reply and entity_uuid(rcon, mounted_cmd) == pig_id)
+              time.sleep(1)
+              start = sample_ship_mobs(rcon, "before")
+              save("riders-ship-before.txt", rcon.cmd("sable info @n"))
+              x1, z1, x2, z2 = x0-1, z0-1, x0+3, z0+3
+              # Lower the support floor so normal physics moves the settled raft four blocks.
+              rcon.cmd(f"fill {x1} {by-5} {z1} {x2} {by-5} {z2} minecraft:smooth_stone")
+              reply = rcon.cmd(f"fill {x1} {by-1} {z1} {x2} {by-1} {z2} minecraft:air")
+              released = reply.strip().startswith("Successfully filled ")
+              time.sleep(4)
+              save("riders-ship-moved.txt", rcon.cmd("sable info @n"))
+              end = sample_ship_mobs(rcon, "moved")
+              displacements = {
+                  side: {kind: [round(after - before, 3)
+                                for before, after in zip(start[side][kind], end[side][kind])]
+                         for kind in start[side].keys() & end[side].keys()}
+                  for side in ("server", "client")
+              }
+              moved = (start["matches"] and end["matches"] and mounted and released
+                       and entity_uuid(rcon, mounted_cmd) == pig_id
+                       and abs(start["server"]["pig"][1] - (by+2)) <= 0.3
+                       and abs(end["server"]["pig"][1] - (by-2)) <= 0.3
+                       and all(math.dist(delta, (0, -4, 0)) <= 0.3
+                               for positions in displacements.values() for delta in positions.values()))
+              ctl("look-at", str(x0+1.5), str(by-1.25), str(z0+1.5), timeout=10)
+              shots("65-riders-moved", [0.2])
+              dismount_reply = rcon.cmd(f"ride {chicken} dismount")
+              no_passengers = entity_uuid(rcon, f"execute unless data entity {pig} Passengers[0] "
+                                          f"run data get entity {pig} UUID")
+              unmounted = (mounted and " stopped riding " in dismount_reply and no_passengers == pig_id
+                           and entity_uuid(rcon, f"data get entity {chicken} UUID") == chicken_id
+                           and sample_ship_mobs(rcon, "dismount-before-tp")["matches"])
+              landing = [x0+1.5, by, z0-1.5]
+              rcon.cmd(f"tp {chicken} {landing[0]} {landing[1]} {landing[2]}")
+              time.sleep(1)
+              off = sample_ship_mobs(rcon, "dismounted")
+              detached = (unmounted and off["matches"] and math.dist(off["server"]["chicken"], landing) <= 0.3
+                          and math.dist(off["server"]["pig"], off["server"]["chicken"]) > 2)
+              summary["ship_riders"] = {"mounted": mounted, "support_removed": released,
+                                        "moved": moved, "dismounted_before_tp": unmounted, "detached": detached,
+                                        "displacement": displacements}
+              rcon.cmd(f"kill {chicken}")
+              rcon.cmd(f"kill {pig}")
+
+
+          def sable_ship(rcon, bx, by, bz):
+              """ae-2: a Sable sub-level assembled from vanilla blocks by command (docs/sable-aeronautics-port.md
+              phase 0), hanging 4 blocks above the platform, then left to fall under Sable's physics."""
+              rcon.cmd("kill @e[type=!minecraft:player]")
+              rcon.cmd(f"fill {bx-6} {by} {bz-6} {bx+6} {by+10} {bz+20} minecraft:air")
+              # Earlier phases leave craters: a whole floor, or the raft and the player fall through.
+              rcon.cmd(f"fill {bx-6} {by-1} {bz-6} {bx+6} {by-1} {bz+20} minecraft:smooth_stone")
+              x0, y0, z0 = bx - 1, by + 4, bz + 8
+              rcon.cmd(f"fill {x0} {y0} {z0} {x0+2} {y0} {z0+2} minecraft:oak_planks")
+              rcon.cmd(f"fill {x0} {y0+1} {z0} {x0+2} {y0+1} {z0+2} minecraft:glass")
+              rcon.cmd(f"setblock {x0} {y0+1} {z0} minecraft:red_stained_glass")
+              rcon.cmd(f"setblock {x0+1} {y0+1} {z0+1} minecraft:gold_block")
+              rcon.cmd(f"tp {NAME} {bx+0.5} {by} {bz+1.5} 0 -10")
+              time.sleep(2)
+              ctl("look", "0", "-10", timeout=10)
+              shots("60-ship-built", [0.5])
+              mark("sable_assemble")
+              summary["sable_assemble"] = rcon.cmd(f"sable assemble area {x0} {y0} {z0} {x0+2} {y0+1} {z0+2}")[-200:]
+              shots("61-ship", [0.5, 1.0, 2.0, 4.0], "status-ship.json")
+              # Phase 5: stand on the landed ship (its glass top is ~2 blocks above the platform).
+              rcon.cmd(f"tp {NAME} {x0+1.5} {by+3.2} {z0+1.5} 0 30")
+              time.sleep(3)
+              rc, state, _ = ctl("state", timeout=10)
+              try:
+                  pos = (json.loads(state).get("player") or {}).get("position")
+              except ValueError:
+                  pos = None
+              summary["on_ship_position"] = pos
+              shots("62-on-ship", [0.5])
+              # Phase 6: break a ship block from beside the landed raft (its corner glass, world pose).
+              rcon.cmd(f"tp {NAME} {x0+1.5} {by} {z0-2.5} 0 0")
+              time.sleep(2)
+              ctl("look-at", str(x0 + 0.5), str(by + 1.5), str(z0 + 0.5), timeout=10)
+              time.sleep(0.5)
+              shots("63-before-break", [0.2])
+              # A ship block is not a world block (ctl break takes world positions): break it through the
+              # crosshair, as a player would, so the client's ship picking chooses the target.
+              target = status("status-before-ship-break.json").get("target")
+              summary["ship_break_proof"] = check_ship_break(rcon, target)
+              shots("64-after-break", [1.0])
+              if os.environ.get("STAND_RIDERS") == "1":
+                  sable_riders(rcon, x0, by, z0)
+              with open(os.path.join(OUT, "client.err.log"), encoding="utf-8", errors="replace") as f:
+                  summary["client_sable_lines"] = [l.strip()[:160] for l in f if "sable" in l.lower()][-12:]
+
+
+          def main():
+              password = secrets.token_urlsafe(18)
+              print(f"::add-mask::{password}", flush=True)
+              setup_server(password)
+              write_states()
+              summary["server"] = start_server()
+              log(f"server ready={summary['server']}")
+              if not summary["server"]:
+                  return 1
+              rcon = Rcon(password)
+              summary["title"] = start_client()
+              log(f"client at title={summary['title']}")
+              if not summary["title"]:
+                  return 1
+              start_audio()
+              mark("title")
+              ctl("screenshot", os.path.join(OUT, "00-title.png"), timeout=30)
+              status("status-title.json")
+              rc, out, err = ctl("connect", f"127.0.0.1:{PORT}", NAME, timeout=60)
+              mark("connect")
+              rc, out, err = ctl("wait-for", "loaded", "--timeout", "240", timeout=300)
+              summary["joined"] = rc == 0
+              mark("joined" if rc == 0 else "join_failed")
+              log(f"joined={summary['joined']}")
+              ctl("screenshot", os.path.join(OUT, "01-after-connect.png"), timeout=30)
+              with open(os.path.join(OUT, "client.err.log"), encoding="utf-8", errors="replace") as f:
+                  reasons = [line.split("disconnected:", 1)[1].strip()[:160] for line in f if "disconnected:" in line]
+              if reasons:
+                  summary["disconnect"] = reasons[-1]
+              rc, msgs, _ = ctl("messages", timeout=10)
+              save("messages.json", msgs)
+              if summary["joined"]:
+                  fire(rcon)
+                  time.sleep(3)
+                  mark("after")
+              st = status("status-end.json")
+              summary["heard"] = st.get("heard")
+              ctl("disconnect", timeout=15)
+              ctl("quit", timeout=20)
+              time.sleep(3)
+              passed = summary["joined"] and summary["ship_break_proof"]["air_after"]
+              if os.environ.get("STAND_RIDERS") == "1":
+                  riders = summary.get("ship_riders", {})
+                  passed = passed and riders.get("moved") and riders.get("detached")
+              if os.environ.get("STAND_AERONAUTICS") == "1":
+                  blocks = summary.get("aeronautics_blocks", {})
+                  passed = passed and bool(blocks) and all(blocks.values())
+              if os.environ.get("STAND_BEARING") == "1":
+                  passed = passed and summary.get("bearing_assembly", {}).get("rotor_transferred")
+              if os.environ.get("STAND_STEERING") == "1":
+                  steering = summary.get("steering", {})
+                  passed = passed and steering.get("held") and steering.get("angle_changed") and steering.get("released")
+              if "cbc_6" in summary:
+                  passed = (passed and all(result["passed"] for result in summary["cbc_5"].values())
+                            and all(summary["cbc_6"].values()) and summary["cbc_7_impact"]
+                            and summary["cbc_7_cracks"]["passed"])
+              return 0 if passed else 1
+
+
+          if __name__ == "__main__":
+              code = 1
+              try:
+                  code = main()
+              finally:
+                  stop_audio()
+                  for name in ("client", "server"):
+                      p = procs.get(name)
+                      if p and p.poll() is None:
+                          if name == "server":
+                              try:
+                                  p.stdin.write(b"stop\n")
+                                  p.stdin.flush()
+                                  p.wait(timeout=90)
+                              except Exception:
+                                  p.kill()
+                          else:
+                              p.kill()
+                  summary["audio"] = audio_peaks()
+                  summary.pop("audio_t0", None)
+                  save("summary.json", json.dumps(summary, indent=1))
+                  print(json.dumps(summary, indent=1), flush=True)
+              sys.exit(code)
+          PY
+          python3 "$RUNNER_TEMP/stand.py"
+      - name: Encrypt the results
+        if: always()
+        run: |
+          cat > "$RUNNER_TEMP/recipient.cert.pem" <<'PEM'
+          -----BEGIN CERTIFICATE-----
+          MIIEFzCCAn+gAwIBAgIUWkAYY06KJXkGzbncuY1Khsb1BrgwDQYJKoZIhvcNAQEL
+          BQAwGzEZMBcGA1UEAwwQaG9yaXpvbi1zdGFuZC1jaTAeFw0yNjExMjYyMzQ4MjZa
+          Fw0yNzAxMjUyMzQ4MjZaMBsxGTAXBgNVBAMMEGhvcml6b24tc3RhbmQtY2kwggGi
+          MA0GCSqGSIb3DQEBAQUAA4IBjwAwggGKAoIBgQC22uLyM+PVeHXkQXlQlnnMQKSj
+          5sPAJD6PSOjcx0ETPYwLl+hDUKYQ6vl3PQInKi4usZFs0SKXQq67i4uC2TZ+VP2u
+          NsFUe5B2894HA5EcGVts/XvFNblMniQuWgsf+dohjcdzDU6EiVfk4NONlH1dG73V
+          swmkRXrwNMvq/LaQdQT26bj0hWuBNGEmA8UdhVmZnz4vu9jA/T5+n5gmfpEfby2U
+          2zeGpBXL3XSsAxNJMN7oQZvflLyLJGhx/Lna5aVEoP2rrSg4eMZ4AJkRiBMTqsYo
+          E3DgHIKDGCHgeGojdC2qnTswQtpjvLItOm0u3dYmsrq4hmvmixktKIPzvl4eQGTy
+          MWgrzNY/PrdP0VKiHZ2sH2kraaymf9h5qVjGeDGbES7TH7bU2k4ulhQUQrJIaJup
+          VgA0lsmNDuJKeNzkYnkpYgvYGBurI1SbYCnelrrptowrfPcKq0dpJVh4J2dI82Ge
+          Vb0DK9BxtjJgz7axbh9Tom7dCWLhL3cnOsQEQGMCAwEAAaNTMFEwHQYDVR0OBBYE
+          FLYlLEl/aBSmAf1mUzotY2bKwYMpMB8GA1UdIwQYMBaAFLYlLEl/aBSmAf1mUzot
+          Y2bKwYMpMA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQELBQADggGBAHZYlUI3
+          Z1KFuy+cVl/C+gh8jsJcsmuc+pqh2RAyRMqKAnzQcH5AInMFnP15yegMvp/YOFZz
+          MDDWxARBm/z3PE1CJJwuop5pXfckbxLAAfEtXYDzQnGM8fhEDuxlFxEIqKlo4xwR
+          fFsPqWYT5PsbCx0gL6YVAI6pXQdTwqG+tIXGImY3l1jXJsaT+S2CUrm9liO+1HKd
+          n42SJjUgZJHgOZ5UJno7pGOZdG3FbMEckPE9O6XQgPYu0uiVcNIAxeo5kwyIlreQ
+          tuLY4BbGSZ5kxGCKx28JapjK/C0+ZcTAkgmuRdT/+H7jeuI3//UdhYuMcVMGkcRF
+          Ws/TixwCb3200lwDbesC4kIdydpakZGfHC3rhHdRMaQXMYAXIEPPqf1p0r7lDpv5
+          cISlAgXvbTufb4tjQFYVV1fzKuL2X+ny0H3I0FMrUkstxtiGlxwqJmR2dRGWSexk
+          hoJ9zwBTc3ofi7p8Nzsdz18L+OF9Cq8L0bU780Y6DC6v2mTDjokc1UykOg==
+          -----END CERTIFICATE-----
+          PEM
+          mkdir -p "$RUNNER_TEMP/out" "$RUNNER_TEMP/out-plain"
+          cp "$RUNNER_TEMP/prepare.log" "$RUNNER_TEMP/port.log" "$RUNNER_TEMP/out-plain/" 2>/dev/null || true
+          tar -czf "$RUNNER_TEMP/stand.tgz" -C "$RUNNER_TEMP" out-plain
+          sha256sum "$RUNNER_TEMP/stand.tgz"
+          openssl cms -encrypt -aes-256-gcm -binary -in "$RUNNER_TEMP/stand.tgz" \
+            -outform DER -out "$RUNNER_TEMP/out/stand.tgz.der" "$RUNNER_TEMP/recipient.cert.pem"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ runner.temp }}/out/
+          if-no-files-found: error
+          retention-days: 2

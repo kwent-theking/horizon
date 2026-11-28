@@ -268,7 +268,44 @@ impl Game<'_> {
                         horizon_client::shader_pack_list::scan(&Self::shader_packs_dir());
                 }
                 // Saved; the next frame's `shader_pack_inputs` loads the pick.
-                Event::ShaderPack => self.settings.save(&Self::options_path()),
+                Event::ShaderPack => {
+                    self.settings.save(&Self::options_path());
+                    if !self.settings.horizon.shader_pack.is_empty()
+                        && self
+                            .renderer
+                            .as_ref()
+                            .is_some_and(horizon_client::gfx::Renderer::has_compressed_sprites)
+                        && let Some(window) = self.window.clone()
+                    {
+                        if let Some(renderer) = &mut self.renderer {
+                            renderer.release_surface();
+                        }
+                        match self.new_renderer(window) {
+                            Ok(r) => {
+                                self.clear_lod();
+                                self.streaming
+                                    .reload_resources(&mut self.world, self.pack.context.clone());
+                                self.pending_uploads.clear();
+                                self.renderer = Some(r);
+                                self.apply_settings();
+                                self.apply_ui_settings();
+                            }
+                            Err(error) => {
+                                if let Some(renderer) = &mut self.renderer
+                                    && let Err(restore) = renderer.recreate_surface()
+                                {
+                                    return Err(format!(
+                                        "{error}; could not restore the previous rendering surface: {restore}"
+                                    )
+                                    .into());
+                                }
+                                log::error!(
+                                    "Horizon: failed to rebuild renderer for shader pack: {error}"
+                                );
+                            }
+                        }
+                    }
+                }
                 Event::OpenShaderPackFolder => {
                     let dir = Self::shader_packs_dir();
                     let _ = std::fs::create_dir_all(&dir);

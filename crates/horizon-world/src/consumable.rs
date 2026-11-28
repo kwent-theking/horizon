@@ -1,7 +1,7 @@
 //! Consumable component timing and ordered particle/sound emission.
 use horizon_core::random::RandomSource;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum UseAnimation {
     None,
     Eat,
@@ -17,7 +17,7 @@ pub enum UseAnimation {
     Spear,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Consumable<S, E = ()> {
     pub seconds: f32,
     pub animation: UseAnimation,

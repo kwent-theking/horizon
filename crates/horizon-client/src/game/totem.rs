@@ -142,8 +142,10 @@ impl Game<'_> {
             .flatten()
             .find(|s| {
                 models
-                    .components(&horizon_client::item_render::stack_view(s))
-                    .get("minecraft:death_protection")
+                    .component(
+                        &horizon_client::item_render::stack_view(s),
+                        "minecraft:death_protection",
+                    )
                     .is_some()
             })
             .cloned()

@@ -445,6 +445,14 @@ impl Game<'_> {
                 m.position.z + z * yaw.cos(),
             );
         }
+        if let Some(p) = self.player.as_ref() {
+            at = self.plot_passenger_feet(
+                m.id,
+                [at; 2],
+                [m.position; 2],
+                f64::from(p.dimensions.eye_height),
+            )[1];
+        }
         if let Some(p) = self.player.as_mut() {
             self.previous_position = p.position;
             p.position = at;

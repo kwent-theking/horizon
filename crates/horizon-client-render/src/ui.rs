@@ -5,6 +5,7 @@ use crate::{
     hud::{HudAtlas, HudBatch, Rect, rgba},
     text::Text,
 };
+use horizon_world::content_view;
 use std::{collections::HashMap, path::Path, sync::RwLock, time::Instant};
 
 /// `GuiSpriteScaling.NineSlice`: the sprite's size in GUI pixels, whatever
@@ -47,12 +48,12 @@ pub fn load_metadata(root: &Path) {
     let base = root.join("assets/minecraft/textures");
     let mut stack = vec![base.join("gui/sprites")];
     while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
+        let Ok(entries) = content_view::read_dir(&dir) else {
             continue;
         };
-        for e in entries.flatten() {
-            let p = e.path();
-            if p.is_dir() {
+        for entry in entries {
+            let p = entry.path();
+            if entry.is_dir() {
                 stack.push(p);
                 continue;
             }
@@ -60,7 +61,7 @@ pub fn load_metadata(root: &Path) {
             let Some(stripped) = name.strip_suffix(".png.mcmeta") else {
                 continue;
             };
-            let Ok(text) = std::fs::read_to_string(&p) else {
+            let Ok(text) = content_view::read_to_string(&p) else {
                 continue;
             };
             let Some(nine_slice) = serde_json::from_str(&text)

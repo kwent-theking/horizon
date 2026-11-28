@@ -12,7 +12,7 @@ use crate::{
 };
 use serde_json::{Map, Value};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet, HashMap},
     sync::{Arc, Mutex},
 };
 
@@ -964,6 +964,13 @@ pub trait ItemEnv {
     fn bundle_fullness(&self, _stack: &StackView, _components: &Components) -> f32 {
         0.0
     }
+    fn bundle_fullness_from_view(
+        &self,
+        stack: &StackView,
+        components: &StackComponents<'_>,
+    ) -> f32 {
+        self.bundle_fullness(stack, &components.to_owned())
+    }
     /// `ItemStack.getMaxStackSize` when the prototype has no component.
     fn component_matches(&self, _stack: &StackView, _predicate: &Value) -> bool {
         false
@@ -1023,31 +1030,180 @@ pub struct ResolvedItem {
     pub oversized_in_gui: bool,
 }
 
-/// All item definitions and the default components of every item.
-#[derive(Default)]
-pub struct ItemModels {
-    pub definitions: BTreeMap<String, ClientItem>,
-    pub prototypes: BTreeMap<String, Components>,
+#[cfg(test)]
+#[test]
+fn pooled_prototypes_preserve_values_and_stack_patches() {
+    let raw: BTreeMap<String, Components> = serde_json::from_str(
+        r#"{"a":{"count":64,"zero":0.0,"flag":null},"b":{"count":64,"zero":-0.0,"data":["x"]}}"#,
+    )
+    .unwrap();
+    let models = ItemModels {
+        prototypes: raw.clone().into(),
+        ..Default::default()
+    };
+    for (id, components) in &raw {
+        let stack = StackView::new(id, 1);
+        assert_eq!(&*models.components(&stack), components);
+        for (key, expected) in components {
+            assert_eq!(
+                models.prototypes.get(id, key).unwrap().to_string(),
+                expected.to_string()
+            );
+        }
+    }
+    for (id, zero) in [("a", 0.0f64), ("b", -0.0)] {
+        assert_eq!(
+            models
+                .prototypes
+                .get(id, "zero")
+                .unwrap()
+                .as_f64()
+                .unwrap()
+                .to_bits(),
+            zero.to_bits(),
+        );
+    }
+    assert!(std::ptr::eq(
+        models.prototypes.get("a", "count").unwrap(),
+        models.prototypes.get("b", "count").unwrap()
+    ));
+
+    let mut stack = StackView::new("a", 1);
+    stack.patch.insert("count".into(), Some(3.into()));
+    stack.patch.insert("flag".into(), None);
+    stack.patch.insert("data".into(), Some(Value::Null));
+    let view = models.prototypes.for_stack(&stack);
+    assert_eq!(view.get("count"), Some(&3.into()));
+    assert_eq!(view.get("flag"), None);
+    assert_eq!(view.get("data"), Some(&Value::Null));
+    assert_eq!(view.get("zero"), models.prototypes.get("a", "zero"));
 }
 
-impl ItemModels {
-    /// The stack's components: its item's defaults with the stack's patch on top. A stack
-    /// with no patch (most stacks a screen draws) borrows the defaults instead of copying them.
-    pub fn components(&self, stack: &StackView) -> std::borrow::Cow<'_, Components> {
-        static NONE: Components = BTreeMap::new();
-        let prototype = self.prototypes.get(&stack.item).unwrap_or(&NONE);
-        if stack.patch.is_empty() {
-            return std::borrow::Cow::Borrowed(prototype);
+/// The default component keys and values are stored once across all items.
+#[derive(Clone, Default)]
+pub struct ItemPrototypes {
+    items: BTreeMap<String, Box<[(u32, u32)]>>,
+    keys: Box<[String]>,
+    values: Box<[Value]>,
+}
+impl From<BTreeMap<String, Components>> for ItemPrototypes {
+    fn from(raw: BTreeMap<String, Components>) -> Self {
+        let keys: Box<[String]> = raw
+            .values()
+            .flat_map(|components| components.keys())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .cloned()
+            .collect();
+        let mut by_value = HashMap::new();
+        let mut values = Vec::new();
+        let items = raw
+            .into_iter()
+            .map(|(item, components)| {
+                let row = components
+                    .into_iter()
+                    .map(|(key, value)| {
+                        let key = keys.binary_search(&key).expect("known component key") as u32;
+                        // JSON keeps the integer/float distinction and the sign of zero.
+                        let value = *by_value.entry(value.to_string()).or_insert_with(|| {
+                            let id = values.len() as u32;
+                            values.push(value);
+                            id
+                        });
+                        (key, value)
+                    })
+                    .collect();
+                (item, row)
+            })
+            .collect();
+        Self {
+            items,
+            keys,
+            values: values.into(),
         }
-        let mut out = prototype.clone();
-        for (key, value) in &stack.patch {
+    }
+}
+impl ItemPrototypes {
+    fn lookup(&self, row: &[(u32, u32)], key: &str) -> Option<&Value> {
+        let key = self.keys.binary_search_by(|k| k.as_str().cmp(key)).ok()? as u32;
+        let index = row.binary_search_by_key(&key, |&(id, _)| id).ok()?;
+        Some(&self.values[row[index].1 as usize])
+    }
+
+    pub fn get(&self, item: &str, key: &str) -> Option<&Value> {
+        self.lookup(self.items.get(item)?, key)
+    }
+
+    fn for_stack<'a>(&'a self, stack: &'a StackView) -> StackComponents<'a> {
+        StackComponents {
+            prototypes: self,
+            row: self
+                .items
+                .get(&stack.item)
+                .map(Box::as_ref)
+                .unwrap_or_default(),
+            patch: &stack.patch,
+        }
+    }
+}
+
+/// A stack's default components and patch, read without materializing a map.
+pub struct StackComponents<'a> {
+    prototypes: &'a ItemPrototypes,
+    row: &'a [(u32, u32)],
+    patch: &'a BTreeMap<String, Option<Value>>,
+}
+impl<'a> StackComponents<'a> {
+    pub fn get(&self, key: &str) -> Option<&'a Value> {
+        match self.patch.get(key) {
+            Some(value) => value.as_ref(),
+            None => self.prototypes.lookup(self.row, key),
+        }
+    }
+
+    fn to_owned(&self) -> Components {
+        let mut out: Components = self
+            .row
+            .iter()
+            .map(|&(key, value)| {
+                (
+                    self.prototypes.keys[key as usize].clone(),
+                    self.prototypes.values[value as usize].clone(),
+                )
+            })
+            .collect();
+        for (key, value) in self.patch {
             match value {
                 Some(v) => out.insert(key.clone(), v.clone()),
                 None => out.remove(key),
             };
         }
-        std::borrow::Cow::Owned(out)
+        out
     }
+}
+
+/// All item definitions and the default components of every item.
+#[derive(Default)]
+pub struct ItemModels {
+    pub definitions: BTreeMap<String, ClientItem>,
+    pub prototypes: ItemPrototypes,
+}
+
+impl ItemModels {
+    /// The stack's defaults with its component patch on top, as a standalone map.
+    pub fn components(&self, stack: &StackView) -> std::borrow::Cow<'_, Components> {
+        static NONE: Components = BTreeMap::new();
+        let view = self.prototypes.for_stack(stack);
+        if view.row.is_empty() && view.patch.is_empty() {
+            std::borrow::Cow::Borrowed(&NONE)
+        } else {
+            std::borrow::Cow::Owned(view.to_owned())
+        }
+    }
+    pub fn component<'a>(&'a self, stack: &'a StackView, key: &str) -> Option<&'a Value> {
+        self.prototypes.for_stack(stack).get(key)
+    }
+
     /// `ItemModelResolver.updateForTopItem`.
     pub fn resolve(&self, stack: &StackView, ctx: &Context, env: &dyn ItemEnv) -> ResolvedItem {
         let mut out = ResolvedItem::default();
@@ -1064,7 +1220,7 @@ impl ItemModels {
         ctx: &Context,
         env: &dyn ItemEnv,
     ) {
-        let components = self.components(stack);
+        let components = self.prototypes.for_stack(stack);
         let Some(Value::String(model_id)) = components.get("minecraft:item_model") else {
             return;
         };
@@ -1074,7 +1230,7 @@ impl ItemModels {
         let mut state = Resolve {
             models: self,
             stack,
-            components: &components,
+            components,
             ctx,
             env,
         };
@@ -1092,7 +1248,7 @@ impl ItemModels {
         self.properties(stack).2
     }
     fn properties(&self, stack: &StackView) -> (bool, bool, f32) {
-        match self.components(stack).get("minecraft:item_model") {
+        match self.prototypes.for_stack(stack).get("minecraft:item_model") {
             Some(Value::String(id)) => identifier(id)
                 .ok()
                 .and_then(|id| self.definitions.get(&id))
@@ -1111,7 +1267,7 @@ impl ItemModels {
 struct Resolve<'a> {
     models: &'a ItemModels,
     stack: &'a StackView,
-    components: &'a Components,
+    components: StackComponents<'a>,
     ctx: &'a Context<'a>,
     env: &'a dyn ItemEnv,
 }
@@ -1321,7 +1477,7 @@ impl Resolve<'_> {
                 if *ignore_default {
                     self.stack.patch.contains_key(component)
                 } else {
-                    self.components.contains_key(component)
+                    self.components.get(component).is_some()
                 }
             }
             ConditionProperty::BundleHasSelectedItem => self.bundle_selected().is_some(),
@@ -1403,9 +1559,9 @@ impl Resolve<'_> {
     fn numeric(&self, property: &NumericProperty) -> f32 {
         let owner = self.ctx.owner;
         match property {
-            NumericProperty::BundleFullness => {
-                self.env.bundle_fullness(self.stack, self.components)
-            }
+            NumericProperty::BundleFullness => self
+                .env
+                .bundle_fullness_from_view(self.stack, &self.components),
             NumericProperty::Compass {
                 wobble,
                 target,

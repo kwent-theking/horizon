@@ -3,6 +3,7 @@ use super::{
 };
 use crate::position::BlockPos;
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::sync::{Arc, OnceLock};
 mod create;
 mod face;
@@ -154,10 +155,57 @@ impl VoxelShape {
     pub fn is_cube(&self) -> bool {
         self.cube
     }
+    /// Hash the immutable allocations independently of shape identity.
+    pub fn hash_grid(&self, state: &mut impl Hasher) {
+        for axis in self.coords.iter() {
+            state.write_usize(axis.len());
+            for coord in axis {
+                state.write_u64(coord.to_bits());
+            }
+        }
+        self.occupancy.hash(state);
+        state.write_usize(self.boxes.len());
+        for &bounds in self.boxes.iter() {
+            Self::box_bits(bounds).hash(state);
+        }
+    }
+
+    /// Reuse identical backing while preserving each shape's own metadata and identity.
+    pub fn share_grid(&mut self, other: &Self) -> bool {
+        let coords_match = self.coords.iter().zip(other.coords.iter()).all(|(a, b)| {
+            a.iter()
+                .map(|v| v.to_bits())
+                .eq(b.iter().map(|v| v.to_bits()))
+        });
+        if !coords_match
+            || self.occupancy != other.occupancy
+            || !self.boxes.iter().copied().map(Self::box_bits).eq(other
+                .boxes
+                .iter()
+                .copied()
+                .map(Self::box_bits))
+        {
+            return false;
+        }
+        self.coords = other.coords.clone();
+        self.occupancy = other.occupancy.clone();
+        self.boxes = other.boxes.clone();
+        true
+    }
+
+    fn box_bits(bounds: Aabb) -> [[u64; 3]; 2] {
+        [bounds.min_position(), bounds.max_position()].map(|p| p.components().map(f64::to_bits))
+    }
+
     /// Clones and operations returning an existing immutable shape preserve its
     /// identity. Separately constructed grids remain distinct even if equal.
     pub fn same_identity(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.identity, &other.identity)
+    }
+    /// An opaque identity for lookup tables. Valid while this shape or a clone
+    /// is alive; separately constructed equal grids have different keys.
+    pub fn identity_key(&self) -> *const () {
+        Arc::as_ptr(&self.identity).cast()
     }
     /// A separately constructed shape with the same immutable grid. Storage is
     /// shared, while identity-sensitive vanilla join shortcuts remain distinct.
@@ -520,6 +568,16 @@ fn clear_strip(bits: &mut [u64], sizes: [usize; 3], x: usize, y: usize, min: usi
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn identity_keys_follow_aliases_not_geometry() {
+        let a = VoxelShape::block();
+        let b = a.clone();
+        let c = a.fresh_identity();
+        assert_eq!(a.identity_key(), b.identity_key());
+        assert_ne!(a.identity_key(), c.identity_key());
+        assert_eq!(a.boxes(), c.boxes());
+    }
+
     #[test]
     fn stop_at_obstacle_and_reuse_boxes() {
         let shape = VoxelShape::block();

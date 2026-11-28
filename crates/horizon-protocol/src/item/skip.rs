@@ -10,7 +10,7 @@ use crate::{
     buf::{Codec, Reader},
 };
 
-type Read = fn(&mut Reader) -> Result<()>;
+pub(super) type Read = fn(&mut Reader) -> Result<()>;
 
 /// DataComponents' registry order (26.3) for the ids `Component::read`
 /// doesn't decode itself.
@@ -196,50 +196,50 @@ pub(super) fn component(kind: i32, r: &mut Reader) -> Result<()> {
     }
 }
 
-fn boolean(r: &mut Reader) -> Result<()> {
+pub(super) fn boolean(r: &mut Reader) -> Result<()> {
     r.bool().map(drop)
 }
-fn varint(r: &mut Reader) -> Result<()> {
+pub(super) fn varint(r: &mut Reader) -> Result<()> {
     r.varint().map(drop)
 }
-fn f32(r: &mut Reader) -> Result<()> {
+pub(super) fn f32(r: &mut Reader) -> Result<()> {
     r.f32().map(drop)
 }
-fn i32(r: &mut Reader) -> Result<()> {
+pub(super) fn i32(r: &mut Reader) -> Result<()> {
     r.i32().map(drop)
 }
 /// ByteBufCodecs.STRING_UTF8.
-fn string(r: &mut Reader) -> Result<()> {
+pub(super) fn string(r: &mut Reader) -> Result<()> {
     r.string(32767).map(drop)
 }
 /// Identifier.STREAM_CODEC, ResourceKey.streamCodec.
-fn ident(r: &mut Reader) -> Result<()> {
+pub(super) fn ident(r: &mut Reader) -> Result<()> {
     string(r)
 }
 /// A text component or compound (fromCodecWithRegistries, COMPOUND_TAG).
-fn nbt(r: &mut Reader) -> Result<()> {
+pub(super) fn nbt(r: &mut Reader) -> Result<()> {
     r.nbt().map(drop)
 }
 fn template(r: &mut Reader) -> Result<()> {
     Template::read(r).map(drop)
 }
 /// ByteBufCodecs.optional: a flag, then the value.
-fn optional(r: &mut Reader, value: Read) -> Result<()> {
+pub(super) fn optional(r: &mut Reader, value: Read) -> Result<()> {
     if r.bool()? { value(r) } else { Ok(()) }
 }
 /// ByteBufCodecs.list and map: a VarInt count, then the elements (a map's
 /// key and value each). Every element is at least a byte, so the count
 /// can't pass what is left.
-fn list(r: &mut Reader, element: Read) -> Result<()> {
+pub(super) fn list(r: &mut Reader, element: Read) -> Result<()> {
     let n = r.count(r.remaining())?;
     (0..n).try_for_each(|_| element(r))
 }
 /// ByteBufCodecs.holder: 0 and the value itself, or the registry id plus one.
-fn holder(r: &mut Reader, direct: Read) -> Result<()> {
+pub(super) fn holder(r: &mut Reader, direct: Read) -> Result<()> {
     if r.varint()? == 0 { direct(r) } else { Ok(()) }
 }
 /// ByteBufCodecs.holderSet: 0 and a tag id, or the size plus one and the ids.
-fn holder_set(r: &mut Reader) -> Result<()> {
+pub(super) fn holder_set(r: &mut Reader) -> Result<()> {
     match r.varint()? {
         0 => ident(r),
         n => {
@@ -252,7 +252,7 @@ fn holder_set(r: &mut Reader) -> Result<()> {
     }
 }
 /// SoundEvent.STREAM_CODEC: a holder of a location and an optional fixed range.
-fn sound(r: &mut Reader) -> Result<()> {
+pub(super) fn sound(r: &mut Reader) -> Result<()> {
     holder(r, |r| {
         ident(r)?;
         optional(r, f32)
@@ -270,7 +270,7 @@ fn trim_material(r: &mut Reader) -> Result<()> {
     })
 }
 /// MobEffectInstance: the effect id, then its Details.
-fn mob_effect(r: &mut Reader) -> Result<()> {
+pub(super) fn mob_effect(r: &mut Reader) -> Result<()> {
     varint(r)?;
     effect_details(r)
 }
@@ -416,7 +416,7 @@ pub(super) fn potion_effects_and_name(r: &mut Reader) -> Result<()> {
     optional(r, string)
 }
 /// FireworkExplosion: shape, colors, fadeColors, hasTrail, hasTwinkle.
-fn firework_explosion(r: &mut Reader) -> Result<()> {
+pub(super) fn firework_explosion(r: &mut Reader) -> Result<()> {
     varint(r)?;
     list(r, i32)?;
     list(r, i32)?;

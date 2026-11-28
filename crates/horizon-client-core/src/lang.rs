@@ -2,6 +2,7 @@
 //! resource root and enabled packs layered over `en_us`, the language list
 //! from `pack.mcmeta` `language` sections, and a process-wide current
 //! language used by every screen.
+use horizon_world::content_view;
 use std::{
     collections::{BTreeMap, HashMap},
     sync::{
@@ -23,7 +24,7 @@ impl LanguageInfo {
         format!("{} ({})", self.name, self.region)
     }
 }
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 pub struct Language {
     pub code: String,
     /// `LanguageInfo.bidirectional`: text without a strong character reads
@@ -40,6 +41,11 @@ static BIDIRECTIONAL: AtomicBool = AtomicBool::new(false);
 /// A source of resource files: the prepared root plus packs, highest priority last.
 pub trait ResourceSource {
     fn read(&self, path: &str) -> Option<Vec<u8>>;
+    /// A filesystem tree whose stamp covers all reads from this source.
+    /// In-memory and other dynamic sources continue through the normal loader.
+    fn cache_root(&self) -> Option<&std::path::Path> {
+        None
+    }
     /// Whether `path` is there, without reading it where the source can tell.
     fn exists(&self, path: &str) -> bool {
         self.read(path).is_some()
@@ -75,18 +81,20 @@ impl ResourceSource for Bundled {
     }
 }
 impl ResourceSource for std::path::PathBuf {
+    fn cache_root(&self) -> Option<&std::path::Path> {
+        Some(self.as_path())
+    }
     fn read(&self, path: &str) -> Option<Vec<u8>> {
-        std::fs::read(self.join(path)).ok()
+        content_view::read(self.join(path)).ok()
     }
     fn exists(&self, path: &str) -> bool {
-        self.join(path).is_file()
+        content_view::is_file(&self.join(path))
     }
     fn namespaces(&self) -> Vec<String> {
-        std::fs::read_dir(self.join("assets"))
+        content_view::read_dir(self.join("assets"))
             .into_iter()
             .flatten()
-            .flatten()
-            .filter(|e| e.path().is_dir())
+            .filter(|e| e.is_dir())
             .filter_map(|e| e.file_name().to_str().map(str::to_owned))
             .collect()
     }
@@ -121,6 +129,34 @@ impl Language {
     /// from every namespace and every source in priority order (later sources
     /// override).
     pub fn load(sources: &[&dyn ResourceSource], code: &str) -> Self {
+        let started = std::time::Instant::now();
+        let cache = language_cache(sources, code);
+        if let Some(language) = cache
+            .as_ref()
+            .and_then(|c| c.read_value::<Self>())
+            .filter(|language| language.code == code)
+        {
+            log::info!(
+                "Horizon: stage=language cache=hit elapsed_ms={}",
+                started.elapsed().as_millis()
+            );
+            return language;
+        }
+        let language = Self::load_uncached(sources, code);
+        if let Some(cache) = cache
+            .as_ref()
+            .filter(|cache| Some(*cache) == language_cache(sources, code).as_ref())
+        {
+            let _ = cache.write_value(&language);
+        }
+        log::info!(
+            "Horizon: stage=language cache=miss elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
+        language
+    }
+
+    fn load_uncached(sources: &[&dyn ResourceSource], code: &str) -> Self {
         let mut map = HashMap::new();
         let mut codes = vec![DEFAULT];
         if code != DEFAULT {
@@ -155,7 +191,7 @@ impl Language {
         {
             apply_deprecated(&mut map, &bytes);
         }
-        let bidirectional = available(sources)
+        let bidirectional = declared_languages(sources, Some(code))
             .iter()
             .any(|info| info.code == code && info.bidirectional);
         Self {
@@ -166,6 +202,9 @@ impl Language {
     }
     pub fn get(&self, key: &str) -> Option<&str> {
         self.map.get(key).map(String::as_str)
+    }
+    fn get_or<'a>(&'a self, key: &str, fallback: &'a str) -> &'a str {
+        self.get(key).unwrap_or(fallback)
     }
     /// The resolved map, for `horizon_protocol::text::plain`: a server's
     /// components carry keys, and the network layer resolves them with this.
@@ -180,8 +219,30 @@ impl Language {
     }
 }
 
+fn language_cache(
+    sources: &[&dyn ResourceSource],
+    code: &str,
+) -> Option<horizon_world::resource_cache::Cache> {
+    use horizon_world::resource_cache::Cache;
+    let root = sources.first()?.cache_root()?;
+    // Resource order is significant: later sources override earlier ones.
+    let mut identity = Vec::new();
+    identity.extend_from_slice(&(code.len() as u64).to_le_bytes());
+    identity.extend_from_slice(code.as_bytes());
+    identity.extend_from_slice(&(sources.len() as u64).to_le_bytes());
+    for source in sources {
+        let tree = Cache::for_tree(source.cache_root()?, "language-source-v1", &[])?;
+        identity.extend_from_slice(tree.identity());
+    }
+    Cache::new(root, "language-v1", &[], &identity)
+}
+
 /// Languages declared by `pack.mcmeta` files (the vanilla asset root first).
 pub fn available(sources: &[&dyn ResourceSource]) -> Vec<LanguageInfo> {
+    declared_languages(sources, None)
+}
+
+fn declared_languages(sources: &[&dyn ResourceSource], only: Option<&str>) -> Vec<LanguageInfo> {
     let mut found: BTreeMap<String, LanguageInfo> = BTreeMap::new();
     found.insert(
         DEFAULT.into(),
@@ -201,6 +262,9 @@ pub fn available(sources: &[&dyn ResourceSource]) -> Vec<LanguageInfo> {
                 continue;
             };
             for (code, info) in value["language"].as_object().into_iter().flatten() {
+                if only.is_some_and(|selected| selected != code.as_str()) {
+                    continue;
+                }
                 // Only languages whose file exists somewhere are selectable.
                 let file = format!("assets/minecraft/lang/{code}.json");
                 if code != DEFAULT && !sources.iter().any(|s| s.exists(&file)) {
@@ -237,15 +301,14 @@ pub fn code() -> String {
 }
 /// Language.getOrDefault: the translation, or the key itself.
 pub fn get(key: &str) -> String {
-    current()
-        .and_then(|l| l.get(key).map(str::to_owned))
-        .unwrap_or_else(|| key.to_owned())
+    get_or(key, key)
 }
 /// The translation, or `fallback` when the key is missing.
 pub fn get_or(key: &str, fallback: &str) -> String {
     current()
-        .and_then(|l| l.get(key).map(str::to_owned))
-        .unwrap_or_else(|| fallback.to_owned())
+        .as_deref()
+        .map_or(fallback, |l| l.get_or(key, fallback))
+        .to_owned()
 }
 pub fn has(key: &str) -> bool {
     current().is_some_and(|l| l.get(key).is_some())
@@ -258,6 +321,52 @@ pub fn tr(key: &str, args: &[&dyn std::fmt::Display]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn snapshot_preserves_language_layering_and_falls_back_after_changes_or_corruption() {
+        use std::fs;
+        let root =
+            std::env::temp_dir().join(format!("horizon-language-snapshot-{}", std::process::id()));
+        let base = root.join("base");
+        let pack = root.join("pack");
+        for dir in [&base, &pack] {
+            fs::create_dir_all(dir.join("assets/minecraft/lang")).unwrap();
+            fs::write(dir.join("horizon-mod-content.stamp"), b"content").unwrap();
+        }
+        let file = "assets/minecraft/lang/en_us.json";
+        fs::write(base.join(file), br#"{"a":"base","fallback":"English"}"#).unwrap();
+        fs::write(pack.join(file), br#"{"a":"pack"}"#).unwrap();
+        fs::write(
+            pack.join("assets/minecraft/lang/fr_fr.json"),
+            br#"{"a":"French"}"#,
+        )
+        .unwrap();
+        let sources: [&dyn ResourceSource; 2] = [&base, &pack];
+        for code in ["en_us", "fr_fr"] {
+            let cold = Language::load(&sources, code);
+            let cache = language_cache(&sources, code).unwrap();
+            assert!(cache.read_value::<Language>().is_some());
+            let warm = Language::load(&sources, code);
+            assert_eq!(cold.map(), warm.map());
+            assert_eq!(warm.get("fallback"), Some("English"));
+            assert_eq!(
+                warm.get("a"),
+                Some(if code == "en_us" { "pack" } else { "French" })
+            );
+            cache.write(b"corrupt typed snapshot").unwrap();
+            assert_eq!(Language::load(&sources, code).map(), cold.map());
+        }
+        fs::write(pack.join(file), br#"{"a":"updated pack"}"#).unwrap();
+        assert_eq!(
+            Language::load(&sources, "en_us").get("a"),
+            Some("updated pack")
+        );
+        let reversed: [&dyn ResourceSource; 2] = [&pack, &base];
+        assert_eq!(Language::load(&reversed, "en_us").get("a"), Some("base"));
+        fs::write(base.join("horizon-mod-content.stamp"), b"new content").unwrap();
+        assert!(language_cache(&sources, "en_us").unwrap().read().is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
     struct Mem(HashMap<String, Vec<u8>>);
     impl ResourceSource for Mem {
         fn read(&self, path: &str) -> Option<Vec<u8>> {
@@ -311,6 +420,100 @@ mod tests {
             ["en_us", "fr_fr"]
         );
         assert_eq!(langs[1].label(), "Français (France)");
+    }
+
+    #[test]
+    fn loading_a_locale_reads_only_it_and_english() {
+        #[derive(Default)]
+        struct Reads(std::cell::RefCell<Vec<String>>);
+        impl ResourceSource for Reads {
+            fn read(&self, path: &str) -> Option<Vec<u8>> {
+                if path.starts_with("assets/minecraft/lang/") && !path.ends_with("/deprecated.json")
+                {
+                    self.0.borrow_mut().push(path.into());
+                }
+                None
+            }
+        }
+
+        let reads = Reads::default();
+        Language::load(&[&reads], "en_us");
+        assert_eq!(reads.0.take(), ["assets/minecraft/lang/en_us.json"]);
+        Language::load(&[&reads], "fr_fr");
+        assert_eq!(
+            reads.0.take(),
+            [
+                "assets/minecraft/lang/en_us.json",
+                "assets/minecraft/lang/fr_fr.json"
+            ]
+        );
+    }
+
+    #[test]
+    fn startup_and_language_switch_read_only_requested_locales_and_preserve_fallbacks() {
+        use std::{cell::RefCell, collections::BTreeSet};
+
+        let english = "assets/ruby/lang/en_us.json";
+        let french = "assets/ruby/lang/fr_fr.json";
+        let german = "assets/ruby/lang/de_de.json";
+        let minecraft_english = "assets/minecraft/lang/en_us.json";
+        let minecraft_french = "assets/minecraft/lang/fr_fr.json";
+        let minecraft_german = "assets/minecraft/lang/de_de.json";
+        let shared = "fixture.shared";
+        let fallback = "fixture.fallback";
+        let missing = "fixture.missing";
+        let en = [(shared, "English"), (fallback, "English only")];
+        let fr = [(shared, "French")];
+        let de = [(shared, "German")];
+        let files = HashMap::from([
+            (english, serde_json::to_vec(&BTreeMap::from(en)).unwrap()),
+            (french, serde_json::to_vec(&BTreeMap::from(fr)).unwrap()),
+            (german, serde_json::to_vec(&BTreeMap::from(de)).unwrap()),
+            (minecraft_french, b"{}".to_vec()),
+            (minecraft_german, b"{}".to_vec()),
+            (minecraft_english, b"{}".to_vec()),
+            (
+                "assets/pack.mcmeta",
+                br#"{"language":{"fr_fr":{"bidirectional":true},"de_de":{},"it_it":{}}}"#.to_vec(),
+            ),
+        ]);
+
+        struct RecordedSource {
+            files: HashMap<&'static str, Vec<u8>>,
+            reads: RefCell<BTreeSet<String>>,
+        }
+        impl ResourceSource for RecordedSource {
+            fn read(&self, path: &str) -> Option<Vec<u8>> {
+                if path.contains("/lang/") && !path.ends_with("/deprecated.json") {
+                    self.reads.borrow_mut().insert(path.to_owned());
+                }
+                self.files.get(path).cloned()
+            }
+
+            fn namespaces(&self) -> Vec<String> {
+                vec!["minecraft".into(), "ruby".into()]
+            }
+        }
+
+        let source = RecordedSource {
+            files,
+            reads: RefCell::default(),
+        };
+        // Start in French, then switch to German using the same resource root.
+        for (code, translated, rtl) in [("fr_fr", fr[0].1, true), ("de_de", de[0].1, false)] {
+            let language = Language::load(&[&source], code);
+            let expected_reads: BTreeSet<_> = ["minecraft", "horizon", "ruby"]
+                .into_iter()
+                .flat_map(|ns| {
+                    [DEFAULT, code].map(|locale| format!("assets/{ns}/lang/{locale}.json"))
+                })
+                .collect();
+            assert_eq!(source.reads.take(), expected_reads);
+            assert_eq!(language.bidirectional, rtl);
+            assert_eq!(language.get_or(shared, shared), translated);
+            assert_eq!(language.get_or(fallback, fallback), en[1].1);
+            assert_eq!(language.get_or(missing, missing), missing);
+        }
     }
 
     #[test]

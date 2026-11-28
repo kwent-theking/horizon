@@ -345,7 +345,7 @@ impl Game<'_> {
         face: [i32; 3],
         play_sound: bool,
     ) {
-        let state = self.world.block(pos[0], pos[1], pos[2]);
+        let state = self.target_block(pos);
         if self.res.facts().is_air(state) {
             return;
         }
@@ -354,7 +354,7 @@ impl Game<'_> {
             // Each guest plays it from the level event itself.
             self.audio.play_unshared(
                 &sounds.hit,
-                Some(pos.map(|v| f64::from(v) + 0.5)),
+                Some(self.block_world_center(pos)),
                 (sounds.volume + 1.0) / 8.0,
                 sounds.pitch * 0.5,
             );

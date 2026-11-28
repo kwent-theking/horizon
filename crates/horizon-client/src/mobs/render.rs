@@ -150,6 +150,14 @@ pub fn body(m: &Mob) -> (String, String) {
             s.to_owned()
         }
     };
+    if m.kind.anim == super::anim::Anim::Gecko {
+        // A GeckoLib mob: its one model (MobType.model) and texture.
+        return ("gecko#main".into(), m.kind.texture.clone());
+    }
+    if m.kind.anim == super::anim::Anim::Modded {
+        // A dumped Java-modelled mob, likewise (mobs/modded).
+        return ("modded#main".into(), m.kind.texture.clone());
+    }
     if avatar(m) {
         // AvatarRenderer: PlayerModel's slim layer for a slim skin.
         return (
@@ -463,7 +471,12 @@ pub fn body_color(m: &Mob, alpha: f32) -> u32 {
 pub fn layers(m: &Mob) -> Vec<Layer> {
     use Species as S;
     let mut v = Vec::new();
-    if avatar(m) {
+    if avatar(m)
+        || matches!(
+            m.kind.anim,
+            super::anim::Anim::Gecko | super::anim::Anim::Modded
+        )
+    {
         return v;
     }
     let white = 0xFFFF_FFFF;
@@ -995,6 +1008,7 @@ pub fn base_transform_at(m: &Mob, alpha: f32, origin: glam::Mat4) -> glam::Mat4 
             base *= glam::Mat4::from_translation(glam::Vec3::new(0.0, -1.0, 0.3));
         }
     }
+    base *= crate::player_anim::root_transform(m, alpha);
     base *= species_rotations(m, alpha);
     base *= glam::Mat4::from_scale(glam::Vec3::new(-1.0, -1.0, 1.0));
     base *= species_scale(m, alpha);
@@ -1097,6 +1111,73 @@ fn species_scale(m: &Mob, alpha: f32) -> glam::Mat4 {
         _ => glam::Mat4::IDENTITY,
     }
 }
+/// Animation and part detail chosen from distance and the Entity Anim LOD option.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum AnimDetail {
+    #[default]
+    Full,
+    ReducedRate {
+        skip_molang: bool,
+        trim_layers: bool,
+    },
+    StaticCore,
+}
+
+/// Picks the entity animation LOD tier from squared distance (blocks^2) to the camera.
+pub fn anim_detail_for(
+    dist_sq: f64,
+    mode: horizon_client_render::graphics::EntityLod,
+) -> AnimDetail {
+    use horizon_client_render::graphics::EntityLod;
+    let (mid_sq, far_sq) = match mode {
+        EntityLod::Off => return AnimDetail::Full,
+        EntityLod::Balanced => (24.0 * 24.0, 48.0 * 48.0),
+        EntityLod::Aggressive => (16.0 * 16.0, 32.0 * 32.0),
+    };
+    if dist_sq <= mid_sq {
+        AnimDetail::Full
+    } else if dist_sq <= far_sq {
+        AnimDetail::ReducedRate {
+            skip_molang: true,
+            trim_layers: true,
+        }
+    } else {
+        AnimDetail::StaticCore
+    }
+}
+
+fn state_for_detail(m: &Mob, alpha: f32, detail: AnimDetail) -> anim::State {
+    match detail {
+        AnimDetail::Full => anim::state(m, alpha),
+        AnimDetail::ReducedRate { .. } | AnimDetail::StaticCore => {
+            let mut s = anim::state(m, 0.0);
+            s.age = (m.age & !1) as f32;
+            s.partial = 0.0;
+            s
+        }
+    }
+}
+
+fn setup_pose_for_detail(
+    m: &Mob,
+    s: &anim::State,
+    poses: &mut Poses,
+    animations: &std::collections::HashMap<String, super::keyframes::Animation>,
+    detail: AnimDetail,
+) {
+    match detail {
+        AnimDetail::Full => anim::setup(m, s, poses, animations),
+        AnimDetail::ReducedRate { skip_molang, .. } => {
+            if skip_molang && m.kind.anim == anim::Anim::Gecko {
+                super::gecko::animate_with_lod(m, s, poses, true);
+            } else {
+                anim::setup(m, s, poses, animations);
+            }
+        }
+        AnimDetail::StaticCore => {}
+    }
+}
+
 /// Draw a part tree with a pose map, texture rect, colour and light.
 #[allow(clippy::too_many_arguments)]
 pub fn draw(
@@ -1126,7 +1207,7 @@ pub fn draw_scrolled(
     overlay: u32,
     out: &mut Vec<Vertex>,
 ) {
-    draw_normals(
+    draw_normals_with_depth(
         part,
         base,
         ModelNormals::new(base),
@@ -1136,11 +1217,12 @@ pub fn draw_scrolled(
         color,
         light,
         overlay,
+        u8::MAX,
         out,
     );
 }
 #[allow(clippy::too_many_arguments)]
-fn draw_normals(
+fn draw_normals_with_depth(
     part: &Part,
     base: glam::Mat4,
     normals: ModelNormals,
@@ -1150,6 +1232,7 @@ fn draw_normals(
     color: u32,
     light: u32,
     overlay: u32,
+    depth_left: u8,
     out: &mut Vec<Vertex>,
 ) {
     let p = poses.pose(part);
@@ -1195,8 +1278,23 @@ fn draw_normals(
             }
         }
     }
+    if depth_left == 0 {
+        return;
+    }
     for c in &part.children {
-        draw_normals(c, m, normals, poses, uv, scroll, color, light, overlay, out);
+        draw_normals_with_depth(
+            c,
+            m,
+            normals,
+            poses,
+            uv,
+            scroll,
+            color,
+            light,
+            overlay,
+            depth_left - 1,
+            out,
+        );
     }
 }
 /// Render a mob with its variant model, texture and layers.
@@ -1225,6 +1323,31 @@ pub fn render_with(
     extra: &[(&Part, [f32; 4], u32, u32)],
     out: &mut Vec<Vertex>,
 ) {
+    render_with_detail(
+        m,
+        alpha,
+        camera,
+        atlas,
+        light,
+        data,
+        extra,
+        AnimDetail::Full,
+        out,
+    );
+}
+/// [`render_with`] with explicit distance-based [`AnimDetail`] LOD.
+#[allow(clippy::too_many_arguments)]
+pub fn render_with_detail(
+    m: &Mob,
+    alpha: f32,
+    camera: glam::DVec3,
+    atlas: Atlas,
+    light: u32,
+    data: &MobData,
+    extra: &[(&Part, [f32; 4], u32, u32)],
+    detail: AnimDetail,
+    out: &mut Vec<Vertex>,
+) {
     // The invisibility effect hides the model (a drinking wandering trader);
     // an illusioner shows its four mirror images instead.
     if super::trader::is_invisible(m) {
@@ -1235,12 +1358,12 @@ pub fn render_with(
                 let shifted =
                     camera - glam::DVec3::new(off[0] + w[0], off[1] + w[1], off[2] + w[2]);
                 let base = base_transform(m, alpha, shifted);
-                render_visible(m, alpha, base, atlas, light, data, extra, true, out);
+                render_visible_detail(m, alpha, base, atlas, light, data, extra, true, detail, out);
             }
         }
         return;
     }
-    render_visible(
+    render_visible_detail(
         m,
         alpha,
         base_transform(m, alpha, camera),
@@ -1249,6 +1372,7 @@ pub fn render_with(
         data,
         extra,
         true,
+        detail,
         out,
     );
 }
@@ -1338,26 +1462,60 @@ fn render_visible(
     body_visible: bool,
     out: &mut Vec<Vertex>,
 ) {
+    render_visible_detail(
+        m,
+        alpha,
+        base,
+        atlas,
+        light,
+        data,
+        extra,
+        body_visible,
+        AnimDetail::Full,
+        out,
+    );
+}
+
+fn body_part<'a>(m: &'a Mob, model_key: &str) -> &'a Part {
+    m.kind.layer(model_key).unwrap_or(&m.kind.model)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_visible_detail(
+    m: &Mob,
+    alpha: f32,
+    base: glam::Mat4,
+    atlas: Atlas,
+    light: u32,
+    data: &MobData,
+    extra: &[(&Part, [f32; 4], u32, u32)],
+    body_visible: bool,
+    detail: AnimDetail,
+    out: &mut Vec<Vertex>,
+) {
     let overlay = u32::from(red_overlay(m));
-    let s = anim::state(m, alpha);
+    let s = state_for_detail(m, alpha, detail);
     let (model_key, texture) = body(m);
-    let model = m
-        .kind
-        .layer(&model_key)
-        .cloned()
-        .unwrap_or_else(|| m.kind.model.clone());
-    let mut poses = Poses::new(&model);
-    anim::setup(m, &s, &mut poses, &data.animations);
+    let model = body_part(m, &model_key);
+    let mut poses = Poses::new(model);
+    setup_pose_for_detail(m, &s, &mut poses, &data.animations, detail);
+    let max_depth = match detail {
+        AnimDetail::StaticCore => 1u8,
+        AnimDetail::Full | AnimDetail::ReducedRate { .. } => u8::MAX,
+    };
     let draw_body = |out: &mut Vec<Vertex>| {
         if body_visible && let Some(uv) = atlas(&texture) {
-            draw(
-                &model,
+            draw_normals_with_depth(
+                model,
                 base,
+                ModelNormals::new(base),
                 &poses,
                 uv,
+                0.0,
                 body_color(m, alpha),
                 light,
                 body_overlay(m, alpha),
+                max_depth,
                 out,
             );
         }
@@ -1367,12 +1525,25 @@ fn render_visible(
     if !shell_last {
         draw_body(out);
     }
+    if detail == AnimDetail::StaticCore {
+        if shell_last {
+            draw_body(out);
+        }
+        return;
+    }
     for (part, uv, color, layer_overlay) in extra {
         draw(part, base, &poses, *uv, *color, light, *layer_overlay, out);
     }
-    let mut all_layers = layers(m);
+    let trim_layers = matches!(
+        detail,
+        AnimDetail::ReducedRate {
+            trim_layers: true,
+            ..
+        }
+    );
+    let mut all_layers = if trim_layers { Vec::new() } else { layers(m) };
     // WardenRenderer: the translucent emissive layers fade with the animations.
-    if m.species() == Species::Warden {
+    if !trim_layers && m.species() == Species::Warden {
         for (model, texture, a) in super::warden::emissive_layers(m, alpha) {
             if a > 0.0 {
                 all_layers.push(Layer {
@@ -1386,29 +1557,36 @@ fn render_visible(
         }
     }
     // One Poses refilled for every layer (armour draws up to seven): it keeps
-    // its maps' capacity.
+    // its maps' capacity, and layers using the body model reuse `poses`.
     let mut layer_poses = Poses::default();
-    for layer in all_layers {
-        let Some(part) = m.kind.layer(&layer.model).cloned() else {
+    for layer in &all_layers {
+        let Some(part) = m.kind.layer(&layer.model) else {
             continue;
         };
         let Some(uv) = atlas(&layer.texture) else {
             continue;
         };
-        layer_poses.reset(&part);
-        anim::setup(m, &s, &mut layer_poses, &data.animations);
-        if matches!(m.species(), Species::Villager | Species::ZombieVillager)
-            && let Some((folder, variant)) = layer
-                .texture
-                .split_once("/type/")
-                .or_else(|| layer.texture.split_once("/baby/"))
-        {
-            let profession = PROFESSIONS[m.extra.variant2 as usize % PROFESSIONS.len()];
-            data.villager_hats
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .apply(folder, variant, profession, &mut layer_poses);
-        }
+        let villager_hat = matches!(m.species(), Species::Villager | Species::ZombieVillager)
+            && (layer.texture.contains("/type/") || layer.texture.contains("/baby/"));
+        let active_poses: &Poses = if layer.model == model_key && !villager_hat {
+            &poses
+        } else {
+            layer_poses.reset(part);
+            setup_pose_for_detail(m, &s, &mut layer_poses, &data.animations, detail);
+            if matches!(m.species(), Species::Villager | Species::ZombieVillager)
+                && let Some((folder, variant)) = layer
+                    .texture
+                    .split_once("/type/")
+                    .or_else(|| layer.texture.split_once("/baby/"))
+            {
+                let profession = PROFESSIONS[m.extra.variant2 as usize % PROFESSIONS.len()];
+                data.villager_hats
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .apply(folder, variant, profession, &mut layer_poses);
+            }
+            &layer_poses
+        };
         let light = if layer.full_bright {
             240 | 240 << 8
         } else {
@@ -1423,9 +1601,9 @@ fn render_visible(
         };
         let start = out.len();
         draw_scrolled(
-            &part,
+            part,
             base,
-            &layer_poses,
+            active_poses,
             uv,
             layer.scroll,
             layer.color,
@@ -1440,12 +1618,13 @@ fn render_visible(
         }
     }
     // EnergySwirlLayer: the armour model, additive, scrolling over the sprite.
-    if let Some((model, texture, x_offset)) = energy_swirl(m, s.age)
+    if !trim_layers
+        && let Some((model, texture, x_offset)) = energy_swirl(m, s.age)
         && let Some(part) = m.kind.layer(model)
         && let Some([u0, v0, u1, v1]) = atlas(texture)
     {
         layer_poses.reset(part);
-        anim::setup(m, &s, &mut layer_poses, &data.animations);
+        setup_pose_for_detail(m, &s, &mut layer_poses, &data.animations, detail);
         // `RenderTypes.energySwirl`'s texture offset, as the sprite-local UV.
         let (du, dv) = (x_offset % 1.0, s.age * 0.01 % 1.0);
         let start = out.len();
@@ -1505,10 +1684,10 @@ pub fn render_single(
     let base = base_transform(m, alpha, camera);
     let overlay = body_overlay(m, alpha);
     let s = anim::state(m, alpha);
-    let model = m.kind.model.clone();
-    let mut poses = Poses::new(&model);
+    let model = &m.kind.model;
+    let mut poses = Poses::new(model);
     anim::setup(m, &s, &mut poses, &std::collections::HashMap::new());
-    draw(&model, base, &poses, uv, 0xFFFF_FFFF, light, overlay, out);
+    draw(model, base, &poses, uv, 0xFFFF_FFFF, light, overlay, out);
 }
 
 /// The transform of a named part (ModelPart.translateAndRotate down the tree).
@@ -1601,14 +1780,10 @@ pub fn part_transform(
     let base = base_transform(m, alpha, camera);
     let s = anim::state(m, alpha);
     let (model_key, _) = body(m);
-    let model = m
-        .kind
-        .layer(&model_key)
-        .cloned()
-        .unwrap_or_else(|| m.kind.model.clone());
-    let mut poses = Poses::new(&model);
+    let model = body_part(m, &model_key);
+    let mut poses = Poses::new(model);
     anim::setup(m, &s, &mut poses, &data.animations);
-    part_matrix(&model, base, &poses, part, 0.0)
+    part_matrix(model, base, &poses, part, 0.0)
 }
 /// `FoxHeldItemLayer`: the item sits at the head's position under the render
 /// state's head roll, yaw and pitch (not the posed head's, which differ while
@@ -1617,12 +1792,8 @@ fn fox_item_transform(m: &Mob, alpha: f32, camera: glam::DVec3, data: &MobData) 
     use glam::{Mat4, Vec3};
     let s = anim::state(m, alpha);
     let (model_key, _) = body(m);
-    let model = m
-        .kind
-        .layer(&model_key)
-        .cloned()
-        .unwrap_or_else(|| m.kind.model.clone());
-    let mut poses = Poses::new(&model);
+    let model = body_part(m, &model_key);
+    let mut poses = Poses::new(model);
     anim::setup(m, &s, &mut poses, &data.animations);
     let head = *poses.get("head");
     let fox = super::fox::pose(m, alpha);
@@ -1673,14 +1844,10 @@ pub fn held_item_transform(
     let base = base_transform(m, alpha, camera);
     let s = anim::state(m, alpha);
     let (model_key, _) = body(m);
-    let model = m
-        .kind
-        .layer(&model_key)
-        .cloned()
-        .unwrap_or_else(|| m.kind.model.clone());
-    let mut poses = Poses::new(&model);
+    let model = body_part(m, &model_key);
+    let mut poses = Poses::new(model);
     anim::setup(m, &s, &mut poses, &data.animations);
-    let mut t = hand_base(m, &model, base, &poses, left)?;
+    let mut t = hand_base(m, model, base, &poses, left)?;
     // ItemInHandLayer: a STAB swing of this arm thrusts its item out
     // (SpearAnimations.thirdPersonAttackItem, the main hand's forward
     // movement), and a spear in use moves with it (ArmPose.SPEAR's
@@ -1715,6 +1882,86 @@ pub fn held_item_transform(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parallel_bodies_preserve_pose_vertices_and_entity_order() {
+        use horizon_core::geometry::Vec3;
+        use std::sync::Arc;
+        let mut kind = (*super::super::sensor_scan_tests::kind()).clone();
+        let face = serde_json::json!({
+            "polygons": [[[0,0,0,0,0], [1,0,0,1,0], [1,1,0,1,1], [0,1,0,0,1]]],
+            "normals": [[0,0,1]]
+        });
+        kind.model = Arc::new(Part::parse(
+            "root",
+            &serde_json::json!({
+                "children": {"body": face, "head": face}
+            }),
+        ));
+        let kind = Arc::new(kind);
+        let mobs: Vec<_> = (0..65)
+            .map(|id| {
+                let mut mob = Mob::new(
+                    id,
+                    kind.clone(),
+                    Vec3::new(f64::from(id), 2.0, 3.0),
+                    id as f32,
+                );
+                mob.previous = Vec3::new(f64::from(id) - 0.25, 1.5, 2.5);
+                mob.age = id * 3;
+                mob.head_pitch = id as f32;
+                mob.limb_position = id as f32 * 0.3;
+                mob.limb_speed = 0.5;
+                mob.previous_limb_speed = 0.25;
+                mob.hurt_time = (id % 3) as i32;
+                mob
+            })
+            .collect();
+        let data = MobData {
+            states: Vec::new(),
+            placements: Default::default(),
+            heightmaps: Default::default(),
+            animations: Default::default(),
+            villager_hats: Default::default(),
+            biome_tags: Default::default(),
+            entity_tags: Default::default(),
+            pois: Default::default(),
+        };
+        let camera = glam::DVec3::new(0.125, 1.0, -3.0);
+        let mut serial = Vec::new();
+        for mob in &mobs {
+            render_with(
+                mob,
+                0.375,
+                camera,
+                &|_| Some([0.0, 0.0, 1.0, 1.0]),
+                0xf070,
+                &data,
+                &[],
+                &mut serial,
+            );
+        }
+        assert!(!serial.is_empty());
+        for threads in [1, 2, 6] {
+            let mut parallel = Vec::new();
+            crate::par::map_batches_with(
+                threads,
+                &mobs,
+                16,
+                |mob| {
+                    let mut body = Vec::new();
+                    let lookup = |_: &str| Some([0.0, 0.0, 1.0, 1.0]);
+                    render_with(mob, 0.375, camera, &lookup, 0xf070, &data, &[], &mut body);
+                    body
+                },
+                |body| parallel.extend(body),
+            );
+            assert_eq!(
+                bytemuck::cast_slice::<Vertex, u8>(&parallel),
+                bytemuck::cast_slice::<Vertex, u8>(&serial)
+            );
+        }
+    }
 
     /// VillagerProfessionLayer's textures (type, or baby for a baby;
     /// profession; level) of every villager and zombie villager are in the
@@ -2078,5 +2325,105 @@ mod scroll_tests {
         assert!((scroll_u(0.25, 0.5) - 0.75).abs() < 1e-6);
         assert!((scroll_u(0.75, 0.5) - 0.25).abs() < 1e-6);
         assert!((scroll_u(1.0, 0.5) - 0.5).abs() < 1e-6);
+    }
+}
+
+#[cfg(test)]
+mod lod_tests {
+    use super::*;
+    use horizon_client_render::graphics::EntityLod;
+
+    #[test]
+    fn anim_detail_tiers_respect_distance_and_mode() {
+        assert_eq!(anim_detail_for(10_000.0, EntityLod::Off), AnimDetail::Full);
+        assert_eq!(
+            anim_detail_for(100.0, EntityLod::Balanced),
+            AnimDetail::Full
+        );
+        assert!(matches!(
+            anim_detail_for(30.0 * 30.0, EntityLod::Balanced),
+            AnimDetail::ReducedRate {
+                skip_molang: true,
+                trim_layers: true
+            }
+        ));
+        assert_eq!(
+            anim_detail_for(60.0 * 60.0, EntityLod::Balanced),
+            AnimDetail::StaticCore
+        );
+        assert!(matches!(
+            anim_detail_for(20.0 * 20.0, EntityLod::Aggressive),
+            AnimDetail::ReducedRate { .. }
+        ));
+        assert_eq!(
+            anim_detail_for(40.0 * 40.0, EntityLod::Aggressive),
+            AnimDetail::StaticCore
+        );
+    }
+
+    #[test]
+    fn static_core_limits_nested_subparts_while_full_draws_them() {
+        use horizon_core::geometry::Vec3;
+        use std::sync::Arc;
+        let face = serde_json::json!({
+            "polygons": [[[0,0,0,0,0], [1,0,0,1,0], [1,1,0,1,1], [0,1,0,0,1]]],
+            "normals": [[0,0,1]]
+        });
+        let ear_tuft = face.clone();
+        let head = serde_json::json!({
+            "polygons": [[[0,0,0,0,0], [1,0,0,1,0], [1,1,0,1,1], [0,1,0,0,1]]],
+            "normals": [[0,0,1]],
+            "children": { "ear_tuft": ear_tuft }
+        });
+        let mut kind = (*super::super::sensor_scan_tests::kind()).clone();
+        kind.model = Arc::new(Part::parse(
+            "root",
+            &serde_json::json!({
+                "polygons": [[[0,0,0,0,0], [1,0,0,1,0], [1,1,0,1,1], [0,1,0,0,1]]],
+                "normals": [[0,0,1]],
+                "children": { "head": head }
+            }),
+        ));
+        let m = Mob::new(1, Arc::new(kind), Vec3::ZERO, 0.0);
+        let data = MobData {
+            states: Vec::new(),
+            placements: Default::default(),
+            heightmaps: Default::default(),
+            animations: Default::default(),
+            villager_hats: Default::default(),
+            biome_tags: Default::default(),
+            entity_tags: Default::default(),
+            pois: Default::default(),
+        };
+        let atlas = |_: &str| Some([0.0, 0.0, 1.0, 1.0]);
+        let mut full = Vec::new();
+        let mut far = Vec::new();
+        render_with_detail(
+            &m,
+            0.5,
+            glam::DVec3::ZERO,
+            &atlas,
+            240,
+            &data,
+            &[],
+            AnimDetail::Full,
+            &mut full,
+        );
+        render_with_detail(
+            &m,
+            0.5,
+            glam::DVec3::ZERO,
+            &atlas,
+            240,
+            &data,
+            &[],
+            AnimDetail::StaticCore,
+            &mut far,
+        );
+        assert!(
+            far.len() < full.len(),
+            "far StaticCore skips depth >= 2 subparts"
+        );
+        assert!(!far.is_empty(), "core body and head remain visible");
     }
 }

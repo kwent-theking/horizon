@@ -8,6 +8,7 @@
 //! maps are kept as found (structure search is not run); conditions that
 //! need an entity, tool or damage source fail when the context has none, as
 //! they do for containers.
+use crate::content_view;
 use horizon_core::random::{LegacyRandom, RandomSource};
 use serde_json::Value;
 use std::{
@@ -278,17 +279,20 @@ fn int_value(v: &Value) -> Option<i64> {
 /// a content mods' root theirs (docs/modpacks.md), whose chests name their
 /// own loot tables.
 fn load_kind(data: &Path, kind: &str, out: &mut HashMap<String, Value>) -> io::Result<()> {
-    let Ok(entries) = fs::read_dir(data) else {
+    let Ok(entries) = content_view::read_dir(data) else {
         return Ok(());
     };
     let mut namespaces: Vec<String> = entries
-        .flatten()
-        .filter(|e| e.path().is_dir())
+        .into_iter()
+        .filter(|e| e.is_dir())
         .filter_map(|e| e.file_name().to_str().map(str::to_owned))
         .collect();
     namespaces.sort();
+    // Recipes already had their own archive loading paths. Keep LootData's
+    // existing recipe input while expanding the loot table input.
+    let archived = kind == "loot_table";
     for ns in namespaces {
-        load_dir(&data.join(&ns).join(kind), &ns, "", out)?;
+        load_dir(&data.join(&ns).join(kind), &ns, "", archived, out)?;
     }
     Ok(())
 }
@@ -297,20 +301,28 @@ fn load_dir(
     dir: &Path,
     namespace: &str,
     prefix: &str,
+    archived: bool,
     out: &mut HashMap<String, Value>,
 ) -> io::Result<()> {
-    let Ok(entries) = fs::read_dir(dir) else {
+    let Ok(entries) = content_view::read_dir(dir) else {
         return Ok(());
     };
-    for entry in entries.flatten() {
+    for entry in entries {
         let path = entry.path();
         let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
             continue;
         };
-        if path.is_dir() {
-            load_dir(&path, namespace, &format!("{prefix}{stem}/"), out)?;
-        } else if path.extension().is_some_and(|e| e == "json") {
-            let value = serde_json::from_slice(&fs::read(&path)?)?;
+        if entry.is_dir() {
+            load_dir(&path, namespace, &format!("{prefix}{stem}/"), archived, out)?;
+        } else if path.extension().is_some_and(|e| e == "json")
+            && (archived || entry.served().is_none())
+        {
+            let bytes = if archived {
+                content_view::read(&path)?
+            } else {
+                fs::read(&path)?
+            };
+            let value = serde_json::from_slice(&bytes)?;
             out.insert(format!("{namespace}:{prefix}{stem}"), value);
         }
     }
@@ -358,6 +370,7 @@ impl LootData {
             &data.join("enchantment"),
             "minecraft",
             "",
+            false,
             &mut raw_enchantments,
         )?;
         let mut names: Vec<&String> = raw_enchantments.keys().collect();

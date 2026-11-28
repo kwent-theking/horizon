@@ -5,10 +5,12 @@
 //! `WeighedSoundEvents.getSound` drawing `nextInt(totalWeight)` from the sound
 //! instance's random.
 use horizon_core::random::RandomSource;
+use horizon_world::content_view;
 use serde_json::Value;
+#[cfg(test)]
+use std::fs;
 use std::{
     collections::{HashMap, HashSet},
-    fs,
     path::Path,
 };
 
@@ -18,7 +20,7 @@ pub const EMPTY: &str = "minecraft:empty";
 pub const INTENTIONALLY_EMPTY: &str = "minecraft:intentionally_empty";
 
 /// `SampledFloat` as sounds use it: constants and `MultipliedFloats`.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Sampled {
     Constant(f32),
     Product(Vec<Sampled>),
@@ -41,7 +43,7 @@ impl Sampled {
     }
 }
 /// `Sound`.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Sound {
     /// The file identifier (`namespace:path`, under `sounds/` with `.ogg`).
     pub location: String,
@@ -57,7 +59,7 @@ pub struct Sound {
     /// compares them by identity).
     pub sentinel: Sentinel,
 }
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Sentinel {
     #[default]
     None,
@@ -103,7 +105,7 @@ impl Sound {
     }
 }
 /// `WeighedSoundEvents`.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct WeighedSoundEvents {
     /// Files, or references to events (`Sound.event`).
     pub sounds: Vec<Sound>,
@@ -233,23 +235,16 @@ fn sound_files(namespace: &Path) -> HashSet<String> {
     let mut files = HashSet::new();
     let mut stack = vec![namespace.join("sounds")];
     while let Some(dir) = stack.pop() {
-        let Ok(entries) = fs::read_dir(&dir) else {
+        let Ok(entries) = content_view::read_dir(&dir) else {
             continue;
         };
-        for e in entries.flatten() {
+        for e in entries {
             let path = e.path();
-            // The listing's own type; a link is followed, as `is_file` does.
-            let Ok(kind) = e.file_type() else {
-                continue;
-            };
-            let (dir, file) = if kind.is_symlink() {
-                (path.is_dir(), path.is_file())
-            } else {
-                (kind.is_dir(), kind.is_file())
-            };
-            if dir {
+            if e.is_dir() {
                 stack.push(path);
-            } else if file && let Ok(rel) = path.strip_prefix(namespace) {
+            } else if (e.disk().is_some() || e.served().is_some())
+                && let Ok(rel) = path.strip_prefix(namespace)
+            {
                 files.insert(rel.to_string_lossy().replace('\\', "/"));
             }
         }
@@ -260,10 +255,32 @@ impl SoundRegistry {
     /// Every `assets/<namespace>/sounds.json` under a resource root, files
     /// validated against `assets/<namespace>/sounds/`.
     pub fn load(root: &Path) -> Self {
+        const CACHE_NAME: &str = "sound-events-v1";
+        let started = std::time::Instant::now();
+        let cache = horizon_world::resource_cache::Cache::for_tree(root, CACHE_NAME, b"");
+        if let Some(events) = cache
+            .as_ref()
+            .and_then(|cache| cache.read_value::<HashMap<String, WeighedSoundEvents>>())
+            && snapshot_is_valid(&events)
+        {
+            log::info!(
+                "load assets: sound registry snapshot hit {} ms",
+                started.elapsed().as_millis()
+            );
+            log::info!(
+                "Horizon: stage=sound_registry cache=hit elapsed_ms={}",
+                started.elapsed().as_millis()
+            );
+            return Self { events };
+        }
+        log::info!(
+            "load assets: sound registry snapshot miss {} ms",
+            started.elapsed().as_millis()
+        );
+        let load_started = std::time::Instant::now();
         let assets = root.join("assets");
-        let mut namespaces: Vec<String> = fs::read_dir(&assets)
+        let mut namespaces: Vec<String> = content_view::read_dir(&assets)
             .into_iter()
-            .flatten()
             .flatten()
             .filter_map(|e| e.file_name().to_str().map(str::to_owned))
             .collect();
@@ -277,11 +294,27 @@ impl SoundRegistry {
         let exists = |ns: &str, path: &str| files.get(ns).is_some_and(|f| f.contains(path));
         let mut registry = Self::default();
         for namespace in &namespaces {
-            let Ok(text) = fs::read(assets.join(namespace).join("sounds.json")) else {
+            let Ok(text) = content_view::read(assets.join(namespace).join("sounds.json")) else {
                 continue;
             };
             registry.add_file(namespace, &text, &exists);
         }
+        log::info!(
+            "load assets: sound registry source load {} ms",
+            load_started.elapsed().as_millis()
+        );
+        if let Some(cache) = cache {
+            let write_started = std::time::Instant::now();
+            let _ = cache.write_value(&registry.events);
+            log::info!(
+                "load assets: sound registry snapshot write {} ms",
+                write_started.elapsed().as_millis()
+            );
+        }
+        log::info!(
+            "Horizon: stage=sound_registry cache=miss elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
         registry
     }
     /// No sound event at all: the resources hold no `sounds.json` (sounds not
@@ -402,6 +435,32 @@ impl SoundRegistry {
     }
 }
 
+/// The cache contains only the pre-resolution values `load` can produce:
+/// positive finite constant samples, positive entry weights, and no sentinel
+/// instances (sentinels are synthesized by selection).
+fn snapshot_is_valid(events: &HashMap<String, WeighedSoundEvents>) -> bool {
+    events.iter().all(|(name, entry)| {
+        normalize(name).as_str() == name.as_str()
+            && entry.sounds.iter().all(|sound| {
+                sound.weight > 0
+                    && normalize(&sound.location).as_str() == sound.location.as_str()
+                    && sound.sentinel == Sentinel::None
+                    && valid_sample(&sound.volume)
+                    && valid_sample(&sound.pitch)
+            })
+    })
+}
+
+fn valid_sample(sample: &Sampled) -> bool {
+    match sample {
+        Sampled::Constant(value) => value.is_finite() && *value > 0.0,
+        // The loader's sounds.json parser creates constants. Products are
+        // produced later while selecting referenced events, not in the
+        // registry snapshot.
+        Sampled::Product(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -423,6 +482,41 @@ mod tests {
         let sounds = &r.get("minecraft:note").unwrap().sounds;
         let kept: Vec<&str> = sounds.iter().map(|s| s.location.as_str()).collect();
         assert_eq!(kept, ["minecraft:block/note/harp"]);
+    }
+
+    #[test]
+    fn registry_finds_a_sound_in_an_archive_only_folder() {
+        let root =
+            std::env::temp_dir().join(format!("horizon-archive-sounds-{}", std::process::id()));
+        let ns = root.join("assets/ruby");
+        fs::create_dir_all(&ns).unwrap();
+        let archive = root.join("sounds.hmod");
+        fs::write(&archive, b"").unwrap();
+        fs::write(
+            ns.join("sounds.json"),
+            br#"{"note":{"sounds":["ruby:block/note/gem","ruby:block/note/missing"]}}"#,
+        )
+        .unwrap();
+        let mut index = content_view::Index::default();
+        let number = index.add_archive(&archive).unwrap();
+        index.insert(
+            "assets/ruby/sounds/block/note/gem.ogg",
+            content_view::Stored {
+                archive: number,
+                offset: 0,
+                compressed: 0,
+                size: 0,
+                crc32: 0,
+                deflated: false,
+            },
+        );
+        index.mount(&root, &[archive]).unwrap();
+        let registry = SoundRegistry::load(&root);
+        content_view::unmount(&root);
+        let _ = fs::remove_dir_all(&root);
+        let sounds = &registry.get("ruby:note").unwrap().sounds;
+        assert_eq!(sounds.len(), 1);
+        assert_eq!(sounds[0].location, "ruby:block/note/gem");
     }
 
     #[test]
@@ -460,5 +554,61 @@ mod tests {
         let mut random = LegacyRandom::new(1);
         assert_eq!(r.sound("minecraft:a", &mut random).unwrap(), Sound::empty());
         assert!(r.sound("minecraft:b", &mut random).is_none());
+    }
+
+    #[test]
+    fn snapshot_round_trip_invalidation_and_corruption_fall_back() {
+        let root = std::env::temp_dir().join(format!(
+            "horizon-sounds-snapshot-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("horizon-mod-content.stamp"), b"fixture-v1").unwrap();
+        let ns = root.join("assets/minecraft");
+        fs::create_dir_all(ns.join("sounds/block")).unwrap();
+        fs::write(ns.join("sounds/block/one.ogg"), b"one").unwrap();
+        let sounds_json = ns.join("sounds.json");
+        fs::write(
+            &sounds_json,
+            br#"{"event": {"subtitle": "subtitle.one", "sounds": ["block/one"]}}"#,
+        )
+        .unwrap();
+
+        let cold = SoundRegistry::load(&root);
+        let cache = root.join(".horizon-derived/sound-events-v1");
+        assert!(cache.is_file());
+        let warm = SoundRegistry::load(&root);
+        assert_eq!(warm.get("minecraft:event"), cold.get("minecraft:event"));
+
+        fs::write(
+            &sounds_json,
+            br#"{"event": {"subtitle": "subtitle.two", "sounds": ["block/one"]}}"#,
+        )
+        .unwrap();
+        let changed = SoundRegistry::load(&root);
+        assert_eq!(
+            changed.get("minecraft:event").unwrap().subtitle.as_deref(),
+            Some("subtitle.two")
+        );
+
+        // An invalidated key was repaired above. Corrupt the current snapshot:
+        // loading still follows sounds.json and recreates the derived file.
+        fs::write(&cache, b"truncated snapshot").unwrap();
+        let fallback = SoundRegistry::load(&root);
+        assert_eq!(
+            fallback.get("minecraft:event"),
+            changed.get("minecraft:event")
+        );
+        assert!(
+            horizon_world::resource_cache::Cache::for_tree(&root, "sound-events-v1", b"")
+                .unwrap()
+                .read_value::<HashMap<String, WeighedSoundEvents>>()
+                .is_some()
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 }

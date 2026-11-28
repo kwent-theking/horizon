@@ -124,7 +124,7 @@ impl Fixture {
                     assert_eq!(am.ambient_occlusion, bm.ambient_occlusion);
                     assert_eq!(am.cube, bm.cube);
                     assert_eq!(am.faces.len(), bm.faces.len());
-                    for (af, bf) in am.faces.iter().zip(&bm.faces) {
+                    for (af, bf) in am.faces.iter().zip(bm.faces.iter()) {
                         assert_eq!(af.quad, bf.quad);
                         assert_eq!(
                             (af.layer, af.opaque, af.translucent),

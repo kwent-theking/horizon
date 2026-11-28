@@ -4,10 +4,13 @@
 //! elements, faces and display transforms are retained as the native decoder
 //! does; render preparation must diagnose these before baking.
 use crate::json::*;
+use crate::obj::{ObjModel, ObjSource};
 use serde_json::value::RawValue;
 use std::collections::BTreeMap;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub enum Direction {
     Down,
     Up,
@@ -64,6 +67,13 @@ pub struct CuboidModel {
     pub textures: BTreeMap<String, TextureSlot>,
     pub elements: Option<Vec<Option<Element>>>,
     pub display: Option<ItemTransforms>,
+    /// `neoforge:composite` children: their geometry is drawn together.
+    pub children: Vec<CuboidModel>,
+    /// A custom loader's model with no geometry of its own: the best texture
+    /// found in its JSON, drawn as a cube (blocks) or a flat item.
+    pub fallback_texture: Option<String>,
+    /// `neoforge:obj`: the OBJ file the model draws, once read.
+    pub obj: Option<crate::obj::ObjModel>,
 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct Element {
@@ -144,6 +154,170 @@ impl CuboidModel {
     }
     fn decode(raw: &RawValue) -> Result<Self> {
         let obj = object(raw)?;
+        let Some(loader) = obj.get("loader").and_then(|raw| string(raw).ok()) else {
+            return Self::decode_plain(&obj);
+        };
+        let known = loader
+            .strip_prefix("neoforge:")
+            .or_else(|| loader.strip_prefix("forge:"));
+        Self::decode_with_loader(&obj, known)
+    }
+    /// Library-level model loaders: every mod using one works the same way.
+    /// A loader this cannot draw degrades to its parent, its referenced model
+    /// or its best texture; it never fails the model.
+    fn decode_with_loader(obj: &Object<'_>, known: Option<&str>) -> Result<Self> {
+        let mut model = Self::decode_plain(obj)?;
+        match known {
+            Some("separate_transforms") => {
+                if let Some(base) = obj.get("base").and_then(|raw| Self::decode_nested(raw)) {
+                    model = model.with_base(base);
+                }
+            }
+            Some("composite") => {
+                if let Some(children) = obj.get("children").and_then(|raw| object(raw).ok()) {
+                    model.children = children
+                        .values()
+                        .filter_map(|raw| Self::decode_nested(raw))
+                        .collect();
+                }
+            }
+            Some("item_layers") => {
+                if model.parent.is_none() && model.elements.is_none() {
+                    model.parent = Some(crate::resolve::GENERATED_MODEL.to_owned());
+                }
+            }
+            Some("fluid_container") => {
+                let loader_parent = model
+                    .parent
+                    .as_deref()
+                    .is_none_or(|p| p.starts_with("neoforge:") || p.starts_with("forge:"));
+                if model.elements.is_none() && loader_parent {
+                    let base = model.textures.get("base").cloned().unwrap_or_else(|| {
+                        TextureSlot::Material(Material {
+                            sprite: "minecraft:item/bucket".to_owned(),
+                            force_translucent: false,
+                        })
+                    });
+                    model.parent = Some(crate::resolve::GENERATED_MODEL.to_owned());
+                    model.textures.insert("layer0".to_owned(), base);
+                }
+            }
+            // The geometry is read from the OBJ file by `attach_obj`; until
+            // then, and if that fails, the model draws its best texture.
+            Some("obj") => {
+                model.obj = ObjSource::decode(obj).map(|source| ObjModel {
+                    source,
+                    quads: None,
+                });
+                model.fallback_texture = fallback_texture_of(obj);
+            }
+            _ => {
+                if model.parent.is_some() || model.elements.is_some() {
+                    return Ok(model);
+                }
+                let referenced = obj
+                    .get("model")
+                    .and_then(|raw| string(raw).ok())
+                    .filter(|name| !name.ends_with(".obj"))
+                    .and_then(|name| identifier(&name).ok());
+                if let Some(referenced) = referenced {
+                    model.parent = Some(referenced);
+                    return Ok(model);
+                }
+                let nested = obj
+                    .values()
+                    .filter(|raw| raw.get().starts_with('{'))
+                    .filter(|raw| {
+                        object(raw)
+                            .is_ok_and(|o| o.contains_key("elements") || o.contains_key("parent"))
+                    })
+                    .find_map(|raw| Self::decode_nested(raw));
+                if let Some(nested) = nested {
+                    return Ok(model.with_base(nested));
+                }
+                model.fallback_texture = fallback_texture_of(obj);
+            }
+        }
+        Ok(model)
+    }
+    /// A child or base: an inline model, or a model reference.
+    fn decode_nested(raw: &RawValue) -> Option<Self> {
+        if raw.get().starts_with('"') {
+            let parent = identifier(&string(raw).ok()?).ok()?;
+            return Some(Self {
+                parent: Some(parent),
+                ambient_occlusion: None,
+                gui_light: None,
+                textures: BTreeMap::new(),
+                elements: None,
+                display: None,
+                children: Vec::new(),
+                fallback_texture: None,
+                obj: None,
+            });
+        }
+        Self::decode(raw).ok()
+    }
+    /// Read and parse the OBJ of a `neoforge:obj` model through `read`, which
+    /// returns the text of `assets/<namespace>/<path>`. On error the model
+    /// keeps drawing its fallback texture.
+    pub fn attach_obj(
+        &mut self,
+        read: &dyn Fn(&str, &str) -> Option<String>,
+    ) -> std::result::Result<(), String> {
+        let Some(obj) = self.obj.as_mut() else {
+            return Ok(());
+        };
+        let (namespace, path) = obj
+            .source
+            .model
+            .split_once(':')
+            .unwrap_or(("minecraft", obj.source.model.as_str()));
+        let text =
+            read(namespace, path).ok_or_else(|| format!("cannot read {namespace}:{path}"))?;
+        let directory = path.rsplit_once('/').map_or("", |(dir, _)| dir);
+        let mut materials = BTreeMap::new();
+        for library in crate::obj::material_libraries(&text) {
+            let file = if directory.is_empty() {
+                library
+            } else {
+                format!("{directory}/{library}")
+            };
+            if let Some(mtl) = read(namespace, &file) {
+                materials.extend(crate::obj::parse_materials(&mtl));
+            }
+        }
+        let quads = crate::obj::parse_obj(&text, &materials, &obj.source)?;
+        obj.quads = Some(quads);
+        Ok(())
+    }
+    /// `self` is the outer model, `base` the one that actually describes the
+    /// geometry: the base wins, the outer model fills what it leaves out.
+    fn with_base(self, base: Self) -> Self {
+        let has_geometry = base.parent.is_some() || base.elements.is_some();
+        let mut textures = self.textures;
+        textures.extend(base.textures);
+        Self {
+            parent: if has_geometry {
+                base.parent
+            } else {
+                self.parent
+            },
+            ambient_occlusion: base.ambient_occlusion.or(self.ambient_occlusion),
+            gui_light: base.gui_light.or(self.gui_light),
+            textures,
+            elements: base.elements.or(self.elements),
+            display: base.display.or(self.display),
+            children: if base.children.is_empty() {
+                self.children
+            } else {
+                base.children
+            },
+            fallback_texture: base.fallback_texture.or(self.fallback_texture),
+            obj: base.obj.or(self.obj),
+        }
+    }
+    fn decode_plain(obj: &Object<'_>) -> Result<Self> {
         let parent = obj
             .get("parent")
             .map(|r| primitive_string(r))
@@ -192,8 +366,51 @@ impl CuboidModel {
             textures,
             elements,
             display,
+            children: Vec::new(),
+            fallback_texture: None,
+            obj: None,
         })
     }
+}
+/// The best texture of a model-like JSON object (`textures`, `ctm_textures`,
+/// a top-level `particle`): particle, then all, center, empty, then any.
+fn fallback_texture_of(obj: &Object<'_>) -> Option<String> {
+    const PREFERRED: [&str; 4] = ["particle", "all", "center", "empty"];
+    let name = |raw: &RawValue| -> Option<String> {
+        let sprite = if raw.get().starts_with('{') {
+            string(object(raw).ok()?.get("sprite")?).ok()?
+        } else {
+            string(raw).ok()?
+        };
+        if sprite.starts_with('#') {
+            return None;
+        }
+        identifier(&sprite).ok()
+    };
+    for key in ["textures", "ctm_textures"] {
+        let Some(map) = obj.get(key).and_then(|raw| object(raw).ok()) else {
+            continue;
+        };
+        let picked = PREFERRED
+            .iter()
+            .filter_map(|k| map.get(*k))
+            .chain(map.values())
+            .find_map(|raw| name(raw));
+        if picked.is_some() {
+            return picked;
+        }
+    }
+    ["particle", "texture"]
+        .iter()
+        .filter_map(|k| obj.get(*k))
+        .find_map(|raw| name(raw))
+}
+/// [`fallback_texture_of`] for a whole JSON document (a blockstate with
+/// `ctm_textures`, for example). `None` when it names no texture.
+pub fn loader_fallback_texture(json: &str) -> Option<String> {
+    let raw: &RawValue =
+        serde_json::from_str(json.strip_prefix('\u{feff}').unwrap_or(json)).ok()?;
+    fallback_texture_of(&object(raw).ok()?)
 }
 fn nullable<T>(raw: &RawValue, decode: impl FnOnce(&RawValue) -> Result<T>) -> Result<Option<T>> {
     if raw.get() == "null" {

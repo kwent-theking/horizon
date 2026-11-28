@@ -8,6 +8,7 @@ use crate::mobs::{
     spawn_rules::{self, Reason, SpawnLevel},
 };
 use horizon_core::random::RandomSource;
+use horizon_world::content_view;
 
 /// What the patrol spawner reads from the level.
 pub trait PatrolLevel: SpawnLevel {
@@ -191,12 +192,12 @@ impl GameplayAttributes {
         use serde_json::Value;
         let data = root.join("data/minecraft");
         let read = |p: std::path::PathBuf| -> Option<Value> {
-            serde_json::from_slice(&std::fs::read(p).ok()?).ok()
+            serde_json::from_slice(&content_view::read(p).ok()?).ok()
         };
         let list = |dir: &str| -> Vec<(String, Value)> {
             let mut out = Vec::new();
-            if let Ok(entries) = std::fs::read_dir(data.join(dir)) {
-                for e in entries.flatten() {
+            if let Ok(entries) = content_view::read_dir(data.join(dir)) {
+                for e in entries {
                     let path = e.path();
                     if let (Some(stem), Some(v)) = (
                         path.file_stem().and_then(|s| s.to_str()).map(str::to_owned),

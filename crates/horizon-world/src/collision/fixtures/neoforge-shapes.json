@@ -1,0 +1,195 @@
+{
+  "schema": 1,
+  "minecraft": "1.21.1",
+  "fixture_source": "Box geometry extracted from local Minecraft 26.3 gameplay-facts.json and cached-collision.nbt. Synthetic mod ids and neighbour mappings exercise the NeoForge 1.21.1 wire format.",
+  "blocks": {
+    "minecraft:stone": {
+      "states": {
+        "": {
+          "outline": [
+            [0, 0, 0, 1, 1, 1]
+          ],
+          "collision": [
+            [0, 0, 0, 1, 1, 1]
+          ]
+        }
+      }
+    },
+    "fixture:fence": {
+      "states": {
+        "north=false,east=false": {
+          "outline": [
+            [0.375, 0, 0.375, 0.625, 1, 0.625]
+          ],
+          "collision": [
+            [0.375, 0, 0.375, 0.625, 1.5, 0.625]
+          ],
+          "neighbours": {
+            "sides": 36,
+            "palette": [
+              {
+                "outline": [
+                  [0.375, 0, 0, 0.625, 1, 0.625]
+                ],
+                "collision": [
+                  [0.375, 0, 0, 0.625, 1.5, 0.625]
+                ]
+              },
+              {
+                "outline": [
+                  [0.375, 0, 0.375, 1, 1, 0.625]
+                ],
+                "collision": [
+                  [0.375, 0, 0.375, 1, 1.5, 0.625]
+                ]
+              },
+              {
+                "outline": [
+                  [0.375, 0, 0, 0.625, 1, 0.625],
+                  [0.625, 0, 0.375, 1, 1, 0.625]
+                ],
+                "collision": [
+                  [0.375, 0, 0, 0.625, 1.5, 0.625],
+                  [0.625, 0, 0.375, 1, 1.5, 0.625]
+                ]
+              }
+            ],
+            "masks": {
+              "4": 0,
+              "32": 1,
+              "36": 2
+            }
+          }
+        },
+        "east=true,north=false": {
+          "outline": [
+            [0.375, 0, 0.375, 1, 1, 0.625]
+          ],
+          "collision": [
+            [0.375, 0, 0.375, 1, 1.5, 0.625]
+          ]
+        },
+        "east=false,north=true": {
+          "outline": [
+            [0.375, 0, 0, 0.625, 1, 0.625]
+          ],
+          "collision": [
+            [0.375, 0, 0, 0.625, 1.5, 0.625]
+          ]
+        }
+      }
+    },
+    "fixture:sconce": {
+      "states": {
+        "facing=north": {
+          "outline": [
+            [0.34375, 0.1875, 0.6875, 0.65625, 0.8125, 1]
+          ],
+          "collision": [],
+          "neighbours": {
+            "sides": 8,
+            "palette": [
+              {
+                "collision": [
+                  [0.34375, 0.1875, 0.6875, 0.65625, 0.8125, 1]
+                ]
+              }
+            ],
+            "masks": {
+              "8": 0
+            }
+          }
+        },
+        "facing=south": {
+          "outline": [],
+          "collision": [],
+          "neighbours": {
+            "sides": 4,
+            "palette": [
+              {
+                "outline": [
+                  [0.34375, 0.1875, 0, 0.65625, 0.8125, 0.3125]
+                ]
+              }
+            ],
+            "masks": {
+              "4": 0
+            }
+          }
+        },
+        "facing=east": {
+          "outline": [
+            [0, 0.1875, 0.34375, 0.3125, 0.8125, 0.65625]
+          ],
+          "collision": [],
+          "neighbours": {
+            "sides": 32,
+            "palette": [
+              {
+                "outline": []
+              },
+              {
+                "collision": [
+                  [0, 0.1875, 0.34375, 0.3125, 0.8125, 0.65625]
+                ]
+              }
+            ],
+            "masks": {
+              "0": 0,
+              "32": 1
+            }
+          }
+        },
+        "facing=west": {
+          "outline": [
+            [0.6875, 0.1875, 0.34375, 1, 0.8125, 0.65625]
+          ],
+          "collision": [],
+          "neighbours": {
+            "sides": 32,
+            "palette": [
+              {
+                "outline": []
+              }
+            ],
+            "masks": {
+              "32": 0
+            }
+          }
+        }
+      }
+    },
+    "fixture:slab": {
+      "states": {
+        "type=top": {
+          "outline": [
+            [0, 0.5, 0, 1, 1, 1]
+          ],
+          "collision": [
+            [0, 0.5, 0, 1, 1, 1]
+          ]
+        },
+        "type=bottom": {
+          "outline": [
+            [0, 0, 0, 1, 0.5, 1]
+          ],
+          "collision": [
+            [0, 0, 0, 1, 0.5, 1]
+          ]
+        }
+      }
+    },
+    "fixture:grate": {
+      "states": {
+        "": {
+          "outline": [
+            [0.4375, 0, 0, 0.5625, 1, 1]
+          ],
+          "collision": [
+            [0.4375, 0, 0, 0.5625, 1, 1]
+          ]
+        }
+      }
+    }
+  }
+}

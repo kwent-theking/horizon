@@ -6,13 +6,9 @@ use serde::{
     de::{MapAccess, SeqAccess, Visitor},
 };
 use serde_json::{Value, value::RawValue};
-use std::{
-    collections::{HashMap, hash_map::Entry as MapEntry},
-    fmt,
-    hash::{Hash, Hasher},
-    marker::PhantomData,
-    sync::Arc,
-};
+use std::{collections::HashMap, fmt, marker::PhantomData, sync::Arc};
+mod stream;
+pub(super) use stream::{Row, read as stream};
 
 // RawValue skips numeric range and depth checks. A non-allocating validation pass
 // keeps the original Value loader's JSON errors, even in overwritten/unused fields.
@@ -126,8 +122,10 @@ fn text(v: Value) -> Option<String> {
     }
 }
 
+#[cfg(test)]
 #[derive(Default)]
 pub(super) struct Entries<'a>(pub Option<Vec<Entry<'a>>>);
+#[cfg(test)]
 impl<'de> Container<'de> for Entries<'de> {
     fn seq<A: SeqAccess<'de>>(mut seq: A) -> Result<Self, A::Error> {
         let mut entries = Vec::new();
@@ -137,11 +135,13 @@ impl<'de> Container<'de> for Entries<'de> {
         Ok(Self(Some(entries)))
     }
 }
+#[cfg(test)]
 impl<'de> Deserialize<'de> for Entries<'de> {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         container(d)
     }
 }
+#[cfg(test)]
 object!(Gameplay<'a> { states: Entries<'a> = Entries::default() => typed });
 object!(SoundId<'a> { id: Option<String> = None => value(text) });
 object!(Sound<'a> {
@@ -182,109 +182,57 @@ object!(Entry<'a> {
     outline_edges: Option<&'a RawValue> = None => typed,
 });
 
-// Match Value::to_string identity without serializing: integer/float spelling is
-// distinct, as is the sign of floating zero. Object keys are already sorted by Value.
-struct ShapeKey(Value);
-fn same(a: &Value, b: &Value) -> bool {
-    match (a, b) {
-        (Value::Number(a), Value::Number(b)) => {
-            a == b && a.as_f64().map(f64::to_bits) == b.as_f64().map(f64::to_bits)
-        }
-        (Value::Array(a), Value::Array(b)) => {
-            a.len() == b.len() && a.iter().zip(b).all(|(a, b)| same(a, b))
-        }
-        (Value::Object(a), Value::Object(b)) => {
-            a.len() == b.len()
-                && a.iter()
-                    .zip(b)
-                    .all(|((ak, av), (bk, bv))| ak == bk && same(av, bv))
-        }
-        _ => a == b,
-    }
-}
-impl PartialEq for ShapeKey {
-    fn eq(&self, other: &Self) -> bool {
-        same(&self.0, &other.0)
-    }
-}
-impl Eq for ShapeKey {}
-fn shape_hash<H: Hasher>(v: &Value, h: &mut H) {
-    std::mem::discriminant(v).hash(h);
-    match v {
-        Value::Null => {}
-        Value::Bool(b) => b.hash(h),
-        Value::String(s) => s.hash(h),
-        Value::Number(n) => {
-            n.is_f64().hash(h);
-            n.hash(h);
-            n.as_f64().map(f64::to_bits).hash(h);
-        }
-        Value::Array(a) => {
-            a.len().hash(h);
-            for v in a {
-                shape_hash(v, h);
-            }
-        }
-        Value::Object(o) => {
-            o.len().hash(h);
-            for (k, v) in o {
-                k.hash(h);
-                shape_hash(v, h);
-            }
-        }
-    }
-}
-impl Hash for ShapeKey {
-    fn hash<H: Hasher>(&self, h: &mut H) {
-        shape_hash(&self.0, h);
-    }
-}
+type Geometry = Arc<[[f64; 6]]>;
+
 #[derive(Default)]
-pub(super) struct Shapes<'a> {
-    raw: HashMap<&'a str, usize>,
-    canonical: HashMap<ShapeKey, usize>,
-    values: Vec<Arc<[[f64; 6]]>>,
+pub(super) struct Shapes {
+    // Memoize raw spellings during the stream so common shapes decode once.
+    raw: HashMap<Box<str>, Geometry>,
+    by_geometry: HashMap<Vec<[u64; 6]>, Geometry>,
 }
-impl<'a> Shapes<'a> {
+impl Shapes {
+    pub fn share(&mut self, boxes: Vec<[f64; 6]>) -> Geometry {
+        let bits = boxes.iter().map(|row| row.map(f64::to_bits)).collect();
+        self.by_geometry
+            .entry(bits)
+            .or_insert_with(|| boxes.into())
+            .clone()
+    }
+
+    pub fn clear(&mut self) {
+        self.raw.clear();
+        // Drop the overwritten rows' geometry, keeping the shared defaults.
+        self.by_geometry
+            .retain(|_, shape| Arc::strong_count(shape) > 1);
+    }
+
     pub fn intern(
         &mut self,
-        raw: Option<&'a RawValue>,
-        fallback: impl FnOnce() -> Vec<[f64; 6]>,
-    ) -> crate::Result<Arc<[[f64; 6]]>> {
+        raw: Option<&RawValue>,
+        fallback: impl FnOnce() -> Geometry,
+    ) -> crate::Result<Geometry> {
         let Some(raw) = raw else {
-            return Ok(fallback().into());
+            return Ok(fallback());
         };
-        if let Some(&id) = self.raw.get(raw.get()) {
-            return Ok(self.values[id].clone());
+        if let Some(shape) = self.raw.get(raw.get()) {
+            return Ok(shape.clone());
         }
         let value: Value = serde_json::from_str(raw.get())?;
-        if !value.is_array() {
-            return Ok(fallback().into());
-        }
-        let id = match self.canonical.entry(ShapeKey(value)) {
-            MapEntry::Occupied(entry) => *entry.get(),
-            MapEntry::Vacant(entry) => {
-                let shape = entry
-                    .key()
-                    .0
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .filter_map(|b| {
-                        let b = b.as_array()?;
-                        Some(std::array::from_fn(|i| {
-                            b.get(i).and_then(Value::as_f64).unwrap_or(0.0)
-                        }))
-                    })
-                    .collect::<Arc<[[f64; 6]]>>();
-                let id = self.values.len();
-                self.values.push(shape);
-                entry.insert(id);
-                id
-            }
+        let Some(array) = value.as_array() else {
+            return Ok(fallback());
         };
-        self.raw.insert(raw.get(), id);
-        Ok(self.values[id].clone())
+        let boxes = array
+            .iter()
+            .filter_map(|b| {
+                let b = b.as_array()?;
+                Some(std::array::from_fn(|i| {
+                    b.get(i).and_then(Value::as_f64).unwrap_or(0.0)
+                }))
+            })
+            .collect();
+        let shape = self.share(boxes);
+        self.raw.insert(raw.get().into(), shape.clone());
+        Ok(shape)
     }
 }
 

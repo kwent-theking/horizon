@@ -1628,6 +1628,37 @@ impl Game<'_> {
                 }
                 ok(json!({ "ok": true, "menu": self.title_value() }))
             }
+            "create-visual-fixture" => {
+                self.need_world()?;
+                if !self.options.test_terrain
+                    || std::env::var_os("HORIZON_CREATE_VISUAL_FIXTURE").as_deref()
+                        != Some(std::ffi::OsStr::new("1"))
+                    || self.integrated.is_none()
+                    || !self
+                        .remote
+                        .as_ref()
+                        .is_some_and(|r| r.session.address == "local")
+                {
+                    return Err(
+                        "Create visual fixtures require an opted-in local test-terrain world"
+                            .into(),
+                    );
+                }
+                let pos = a.block_pos(0)?;
+                let start = line.find('{').ok_or("create-visual-fixture X Y Z {SNBT}")?;
+                let text = line[start..].trim_end();
+                if text.len() > 8192 {
+                    return Err("Create visual fixture tag exceeds 8192 bytes".into());
+                }
+                let (tag, used) = horizon_world::nbt::parse_snbt(text)?;
+                if used != text.len() || !matches!(&tag, horizon_world::nbt::Tag::Compound(_)) {
+                    return Err("Create visual fixture needs exactly one compound tag".into());
+                }
+                if !self.apply_create_visual_fixture(pos, &tag) {
+                    return Err("no supported Create block at the fixture position".into());
+                }
+                ok(json!({ "ok": true }))
+            }
             "command" => {
                 self.need_world()?;
                 let text = line

@@ -156,7 +156,7 @@ impl Game<'_> {
     }
     /// `BlockBehaviour.getDestroyProgress` with `Player.getDestroySpeed`.
     pub(super) fn destroy_progress(&self, pos: [i32; 3]) -> f32 {
-        let state = self.world.block(pos[0], pos[1], pos[2]);
+        let state = self.target_block(pos);
         let facts = self.res.facts().get(state);
         if facts.hardness == -1.0 {
             return 0.0;
@@ -312,15 +312,14 @@ impl Game<'_> {
             .using
             .and_then(|(slot, _)| self.inventory.get(slot).and_then(Option::as_ref))
             .or_else(|| self.held());
-        let range = active.and_then(|stack| {
+        let view = active.map(horizon_client::item_render::stack_view);
+        let range = view.as_ref().and_then(|view| {
             self.pack
                 .item_renderer
                 .models
-                .components(&horizon_client::item_render::stack_view(stack))
-                .get("minecraft:attack_range")
-                .cloned()
+                .component(view, "minecraft:attack_range")
         });
-        let spear = range.as_ref().and_then(|r| {
+        let spear = range.and_then(|r| {
             let eye = self.eye_position()?;
             let look = super::view_vector(self.yaw, self.pitch);
             let reach = attack_reach(r, self.creative);

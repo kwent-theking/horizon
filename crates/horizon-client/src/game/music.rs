@@ -61,6 +61,11 @@ impl Game<'_> {
             player_position,
             player_speed_sqr,
             player_fall_flying,
+            cbc_shells: self
+                .remote
+                .as_ref()
+                .map(|r| r.create_contraptions.shell_sounds())
+                .unwrap_or_default(),
         };
         self.audio.tick(self.pause, &ctx);
     }

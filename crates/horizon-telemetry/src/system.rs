@@ -9,21 +9,52 @@ use std::sync::OnceLock;
 
 use crate::payload::System;
 
-/// What `program args` prints, trimmed, when it succeeds and prints something. On Windows the
-/// program opens no console window: a GUI launcher or a game started without one would flash a
-/// terminal for every probe.
+/// How long a probe command may run before it is killed: a hung WMI or PowerShell must not
+/// stall whoever asked.
+const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// What `program args` prints, trimmed, when it succeeds and prints something within
+/// [`COMMAND_TIMEOUT`]. On Windows the program opens no console window: a GUI launcher or a game
+/// started without one would flash a terminal for every probe.
 pub fn command_output(program: &str, args: &[&str]) -> Option<String> {
+    command_output_within(program, args, COMMAND_TIMEOUT)
+}
+
+fn command_output_within(
+    program: &str,
+    args: &[&str],
+    timeout: std::time::Duration,
+) -> Option<String> {
+    use std::io::Read;
+    use std::process::Stdio;
     let mut command = std::process::Command::new(program);
-    command.args(args);
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         command.creation_flags(CREATE_NO_WINDOW);
     }
-    let out = command.output().ok()?;
-    let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-    (out.status.success() && !text.is_empty()).then_some(text)
+    let mut child = command.spawn().ok()?;
+    let mut stdout = child.stdout.take()?;
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stdout.read_to_end(&mut bytes);
+        let _ = sender.send(bytes);
+    });
+    let Ok(bytes) = receiver.recv_timeout(timeout) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    };
+    let status = child.wait().ok()?;
+    let text = String::from_utf8_lossy(&bytes).trim().to_owned();
+    (status.success() && !text.is_empty()).then_some(text)
 }
 
 fn read(path: &str) -> Option<String> {
@@ -164,8 +195,286 @@ fn cpu_mhz() -> (Option<u32>, Option<u32>) {
     }
 }
 
+/// Physical system memory in MiB, read once per process.
+pub fn ram_mb() -> Option<u64> {
+    static RAM_MB: OnceLock<Option<u64>> = OnceLock::new();
+    *RAM_MB.get_or_init(|| ram_bytes().map(|b| b >> 20))
+}
+
+/// CPU brand/identifier string, read once per process.
+pub fn cpu_name() -> Option<String> {
+    static CPU: OnceLock<Option<String>> = OnceLock::new();
+    CPU.get_or_init(cpu).clone()
+}
+
+/// Physical CPU cores count, read once per process.
+pub fn physical_cores() -> Option<u16> {
+    let n = fixed().cores;
+    (n > 0).then_some(n)
+}
+
 fn powershell(command: &str) -> Option<String> {
     command_output("powershell", &["-NoProfile", "-Command", command])
+}
+
+/// Physical DRAM generation detected from SMBIOS / WMI.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum MemoryKind {
+    #[default]
+    Unknown,
+    Ddr2,
+    Ddr3,
+    Ddr4,
+    Ddr5,
+    Lpddr3,
+    Lpddr4,
+    Lpddr5,
+    Other,
+}
+
+impl MemoryKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unknown => "Unknown",
+            Self::Ddr2 => "DDR2",
+            Self::Ddr3 => "DDR3",
+            Self::Ddr4 => "DDR4",
+            Self::Ddr5 => "DDR5",
+            Self::Lpddr3 => "LPDDR3",
+            Self::Lpddr4 => "LPDDR4",
+            Self::Lpddr5 => "LPDDR5",
+            Self::Other => "RAM",
+        }
+    }
+
+    pub fn is_ddr3_or_slower(self) -> bool {
+        matches!(self, Self::Ddr2 | Self::Ddr3 | Self::Lpddr3)
+    }
+
+    fn rank(self) -> u8 {
+        match self {
+            Self::Unknown => 255,
+            Self::Ddr2 => 1,
+            Self::Lpddr3 => 2,
+            Self::Ddr3 => 3,
+            Self::Lpddr4 => 4,
+            Self::Ddr4 => 5,
+            Self::Lpddr5 => 6,
+            Self::Ddr5 => 7,
+            Self::Other => 8,
+        }
+    }
+
+    fn from_smbios(code: u32) -> Self {
+        match code {
+            20 | 21 | 22 => Self::Ddr2,
+            24 => Self::Ddr3,
+            26 => Self::Ddr4,
+            34 => Self::Ddr5,
+            27 | 28 | 29 => Self::Lpddr3,
+            30 => Self::Lpddr4,
+            35 => Self::Lpddr5,
+            0 => Self::Unknown,
+            _ => Self::Other,
+        }
+    }
+
+    fn from_speed_mhz(mhz: u32) -> Self {
+        match mhz {
+            300..=800 => Self::Ddr2,
+            801..=1600 => Self::Ddr3,
+            // DDR3 tops out near 2133 and DDR4 starts at 1600: the speed alone can't say.
+            1601..=2133 => Self::Unknown,
+            2134..=4400 => Self::Ddr4,
+            4401..=10000 => Self::Ddr5,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// Physical memory module topology (type, populated stick count, inferred channels).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemoryInfo {
+    pub kind: MemoryKind,
+    pub stick_count: u8,
+    pub channel_count: u8,
+    pub single_channel: bool,
+    pub speed_mhz: Option<u32>,
+}
+
+fn find_prefix_token<'a>(haystack: &'a str, prefix: &str) -> Option<&'a str> {
+    let mut rest = haystack;
+    while let Some(pos) = rest.find(prefix) {
+        let before_ok = pos == 0 || !rest.as_bytes()[pos - 1].is_ascii_alphanumeric();
+        let after = &rest[pos + prefix.len()..];
+        if before_ok {
+            let trimmed = after.trim_start_matches([' ', '-', '_']);
+            let end = trimmed
+                .find(|c: char| !c.is_ascii_alphanumeric())
+                .unwrap_or(trimmed.len());
+            if end > 0 {
+                return Some(&trimmed[..end]);
+            }
+        }
+        rest = &rest[pos + prefix.len()..];
+    }
+    None
+}
+
+/// Extracts `(controller, channel)` tokens from locator/bank labels when explicit channel naming exists.
+fn channel_token(bank: &str, locator: &str) -> Option<(String, String)> {
+    let combined = format!("{} {}", locator, bank).to_ascii_lowercase();
+    let ctrl = find_prefix_token(&combined, "controller")
+        .or_else(|| find_prefix_token(&combined, "ctrl"))
+        .or_else(|| find_prefix_token(&combined, "node"))
+        .or_else(|| find_prefix_token(&combined, "mc"))
+        .map(str::to_owned)
+        .unwrap_or_default();
+
+    let chan = ["channel", "chan"]
+        .into_iter()
+        .find_map(|kw| find_prefix_token(&combined, kw))
+        .map(|tok| {
+            // Stop before suffixes like `dimm0` if written `channela-dimm0` without separator already handled,
+            // or `channela1` / `channelb0` -> channel `a` / `b` when alphabetic leading char exists.
+            tok.chars()
+                .next()
+                .filter(|c| c.is_ascii_alphabetic())
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| tok.to_owned())
+        })
+        .or_else(|| {
+            // Match `dimm_a1`, `dimma0`, `slotb1` -> letter channel followed by digits.
+            ["dimm", "slot"].into_iter().find_map(|kw| {
+                let tok = find_prefix_token(&combined, kw)?;
+                let mut chars = tok.chars();
+                let first = chars.next()?;
+                let rest = chars.as_str();
+                (first.is_ascii_alphabetic()
+                    && !rest.is_empty()
+                    && rest.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| first.to_string())
+            })
+        });
+
+    chan.map(|c| (ctrl, c))
+}
+
+/// Parses pipe-delimited `SMBIOSMemoryType|MemoryType|BankLabel|DeviceLocator|Capacity|Speed` rows.
+pub fn parse_memory_modules(text: &str) -> MemoryInfo {
+    let mut sticks = 0usize;
+    let mut kind = MemoryKind::Unknown;
+    let mut min_speed: Option<u32> = None;
+    let mut explicit_channels = std::collections::BTreeSet::new();
+    let mut banks = std::collections::BTreeSet::new();
+    let mut locators = std::collections::BTreeSet::new();
+
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.split('|').map(str::trim);
+        let Some(smbios_str) = parts.next() else {
+            continue;
+        };
+        let Some(mem_type_str) = parts.next() else {
+            continue;
+        };
+        let bank = parts.next().unwrap_or("");
+        let locator = parts.next().unwrap_or("");
+        let capacity = parts.next().and_then(|s| s.parse::<u64>().ok());
+        let speed = parts.next().and_then(|s| s.parse::<u32>().ok());
+
+        if capacity == Some(0) {
+            continue;
+        }
+        let smbios = smbios_str.parse::<u32>().unwrap_or(0);
+        let mem_type = mem_type_str.parse::<u32>().unwrap_or(0);
+        if smbios == 0 && mem_type == 0 && capacity.is_none() {
+            continue;
+        }
+
+        sticks += 1;
+        let row_kind = MemoryKind::from_smbios(if smbios != 0 { smbios } else { mem_type });
+        if row_kind.rank() < kind.rank() {
+            kind = row_kind;
+        }
+        if let Some(mhz) = speed.filter(|&s| s > 0) {
+            min_speed = Some(min_speed.map_or(mhz, |cur| cur.min(mhz)));
+        }
+        if let Some(key) = channel_token(bank, locator) {
+            explicit_channels.insert(key);
+        }
+        if !bank.is_empty() {
+            banks.insert(bank.to_ascii_lowercase());
+        }
+        if !locator.is_empty() {
+            locators.insert(locator.to_ascii_lowercase());
+        }
+    }
+
+    if sticks == 0 {
+        return MemoryInfo::default();
+    }
+    let channel_count = if !explicit_channels.is_empty() {
+        explicit_channels.len()
+    } else if sticks == 1 {
+        1
+    } else if banks.len() >= 2 {
+        banks.len()
+    } else if locators.len() >= 2 {
+        2.min(sticks)
+    } else {
+        1
+    };
+    let stick_count = sticks.min(u8::MAX as usize) as u8;
+    let channel_count = channel_count.min(u8::MAX as usize) as u8;
+    if matches!(kind, MemoryKind::Unknown | MemoryKind::Other)
+        && let Some(mhz) = min_speed
+    {
+        let inferred = MemoryKind::from_speed_mhz(mhz);
+        if inferred != MemoryKind::Unknown {
+            kind = inferred;
+        }
+    }
+    MemoryInfo {
+        kind,
+        stick_count,
+        channel_count,
+        single_channel: channel_count <= 1,
+        speed_mhz: min_speed,
+    }
+}
+
+static MEMORY_INFO: OnceLock<MemoryInfo> = OnceLock::new();
+
+/// Detects system memory type and channel topology once per process.
+pub fn memory_info() -> MemoryInfo {
+    *MEMORY_INFO.get_or_init(|| {
+        if cfg!(target_os = "windows") {
+            let script = "$m = Get-CimInstance Win32_PhysicalMemory -ErrorAction SilentlyContinue; \
+                          if (-not $m) { $m = Get-WmiObject Win32_PhysicalMemory -ErrorAction SilentlyContinue }; \
+                          if ($m) { $m | ForEach-Object { \"$($_.SMBIOSMemoryType)|$($_.MemoryType)|$($_.BankLabel)|$($_.DeviceLocator)|$($_.Capacity)|$($_.Speed)\" } }";
+            powershell(script).map_or_else(MemoryInfo::default, |out| parse_memory_modules(&out))
+        } else {
+            MemoryInfo::default()
+        }
+    })
+}
+
+/// The memory topology if a probe has finished, without waiting for one.
+pub fn memory_info_if_ready() -> Option<MemoryInfo> {
+    MEMORY_INFO.get().copied()
+}
+
+/// Starts the memory probe on a background thread, then calls `on_ready`; startup never waits
+/// on the probe. A no-op besides `on_ready` when the result is already known.
+pub fn prefetch_memory_info(on_ready: impl FnOnce() + Send + 'static) {
+    std::thread::spawn(move || {
+        memory_info();
+        on_ready();
+    });
 }
 
 /// `nvme`, `ssd` or `hdd` for the drive `path` is on, where it can be read.
@@ -606,5 +915,128 @@ mod tests {
         assert!(
             ["", "nvme", "ssd", "hdd"].contains(&System::detect_in(Some(&dir)).storage.as_str())
         );
+    }
+
+    #[test]
+    fn parses_ddr_generations_and_channel_topology() {
+        // Real dual-controller Ryzen DDR4 output: identical BANK 0, distinct Controller0/Controller1
+        let dual_ddr4 = "\
+26|0|BANK 0|Controller0-ChannelA-DIMM0|8589934592|3200
+26|0|BANK 0|Controller1-ChannelA-DIMM0|8589934592|3200
+";
+        assert_eq!(
+            parse_memory_modules(dual_ddr4),
+            MemoryInfo {
+                kind: MemoryKind::Ddr4,
+                stick_count: 2,
+                channel_count: 2,
+                single_channel: false,
+                speed_mhz: Some(3200),
+            }
+        );
+
+        // Single stick DDR3
+        let single_ddr3 = "24|0|BANK 0|ChannelA-DIMM0|8589934592|1600\n";
+        assert_eq!(
+            parse_memory_modules(single_ddr3),
+            MemoryInfo {
+                kind: MemoryKind::Ddr3,
+                stick_count: 1,
+                channel_count: 1,
+                single_channel: true,
+                speed_mhz: Some(1600),
+            }
+        );
+        assert!(MemoryKind::Ddr3.is_ddr3_or_slower());
+
+        // Two DDR3 sticks installed into the SAME channel (still single-channel!)
+        let same_chan_ddr3 = "\
+24|0|BANK 0|ChannelA-DIMM0|4294967296|1333
+24|0|BANK 1|ChannelA-DIMM1|4294967296|1333
+";
+        assert_eq!(
+            parse_memory_modules(same_chan_ddr3),
+            MemoryInfo {
+                kind: MemoryKind::Ddr3,
+                stick_count: 2,
+                channel_count: 1,
+                single_channel: true,
+                speed_mhz: Some(1333),
+            }
+        );
+
+        // Dual-channel DDR5 with DIMM_A1 / DIMM_B1 naming and an empty socket
+        let dual_ddr5 = "\
+34|0|P0 CHANNEL A|DIMM_A1|17179869184|5600
+0|0|P0 CHANNEL A|DIMM_A2|0|0
+34|0|P0 CHANNEL B|DIMM_B1|17179869184|5600
+";
+        assert_eq!(
+            parse_memory_modules(dual_ddr5),
+            MemoryInfo {
+                kind: MemoryKind::Ddr5,
+                stick_count: 2,
+                channel_count: 2,
+                single_channel: false,
+                speed_mhz: Some(5600),
+            }
+        );
+
+        // SMBIOSMemoryType=0 falling back to MemoryType=24 with generic BANK labels
+        let fallback_ddr3 = "\
+0|24|BANK 0|DIMM 0|4294967296|1600
+0|24|BANK 2|DIMM 2|4294967296|1600
+";
+        assert_eq!(
+            parse_memory_modules(fallback_ddr3),
+            MemoryInfo {
+                kind: MemoryKind::Ddr3,
+                stick_count: 2,
+                channel_count: 2,
+                single_channel: false,
+                speed_mhz: Some(1600),
+            }
+        );
+
+        // Older DDR3 BIOSes reporting 0|0 (Unknown) for both SMBIOS and MemoryType but valid 1333 MHz speed
+        let speed_inferred_ddr3 = "0|0|BANK 0|DIMM 0|8589934592|1333\n";
+        assert_eq!(
+            parse_memory_modules(speed_inferred_ddr3),
+            MemoryInfo {
+                kind: MemoryKind::Ddr3,
+                stick_count: 1,
+                channel_count: 1,
+                single_channel: true,
+                speed_mhz: Some(1333),
+            }
+        );
+    }
+
+    #[test]
+    fn speed_fallback_does_not_call_overlapping_speeds_ddr3() {
+        assert_eq!(MemoryKind::from_speed_mhz(1333), MemoryKind::Ddr3);
+        assert_eq!(MemoryKind::from_speed_mhz(1600), MemoryKind::Ddr3);
+        assert_eq!(MemoryKind::from_speed_mhz(1866), MemoryKind::Unknown);
+        assert_eq!(MemoryKind::from_speed_mhz(2133), MemoryKind::Unknown);
+        assert_eq!(MemoryKind::from_speed_mhz(2666), MemoryKind::Ddr4);
+        let slow_ddr4 = parse_memory_modules("26|0|BANK 0|DIMM 0|8589934592|1866
+");
+        assert_eq!(slow_ddr4.kind, MemoryKind::Ddr4);
+        let unlabeled = parse_memory_modules("0|0|BANK 0|DIMM 0|8589934592|1866
+");
+        assert!(!unlabeled.kind.is_ddr3_or_slower());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn command_output_gives_up_on_a_hung_command() {
+        let started = std::time::Instant::now();
+        let out = command_output_within(
+            "powershell",
+            &["-NoProfile", "-Command", "Start-Sleep -Seconds 30; 'late'"],
+            std::time::Duration::from_millis(500),
+        );
+        assert_eq!(out, None);
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
     }
 }

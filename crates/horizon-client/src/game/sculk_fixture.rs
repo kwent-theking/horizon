@@ -22,7 +22,7 @@ use horizon_core::{
 };
 use horizon_world::{chunk::BlockState, level::Ticks, registry::BlockStateId};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     fmt::Write as _,
     io::Write as _,
     sync::Arc,
@@ -185,9 +185,9 @@ impl Game<'_> {
         let base = registry
             .default_state(name)
             .ok_or_else(|| format!("unknown block {name}"))?;
-        let mut properties: BTreeMap<String, String> = registry
+        let mut properties = registry
             .state(base)
-            .map(|s| s.properties.clone().into_iter().collect())
+            .map(|s| s.properties.clone())
             .unwrap_or_default();
         for kv in props.split(',').filter(|s| !s.is_empty()) {
             let (k, v) = kv.split_once('=').ok_or("property")?;

@@ -132,6 +132,11 @@ fn entity_vertex(position: vec3<f32>, uv: vec2<f32>,
     var out = entity_vertex(position, uv, overlay & 0xffffu, color, light, normal);
     out.glint_uv = glint_uv;
     out.tier = overlay >> 16u;
+    if out.overlay == 38u {
+        let end = vec2<f32>(f32(overlay >> 16u), f32(light.z | (light.w << 8u))) / 65535.0;
+        out.weather_rect = vec4(glint_uv, end);
+        out.tier = 0u;
+    }
     return out;
 }
 // Retained bolt-local geometry, translated using the same f64 camera
@@ -231,6 +236,16 @@ fn crumbling_uv(uv: vec2<f32>, packed_origin: vec2<f32>, sprite_size: vec2<f32>,
         uv = crumbling_uv(in.uv, in.wrap, globals.crumbling_sprite.zw, textureDimensions(atlas));
     }
     var color = textureSample(atlas, atlas_sampler, uv) * select(in.back_color, in.color, front);
+    if in.overlay == 38u {
+        // CBC's mask stores source texture coordinates in its red and green channels.
+        let mask = textureSampleLevel(atlas, atlas_sampler, in.uv, 0.0);
+        if mask.a < 0.1 { discard; }
+        let dims = vec2<f32>(textureDimensions(atlas));
+        let end = round(in.weather_rect.zw * dims) / dims;
+        let shifted = mix(in.weather_rect.xy, end, mask.rg);
+        color = textureSampleLevel(atlas, atlas_sampler, shifted, 0.0) * select(in.back_color, in.color, front);
+        if color.a < 0.05 { discard; }
+    }
     if in.overlay == 9u || in.overlay == 10u {
         // rendertype_end_portal: end_sky and PORTAL_LAYERS (15 for portals, 16
         // for gateways) layers of end_portal.png projected from the screen.
@@ -244,7 +259,7 @@ fn crumbling_uv(uv: vec2<f32>, packed_origin: vec2<f32>, sprite_size: vec2<f32>,
         // clouds.fsh: alpha fades out towards the cloud fog end.
         return vec4(color.rgb, color.a * (1.0 - linear_fog(in.spherical, 0.0, globals.fog_ends.y)));
     }
-    if color.a < 0.1 || (in.cull != 0u && !front) { discard; }
+    if (color.a < 0.1 && in.overlay != 38u) || (in.cull != 0u && !front) { discard; }
     // entity.fsh calculateFinalColor: the overlay (hurt red, TNT white) over the
     // lit texture, then the lightmap, then the glint and fog.
     color = vec4(mix(in.overlay_color.rgb, color.rgb, in.overlay_color.a), color.a);
@@ -321,6 +336,15 @@ fn celestial_color(in: Out) -> vec4<f32> {
     let f = max(linear_fog(in.spherical, globals.fog.x, globals.fog.y),
                 linear_fog(in.cylindrical, globals.fog.z, globals.fog.w));
     return vec4(mix(color.rgb * (128.0 / 255.0), globals.fog_color.rgb, f * globals.fog_color.a), color.a);
+}
+
+// CBC RenderType.eyes: the texture and vertex tint without lightmap or overlay.
+@fragment fn fs_cbc_eyes(in: Out, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
+    let color = textureSample(atlas, atlas_sampler, in.uv) * in.color;
+    if (color.a < 0.1 && in.overlay != 38u) || (in.cull != 0u && !front) { discard; }
+    let fog = max(linear_fog(in.spherical, globals.fog.x, globals.fog.y),
+                  linear_fog(in.cylindrical, globals.fog.z, globals.fog.w));
+    return vec4(mix(color.rgb, globals.fog_color.rgb, fog * globals.fog_color.a), color.a);
 }
 
 // RenderPipelines.WATER_MASK: depth only (the pipeline masks the colour off).

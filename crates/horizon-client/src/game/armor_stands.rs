@@ -678,7 +678,9 @@ impl Game<'_> {
             let dragon = a.equipment[5]
                 .as_ref()
                 .is_some_and(|i| &*i.item == "minecraft:dragon_head");
-            let position = super::entity_culling::at(a.position);
+            let (position, ship) = self
+                .plot_object_pose(a.id, alpha)
+                .unwrap_or_else(|| (super::entity_culling::at(a.position), glam::Quat::IDENTITY));
             if !self.standing_entity_in_view(
                 camera,
                 position,
@@ -694,7 +696,7 @@ impl Game<'_> {
             let Some(model) = (if a.small { &assets.small } else { &assets.main }) else {
                 continue;
             };
-            let p = glam::DVec3::new(a.position.x, a.position.y, a.position.z) - camera;
+            let p = position - camera;
             // setupRotations: 180 - body yaw, plus the wobble for 5 ticks after a hit.
             let wiggle = (self.world.game_time - a.last_hit) as f32 + alpha as f32;
             let wobble = if wiggle < 5.0 {
@@ -702,7 +704,7 @@ impl Game<'_> {
             } else {
                 0.0
             };
-            let base = glam::Mat4::from_translation(p.as_vec3())
+            let base = glam::Mat4::from_rotation_translation(ship, p.as_vec3())
                 * glam::Mat4::from_rotation_y((180.0 - a.yaw + wobble).to_radians())
                 * glam::Mat4::from_scale(glam::Vec3::new(-1.0, -1.0, 1.0))
                 * glam::Mat4::from_translation(glam::Vec3::new(0.0, -1.501, 0.0));

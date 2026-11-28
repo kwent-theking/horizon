@@ -287,7 +287,7 @@ impl Connection {
     }
     /// `Connection.isMemoryConnection`: through a [`Pipe`] rather than a socket.
     pub fn is_memory(&self) -> bool {
-        matches!(self.reader.stream, Stream::Memory(_))
+        self.reader.is_memory()
     }
     /// ClientboundLoginCompressionPacket: negative thresholds disable compression.
     pub fn set_compression(&mut self, threshold: i32) {
@@ -314,8 +314,21 @@ impl Connection {
     }
 }
 impl ConnReader {
+    /// Whether this is a native in-memory connection to the integrated server.
+    pub fn is_memory(&self) -> bool {
+        matches!(self.stream, Stream::Memory(_))
+    }
+
     /// Block until a whole packet arrives: (id, payload).
     pub fn recv(&mut self) -> Result<(i32, Vec<u8>)> {
+        self.recv_with_wire(|_, _| ()).map(|(packet, ())| packet)
+    }
+
+    /// Inspect the original payload using its mapped id, before rewriting it.
+    pub fn recv_with_wire<T>(
+        &mut self,
+        metadata: impl FnOnce(i32, &[u8]) -> T,
+    ) -> Result<((i32, Vec<u8>), T)> {
         loop {
             if let Some(frame) = frame::split(&mut self.buffer)? {
                 let body = frame::decompress(frame, self.threshold)?;
@@ -345,8 +358,13 @@ impl ConnReader {
                         .open("horizon-dump-sb.txt")
                     {
                         let n = body.len() - start;
-                        let full = if n <= 512 { &body[start..] } else { &body[start..start + 64] };
-                        let _ = writeln!(f, "RECV wire {raw_id} -> id {id} ({n} bytes) {:02X?}", full);
+                        let full = if n <= 512 {
+                            &body[start..]
+                        } else {
+                            &body[start..start + 64]
+                        };
+                        let _ =
+                            writeln!(f, "RECV wire {raw_id} -> id {id} ({n} bytes) {:02X?}", full);
                     }
                 }
                 // The body gateway: the active translation may rewrite the
@@ -354,10 +372,13 @@ impl ConnReader {
                 // (777) shape after the id was mapped.
                 // / RU: шлюз тел: активная трансляция может переписать тело
                 // пакета из формата 767 в родной 777 после маппинга id.
-                let payload = crate::translation::ingress_body(id, &body[start..])
-                    .unwrap_or_else(|| body[start..].to_vec());
+                let metadata = metadata(id, &body[start..]);
+                let (id, payload) = match crate::translation::ingress_body(id, &body[start..]) {
+                    Some(payload) => (crate::translation::native_id(id), payload),
+                    None => (id, body[start..].to_vec()),
+                };
                 self.counters.received.fetch_add(1, Ordering::Relaxed);
-                return Ok((id, payload));
+                return Ok(((id, payload), metadata));
             }
             let mut chunk = [0u8; 16384];
             let n = self.stream.read(&mut chunk)?;
@@ -389,8 +410,12 @@ impl ConnWriter {
     /// обойти его из кода отправки нельзя. С HORIZON_DUMP_SB каждый
     /// исходящий id пишется в лог - защита от тихих обходов.
     pub fn send(&mut self, body: &[u8]) -> Result<()> {
-        let routed = crate::translation::egress(body);
-        let routed = routed.as_deref().unwrap_or_default();
+        for routed in crate::translation::egress_all(body) {
+            self.send_routed(&routed)?;
+        }
+        Ok(())
+    }
+    fn send_routed(&mut self, routed: &[u8]) -> Result<()> {
         if routed.is_empty() {
             // The translation dropped the packet (no counterpart on the
             // wire). Producers must not notice: send stays a success.
@@ -408,7 +433,11 @@ impl ConnWriter {
                 .open("horizon-dump-sb.txt")
             {
                 let n = routed.len() - r.position();
-                let full = if n <= 64 { &routed[r.position()..] } else { &routed[r.position()..r.position() + 64] };
+                let full = if n <= 64 {
+                    &routed[r.position()..]
+                } else {
+                    &routed[r.position()..r.position() + 64]
+                };
                 let _ = writeln!(f, "SB id {} ({} bytes) {:02X?}", id, n, full);
             }
         }

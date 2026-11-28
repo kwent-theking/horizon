@@ -5,6 +5,7 @@
 //! the same id and a filter removes the matching ones.
 use horizon_assets::palette::apply_palette;
 use horizon_client_core::pattern::Pattern;
+use horizon_world::content_view;
 use serde_json::Value;
 use std::{
     collections::BTreeMap,
@@ -174,27 +175,20 @@ fn decode_source(s: &Value) -> Option<SpriteSource> {
 /// `assets/<namespace>/textures/<path>.png`.
 pub fn list_textures(root: &Path) -> Vec<String> {
     let mut out = Vec::new();
-    let Ok(namespaces) = fs::read_dir(root.join("assets")) else {
+    let Ok(namespaces) = content_view::read_dir(root.join("assets")) else {
         return out;
     };
-    for ns in namespaces.flatten() {
+    for ns in namespaces {
         let namespace = ns.file_name().to_string_lossy().into_owned();
         let base = ns.path().join("textures");
         let mut stack = vec![base.clone()];
         while let Some(dir) = stack.pop() {
-            let Ok(entries) = fs::read_dir(&dir) else {
+            let Ok(entries) = content_view::read_dir(&dir) else {
                 continue;
             };
-            for e in entries.flatten() {
-                let p = e.path();
-                // `file_type` comes with the listing; `Path::is_dir` is a stat per
-                // entry, kept for links (which it follows).
-                let dir = match e.file_type() {
-                    Ok(t) if t.is_symlink() => p.is_dir(),
-                    Ok(t) => t.is_dir(),
-                    Err(_) => p.is_dir(),
-                };
-                if dir {
+            for entry in entries {
+                let p = entry.path();
+                if entry.is_dir() {
                     stack.push(p);
                 } else if p.extension().is_some_and(|x| x == "png")
                     && let Ok(rel) = p.strip_prefix(&base)

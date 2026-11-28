@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 pub mod buf;
 pub mod chunk;
+pub mod codec_tree;
 pub mod connection;
 pub mod translation;
 pub mod crypto;

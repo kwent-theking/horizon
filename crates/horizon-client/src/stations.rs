@@ -25,9 +25,20 @@ pub struct StationData {
 }
 impl StationData {
     pub fn load(root: &Path, items: &Items) -> Self {
+        Self::load_with_files(root, items, None)
+    }
+
+    pub fn load_with_files(
+        root: &Path,
+        items: &Items,
+        recipe_files: Option<&[(String, String, Vec<u8>)]>,
+    ) -> Self {
         Self {
             enchantments: std::sync::Arc::clone(&items.enchantments),
-            recipes: StationRecipes::load(root, items),
+            recipes: match recipe_files {
+                Some(files) => StationRecipes::load_with_files(root, files, items),
+                None => StationRecipes::load(root, items),
+            },
             brewing: crate::brewing::Brewing::load(root, items),
             trades: crate::merchant::Trades::load(root),
             banners: crate::banner::Banners::load(root),
@@ -485,32 +496,30 @@ fn ingredient(v: &Value, items: &Items) -> Ingredient {
 impl StationRecipes {
     pub fn load(root: &Path, items: &Items) -> Self {
         // Vanilla's recipes, then the content mods' (docs/modpacks.md).
-        let mut files = Vec::new();
-        let namespaces =
-            std::iter::once("minecraft".to_owned()).chain(crate::mod_content::namespaces(root));
-        for namespace in namespaces {
-            let mut more: Vec<_> = fs::read_dir(root.join(format!("data/{namespace}/recipe")))
-                .into_iter()
-                .flatten()
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| p.extension().is_some_and(|e| e == "json"))
-                .collect();
-            more.sort();
-            files.extend(more.into_iter().map(|p| (namespace.clone(), p)));
-        }
+        let files = crate::crafting::recipe_json_files(root).unwrap_or_default();
+        Self::load_with_files(root, &files, items)
+    }
+
+    pub fn load_with_files(
+        root: &Path,
+        files: &[(String, String, Vec<u8>)],
+        items: &Items,
+    ) -> Self {
         let mut smithing = Vec::new();
         let mut stonecutting = Vec::new();
-        for (namespace, p) in files {
-            let Ok(bytes) = fs::read(&p) else { continue };
-            let Ok(v) = serde_json::from_slice::<Value>(&bytes) else {
+        for (namespace, stem, bytes) in files {
+            let is_candidate = bytes
+                .windows(8)
+                .any(|w| w == b"smithing" || w == b"stonecut");
+            if !is_candidate {
+                continue;
+            }
+            let Ok(v) = serde_json::from_slice::<Value>(bytes) else {
                 continue;
             };
-            let id = format!(
-                "{namespace}:{}",
-                p.file_stem().and_then(|s| s.to_str()).unwrap_or("")
-            );
-            match v["type"].as_str().unwrap_or("") {
+            let id = format!("{namespace}:{stem}");
+            match crate::crafting::canonical_recipe_type(v["type"].as_str().unwrap_or("")).as_ref()
+            {
                 "minecraft:smithing_transform" => smithing.push(Smithing::Transform {
                     id,
                     template: ingredient(&v["template"], items),
@@ -1003,14 +1012,80 @@ mod tests {
     fn smithing_ingredient_parses_holders() {
         let items = sample_items();
         let a = ingredient(&serde_json::json!("minecraft:diamond_sword"), &items);
-        assert_eq!(a.1, vec!["minecraft:diamond_sword"]);
+        assert_eq!(*a.1, vec!["minecraft:diamond_sword"]);
         let b = ingredient(
             &serde_json::json!(["minecraft:diamond_sword", "minecraft:diamond_axe"]),
             &items,
         );
         assert_eq!(
-            b.1,
+            *b.1,
             vec!["minecraft:diamond_sword", "minecraft:diamond_axe"]
         );
+    }
+
+    #[test]
+    fn station_recipes_load_with_files_fast_filters() {
+        let items = sample_items();
+        let craft = (
+            "minecraft".to_owned(),
+            "craft".to_owned(),
+            br#"{"type":"minecraft:crafting_shapeless","ingredients":[],"result":{"id":"minecraft:apple"}}"#.to_vec(),
+        );
+        let cut = (
+            "minecraft".to_owned(),
+            "stone".to_owned(),
+            br#"{"type":"minecraft:stonecutting","ingredient":{"item":"minecraft:stone"},"result":{"id":"minecraft:stone_bricks","count":1}}"#.to_vec(),
+        );
+        let smith = (
+            "minecraft".to_owned(),
+            "upgrade".to_owned(),
+            br#"{"type":"minecraft:smithing_transform","template":{"item":"minecraft:netherite_upgrade_smithing_template"},"base":{"item":"minecraft:diamond_sword"},"addition":{"item":"minecraft:netherite_ingot"},"result":{"id":"minecraft:netherite_sword"}}"#.to_vec(),
+        );
+        let temp =
+            std::env::temp_dir().join(format!("horizon-station-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp);
+        fs::create_dir_all(&temp).unwrap();
+        let loaded = StationRecipes::load_with_files(&temp, &[craft, cut, smith], &items);
+        assert_eq!(loaded.stonecutting.len(), 1);
+        assert_eq!(loaded.stonecutting[0].id, "minecraft:stone");
+        assert_eq!(loaded.smithing.len(), 1);
+        match &loaded.smithing[0] {
+            Smithing::Transform { id, result, .. } => {
+                assert_eq!(id, "minecraft:upgrade");
+                assert_eq!(result, "minecraft:netherite_sword");
+            }
+            _ => panic!("expected transform"),
+        }
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn bare_and_empty_namespace_station_recipe_types_parse_as_vanilla() {
+        let items = sample_items();
+        let cut = (
+            "minecraft".to_owned(),
+            "bare_cut".to_owned(),
+            br#"{"type":"stonecutting","ingredient":{"item":"minecraft:stone"},"result":{"id":"minecraft:stone_bricks","count":1}}"#.to_vec(),
+        );
+        let smith = (
+            "minecraft".to_owned(),
+            "empty_smith".to_owned(),
+            br#"{"type":":smithing_transform","template":{"item":"minecraft:netherite_upgrade_smithing_template"},"base":{"item":"minecraft:diamond_sword"},"addition":{"item":"minecraft:netherite_ingot"},"result":{"id":"minecraft:netherite_sword"}}"#.to_vec(),
+        );
+        let temp = std::env::temp_dir().join(format!(
+            "horizon-station-bare-type-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&temp);
+        fs::create_dir_all(&temp).unwrap();
+        let loaded = StationRecipes::load_with_files(&temp, &[cut, smith], &items);
+        assert_eq!(loaded.stonecutting.len(), 1);
+        assert_eq!(loaded.stonecutting[0].id, "minecraft:bare_cut");
+        assert_eq!(loaded.smithing.len(), 1);
+        match &loaded.smithing[0] {
+            Smithing::Transform { id, .. } => assert_eq!(id, "minecraft:empty_smith"),
+            _ => panic!("expected transform"),
+        }
+        let _ = fs::remove_dir_all(&temp);
     }
 }
