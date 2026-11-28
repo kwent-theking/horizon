@@ -48,7 +48,7 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
             ))
         })
         .collect::<Result<_, &str>>()?;
-    let mut visibility = FaceVisibility::new(&occlusion, &definitions)?;
+    let mut visibility = FaceVisibility::from_owned_occlusion(occlusion, &definitions)?;
     for invalid in [registry.len() as u32, u32::MAX] {
         assert!(
             visibility

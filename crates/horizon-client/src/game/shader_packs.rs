@@ -357,8 +357,7 @@ fn block_id_table(pack: &super::PackResources, ids: &BlockIds) -> Vec<i32> {
         let block = state.name.strip_prefix("minecraft:").unwrap_or(&state.name);
         let mut vote = |layer: u32| {
             let named = pack
-                .layer_names
-                .get(&layer)
+                .layer_name(layer)
                 .and_then(|n| n.strip_prefix("block/"))
                 == Some(block);
             let v = votes.entry((layer, id)).or_default();
@@ -378,7 +377,7 @@ fn block_id_table(pack: &super::PackResources, ids: &BlockIds) -> Vec<i32> {
         }
         let origin = horizon_core::position::BlockPos::new(0, 0, 0);
         for (_, model) in catalog.collect(state_id, origin).unwrap_or_default() {
-            for face in &model.faces {
+            for face in model.faces.iter() {
                 vote(face.layer);
             }
         }

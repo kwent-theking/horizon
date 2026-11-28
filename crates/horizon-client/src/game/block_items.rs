@@ -36,11 +36,30 @@ impl Game<'_> {
         block_entity_nbt::canonical(&tag)
     }
 
+    /// Pick Block into the inventory. A server only hears the carried slot,
+    /// so outside creative it may only select a stack already in the hotbar.
+    pub(super) fn pick_into_inventory(&mut self, stack: &ItemStack) {
+        if self.remote.is_some() && !self.creative {
+            horizon_client::pick_item::pick_hotbar(
+                &self.inventory[..36],
+                &mut self.selected,
+                stack,
+            );
+            return;
+        }
+        horizon_client::pick_item::pick(
+            &mut self.inventory[..36],
+            &mut self.selected,
+            stack,
+            self.creative,
+        );
+    }
+
     /// `BlockState.getCloneItemStack` of the block at `pos`, then, with
     /// `include_data`, `ServerGamePacketListenerImpl.addBlockDataToItem`.
     pub(super) fn picked_stack(&self, pos: [i32; 3], include_data: bool) -> Option<ItemStack> {
         let key = (pos[0], pos[1], pos[2]);
-        let state = self.world.block(pos[0], pos[1], pos[2]);
+        let state = self.target_block(pos);
         let facts = self.res.facts().get(state);
         if &*facts.item == "minecraft:air" {
             return None;
@@ -64,12 +83,32 @@ impl Game<'_> {
         }
         // AbstractBannerBlock.getCloneItemStack: the banner's own item
         // (BannerBlockEntity.getItem), data or not.
-        let banner = matches!(
-            self.world.block_entities.get(&key),
-            Some(BlockEntity::Banner(_))
-        );
+        let banner = if self.plot_level(pos).is_some() {
+            facts.name.ends_with("_banner")
+        } else {
+            matches!(
+                self.world.block_entities.get(&key),
+                Some(BlockEntity::Banner(_))
+            )
+        };
         if (include_data || banner)
-            && let Some(saved) = self.saved_block_entity(key)
+            && let Some(saved) = if let Some(plot) = self.plot_level(pos) {
+                plot.block_entity(pos).and_then(|(kind, tag)| {
+                    let name = self
+                        .remote
+                        .as_ref()?
+                        .builtin
+                        .get("minecraft:block_entity_type")?
+                        .name(*kind)?;
+                    let Tag::Compound(mut tag) = tag.clone() else {
+                        return None;
+                    };
+                    tag.insert("id".into(), Tag::String(name.into()));
+                    Some(Tag::Compound(tag))
+                })
+            } else {
+                self.saved_block_entity(key)
+            }
         {
             patch.extend(block_entity_item::pick(&saved));
         }

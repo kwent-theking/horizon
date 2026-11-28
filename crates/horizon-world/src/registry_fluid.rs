@@ -28,11 +28,8 @@ impl<'r> FluidRegistry<'r> {
         blocks_flow: &BTreeSet<String>,
         ice: &BTreeSet<String>,
     ) -> io::Result<Self> {
-        for names in [blocks_flow, ice] {
-            if names.iter().any(|n| registry.default_state(n).is_none()) {
-                return Err(invalid("unknown fluid block member"));
-            }
-        }
+        // Tags may name blocks of mods that are not installed: no state
+        // matches those names, so they change nothing.
         let states = (0..registry.len())
             .map(|i| {
                 let id = BlockStateId(i as u32);

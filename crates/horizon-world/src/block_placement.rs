@@ -92,11 +92,7 @@ impl<'r> BlockPlacementBindings<'r> {
         if !std::ptr::eq(registry, properties.registry()) {
             return Err(invalid("placement properties use another registry"));
         }
-        for name in double_plants.iter().chain(mossy_carpets) {
-            if registry.default_state(name).is_none() {
-                return Err(invalid("unknown placement definition"));
-            }
-        }
+        // Tag members of mods that are not installed match no state: skip them.
         let default = |name: &str| {
             registry
                 .default_state(name)

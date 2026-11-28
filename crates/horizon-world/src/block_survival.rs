@@ -434,11 +434,7 @@ impl<'r> BlockSurvivalRegistry<'r> {
                 .into_iter()
                 .flatten()
                 .collect::<BTreeSet<_>>();
-            for name in &names {
-                if registry.default_state(name).is_none() {
-                    return Err(invalid("unknown survival tag member"));
-                }
-            }
+            // Tag members of mods that are not installed match no state: skip them.
             Ok((0..registry.len())
                 .map(|i| BlockStateId(i as u32))
                 .filter(|id| names.contains(&registry.state(*id).unwrap().name))

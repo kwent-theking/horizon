@@ -506,11 +506,16 @@ fn shared_tag(root: &str, ns: &str, rest: &str) -> bool {
 }
 
 /// Where a jar entry goes: `Some(true)` inside the content mod (its own
-/// namespaces, additions to vanilla and convention tags), `Some(false)`
+/// namespaces, additions to vanilla and convention tags, and CBC rules for
+/// vanilla hit effects), `Some(false)`
 /// to `outside/`, `None` not carried (code, metadata).
 fn place(name: &str, owned: &[&str]) -> Option<bool> {
     let (root, ns, rest) = split(name)?;
-    Some(owned.contains(&ns) || shared_tag(root, ns, rest))
+    Some(
+        owned.contains(&ns)
+            || shared_tag(root, ns, rest)
+            || horizon_mods::content::shared_hit_effect_asset(root, ns, rest),
+    )
 }
 
 /// Namespaces no carried mod claims: vanilla's, the convention tags', the
@@ -1245,6 +1250,22 @@ fn write(path: &Path, bytes: &[u8]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cbc_hit_rules_are_carried_inside_the_pack() {
+        let owned = ["createbigcannons"];
+        assert_eq!(
+            place(
+                "assets/minecraft/block_hit_effects/block/tags/leaves.json",
+                &owned
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            place("assets/minecraft/textures/block/oak_leaves.png", &owned),
+            Some(false)
+        );
+    }
     use std::io::Write;
 
     /// YUNG's pools carry comments, which Minecraft's lenient reader skips;

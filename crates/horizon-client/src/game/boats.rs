@@ -907,12 +907,18 @@ impl Game<'_> {
                 b.previous.y + (b.position.y - b.previous.y) * alpha,
                 b.previous.z + (b.position.z - b.previous.z) * alpha,
             ) - camera;
+            let (p, ship) = self
+                .plot_object_pose(b.id, alpha)
+                .map_or((p, glam::Quat::IDENTITY), |(at, orientation)| {
+                    (at - camera, orientation)
+                });
             let yaw = b.previous_yaw + (b.yaw - b.previous_yaw) * a;
             let hurt = b.hurt_time as f32 - a;
             let damage = (b.damage - a).max(0.0);
-            let mut base =
-                glam::Mat4::from_translation(p.as_vec3() + glam::Vec3::new(0.0, 0.375, 0.0))
-                    * glam::Mat4::from_rotation_y((180.0 - yaw).to_radians());
+            let mut base = glam::Mat4::from_rotation_translation(
+                ship,
+                p.as_vec3() + ship * glam::Vec3::new(0.0, 0.375, 0.0),
+            ) * glam::Mat4::from_rotation_y((180.0 - yaw).to_radians());
             if hurt > 0.0 {
                 base *= glam::Mat4::from_rotation_x(
                     (hurt.sin() * hurt * damage / 10.0 * b.hurt_dir as f32).to_radians(),

@@ -75,12 +75,12 @@ fn info(solid: bool) -> Info {
         solid,
         full: false,
         permeable: false,
-        shade: 1.0,
+        shade: 1.0f32.to_bits(),
         emission: 0,
         tier: 0,
         emissive: false,
         fluid: FluidState::EMPTY,
-        model: false,
+        model: TerrainModel::None,
         block_entity: false,
         tints: [Tint::None; 2],
         tint_count: 0,
@@ -92,7 +92,7 @@ fn info(solid: bool) -> Info {
         ice: false,
         sturdy: 0,
         face: [0; 6],
-        cover: [0.0; 6],
+        cover: [0.0f32.to_bits(); 6],
     }
 }
 
@@ -165,8 +165,10 @@ fn cases() -> Vec<(&'static str, Padded)> {
 #[test]
 fn visibility_matches_reference() {
     let info = [info(false), info(true), info(false), info(true)];
+    let pooled = StateInfo::from_rows(info.len(), info.into_iter().map(Ok::<_, ()>)).unwrap();
     for (name, pad) in cases() {
-        assert_eq!(visibility(&pad, &info), reference(&pad, &info), "{name}");
+        let actual = visibility_with_scratch(&pad, |id| pooled[id].solid, &mut Vec::new());
+        assert_eq!(actual, reference(&pad, &info), "{name}");
     }
     // All 256 open/closed octant combinations, including disconnected regions.
     for mask in 0..256u16 {
@@ -277,4 +279,73 @@ fn visibility_benchmark() {
             before / after
         );
     }
+}
+
+#[test]
+fn padded_fill_and_visibility_with_scratch_reuse_match_fresh() {
+    let info = [info(false), info(true)];
+    let mut scratch = MeshScratch::default();
+
+    // First section: partially filled with a center chunk + one neighbour.
+    let mut center_a = Chunk::empty(0, 0);
+    let mut east_a = Chunk::empty(1, 0);
+    for z in 0..16 {
+        for x in 0..16 {
+            center_a.set(x, MIN_Y + 4, z, 1);
+        }
+    }
+    center_a.set(8, MIN_Y + 4, 8, 0); // hole connecting top/bottom
+    east_a.set(0, MIN_Y + 4, 0, 1);
+    let mut region_a = [[None; 3]; 3];
+    region_a[1][1] = Some(&center_a);
+    region_a[1][2] = Some(&east_a);
+
+    scratch.pad.fill(&mut scratch.own, &region_a, 0);
+    assert_eq!(scratch.pad.blocks[pi(16, 4, 0)], 1);
+    assert_eq!(scratch.pad.blocks[pi(-1, 4, 0)], 0);
+    assert_eq!(scratch.pad.light[pi(-1, 4, 0)], 0xF0);
+    assert_eq!(
+        visibility_with_scratch(&scratch.pad, |id| info[id].solid, &mut scratch.vis_stack),
+        reference(&scratch.pad, &info)
+    );
+
+    // Second section: reuse same MeshScratch with missing neighbour (must clear border state).
+    let mut center_b = Chunk::empty(2, 0);
+    for y in 0..16 {
+        for z in 0..16 {
+            for x in 0..16 {
+                if x != 7 {
+                    center_b.set(x, MIN_Y + y, z, 1);
+                }
+            }
+        }
+    }
+    let mut region_b = [[None; 3]; 3];
+    region_b[1][1] = Some(&center_b);
+    scratch.pad.fill(&mut scratch.own, &region_b, 0);
+    assert_eq!(scratch.pad.blocks[pi(16, 4, 0)], 0);
+    assert_eq!(scratch.pad.light[pi(16, 4, 0)], 0xF0);
+    let vis_b = visibility_with_scratch(&scratch.pad, |id| info[id].solid, &mut scratch.vis_stack);
+    assert_eq!(vis_b, reference(&scratch.pad, &info));
+    assert_eq!(vis_b, visibility(&scratch.pad, &info));
+}
+
+#[test]
+fn mesh_info_pools_bit_identical_fixture_rows() {
+    let mut negative_zero = info(false);
+    negative_zero.cover[0] = (-0.0f32).to_bits();
+    let rows = [
+        info(false),
+        info(true),
+        negative_zero,
+        info(false),
+        info(true),
+    ];
+    let table = StateInfo::from_rows(rows.len(), rows.into_iter().map(Ok::<_, ()>)).unwrap();
+    for (id, expected) in rows.iter().enumerate() {
+        assert!(table[id] == *expected);
+    }
+    assert!(std::ptr::eq(&table[0], &table[3]));
+    assert!(std::ptr::eq(&table[1], &table[4]));
+    assert!(!std::ptr::eq(&table[0], &table[2]));
 }

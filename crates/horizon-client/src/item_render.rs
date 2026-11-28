@@ -19,18 +19,20 @@ use horizon_assets::{
     animation::AnimationMetadata,
     item_bake::{BakedItemModel, SpriteLookup, SpriteMask, bake_item_model},
     item_model::{
-        ClientItem, Components, Context, DisplayContext, FoilType, ItemEnv, ItemModels,
-        LayerContent, LevelState, OwnerState, SpecialModel, StackView,
+        ClientItem, Components, ConditionProperty, Context, DisplayContext, FoilType, ItemEnv,
+        ItemModelNode, ItemModels, LayerContent, LevelState, OwnerState, SelectProperty,
+        SpecialModel, StackView,
     },
     model::Direction,
     palette::PalettedPermutations,
     resolve::{MISSING_MODEL, ModelLibrary},
 };
-use horizon_world::nbt::Tag;
+use horizon_world::{content_view, nbt::Tag};
 use serde_json::Value;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
+    hash::{BuildHasher, Hash, Hasher, RandomState},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -383,7 +385,7 @@ impl FileSprites {
             cache.insert(sprite.to_owned(), translucent);
         }
         let alpha: Vec<u8> = argb.iter().map(|p| (p >> 24) as u8).collect();
-        let animation = fs::read_to_string(png.with_extension("png.mcmeta"))
+        let animation = content_view::read_to_string(png.with_extension("png.mcmeta"))
             .ok()
             .and_then(|m| serde_json::from_str::<Value>(&m).ok())
             .and_then(|m| m.get("animation").map(Value::to_string))
@@ -440,7 +442,7 @@ pub struct ItemRenderer {
     pub models: ItemModels,
     library: Arc<ModelLibrary>,
     sprites: FileSprites,
-    baked: Mutex<HashMap<String, Arc<BakedItemModel>>>,
+    baked: Mutex<BakedModels>,
     extents: Mutex<HashMap<String, Arc<Vec<Vec3>>>>,
     /// GUI items already drawn: the HUD vertices of a static item at a GUI position
     /// (`gui::draw`), which are the same every frame it stays there.
@@ -453,13 +455,93 @@ pub struct ItemRenderer {
     item_ids: HashMap<String, i32>,
 }
 
+#[derive(Default)]
+struct BakedModels {
+    by_name: HashMap<String, Arc<BakedItemModel>>,
+    by_contents: HashMap<u64, Arc<BakedItemModel>>,
+    hasher: RandomState,
+}
+
+fn quad_key(quad: &horizon_assets::bake::ModelQuad) -> impl Eq + Hash + '_ {
+    (
+        quad.positions.map(|p| p.map(f32::to_bits)),
+        quad.uv.map(|uv| uv.map(f32::to_bits)),
+        quad.facing as u8,
+        quad.cull.map(|d| d as u8),
+        quad.material.sprite.as_str(),
+        quad.material.force_translucent,
+        quad.tint_index,
+        quad.shade_direction_override.map(|d| d as u8),
+        quad.light_emission,
+    )
+}
+
+fn model_key(model: &BakedItemModel) -> impl Eq + Hash + '_ {
+    (
+        model.uses_block_light,
+        model.particle.sprite.as_str(),
+        model.particle.force_translucent,
+        model.transforms.each_ref().map(|t| {
+            t.as_ref()
+                .map(|t| [t.rotation, t.translation, t.scale].map(|v| v.map(f32::to_bits)))
+        }),
+        model.quads.len(),
+    )
+}
+impl BakedModels {
+    fn insert(&mut self, name: &str, model: BakedItemModel) -> Arc<BakedItemModel> {
+        use std::collections::hash_map::Entry;
+        let mut hasher = self.hasher.build_hasher();
+        model_key(&model).hash(&mut hasher);
+        for quad in &model.quads {
+            quad_key(quad).hash(&mut hasher);
+        }
+        let mut hash = hasher.finish();
+        let shared = loop {
+            match self.by_contents.entry(hash) {
+                Entry::Occupied(entry) => {
+                    let existing = entry.get();
+                    if model_key(existing) == model_key(&model)
+                        && existing
+                            .quads
+                            .iter()
+                            .map(quad_key)
+                            .eq(model.quads.iter().map(quad_key))
+                    {
+                        break existing.clone();
+                    }
+                    hash = hash.wrapping_add(1);
+                }
+                Entry::Vacant(entry) => break entry.insert(Arc::new(model)).clone(),
+            }
+        };
+        self.by_name.insert(name.to_owned(), shared.clone());
+        shared
+    }
+}
+
+/// Preloaded client item definitions (`assets/*/items/**/*.json`), loaded
+/// outside nested worker pools so cold startup uses all available threads.
+pub struct ItemDefinitions(BTreeMap<String, ClientItem>);
+
 /// Every `items/**/*.json` client item definition, by identifier.
+#[cfg(test)]
 fn load_definitions(root: &Path) -> BTreeMap<String, ClientItem> {
-    fn walk(dir: &Path, rel: &str, namespace: &str, out: &mut BTreeMap<String, ClientItem>) {
-        let Ok(entries) = fs::read_dir(dir) else {
+    load_definitions_with_threads(root, horizon_core::par::threads())
+}
+
+fn load_definitions_with_threads(root: &Path, threads: usize) -> BTreeMap<String, ClientItem> {
+    fn collect_paths(
+        dir: &Path,
+        rel: &str,
+        namespace: &str,
+        out: &mut Vec<(String, std::path::PathBuf)>,
+    ) {
+        // A mods' root serves their item definitions from the archives.
+        let Ok(entries) = content_view::read_dir(dir) else {
             return;
         };
-        for entry in entries.flatten() {
+        for entry in entries {
             let path = entry.path();
             let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
                 continue;
@@ -469,26 +551,306 @@ fn load_definitions(root: &Path) -> BTreeMap<String, ClientItem> {
             } else {
                 format!("{rel}/{name}")
             };
-            if path.is_dir() {
-                walk(&path, &rel, namespace, out);
-            } else if let Some(id) = rel.strip_suffix(".json")
-                && let Some(item) = fs::read_to_string(&path)
-                    .ok()
-                    .and_then(|t| ClientItem::from_json(&t).ok())
-            {
-                out.insert(format!("{namespace}:{id}"), item);
+            if entry.is_dir() {
+                collect_paths(&path, &rel, namespace, out);
+            } else if let Some(id) = rel.strip_suffix(".json") {
+                out.push((format!("{namespace}:{id}"), path));
             }
         }
     }
-    let mut out = BTreeMap::new();
-    let Ok(namespaces) = fs::read_dir(root.join("assets")) else {
-        return out;
-    };
-    for ns in namespaces.flatten() {
-        let namespace = ns.file_name().to_string_lossy().into_owned();
-        walk(&ns.path().join("items"), "", &namespace, &mut out);
+    let started = std::time::Instant::now();
+    let cache = horizon_world::resource_cache::Cache::for_tree(root, "client-item-defs-v1", &[]);
+    if let Some(raw) = cache
+        .as_ref()
+        .and_then(|c| c.read_value::<Vec<(String, String)>>())
+        .filter(|raw| raw.iter().all(|(id, _)| !id.is_empty()))
+    {
+        let mut parsed = BTreeMap::new();
+        let mut all_valid = true;
+        horizon_core::par::map_batches_with(
+            threads,
+            raw,
+            256,
+            |(id, text)| {
+                ClientItem::from_json(text)
+                    .ok()
+                    .map(|item| (id.clone(), item))
+            },
+            |entry| {
+                if let Some((id, item)) = entry {
+                    parsed.insert(id, item);
+                } else {
+                    all_valid = false;
+                }
+            },
+        );
+        if all_valid {
+            log::info!(
+                "Horizon: stage=item_definitions cache=hit threads={} count={} elapsed_ms={}",
+                threads,
+                parsed.len(),
+                started.elapsed().as_millis()
+            );
+            return parsed;
+        }
     }
+    let walk_started = std::time::Instant::now();
+    let mut paths = Vec::new();
+    let Ok(namespaces) = content_view::read_dir(root.join("assets")) else {
+        return BTreeMap::new();
+    };
+    for ns in namespaces {
+        let namespace = ns.file_name().to_string_lossy().into_owned();
+        collect_paths(&ns.path().join("items"), "", &namespace, &mut paths);
+    }
+    paths.sort_by(|a, b| a.0.cmp(&b.0));
+    let walk_ms = walk_started.elapsed().as_millis();
+    let file_count = paths.len();
+    let parse_started = std::time::Instant::now();
+    let mut raw = Vec::new();
+    let mut out = BTreeMap::new();
+    // Thread time in reads, and the slowest read: a cold start spent 70 s here
+    // while parsing the same texts from the cache takes under 0.1 s.
+    let read_ns = std::sync::atomic::AtomicU64::new(0);
+    let slowest_read_ns = std::sync::atomic::AtomicU64::new(0);
+    horizon_core::par::map_batches_with(
+        threads,
+        paths,
+        256,
+        |(id, path)| {
+            let read_started = std::time::Instant::now();
+            let text = content_view::read_to_string(path);
+            let took = read_started.elapsed().as_nanos() as u64;
+            read_ns.fetch_add(took, std::sync::atomic::Ordering::Relaxed);
+            slowest_read_ns.fetch_max(took, std::sync::atomic::Ordering::Relaxed);
+            let text = text.ok()?;
+            let item = ClientItem::from_json(&text).ok()?;
+            Some((id.clone(), text, item))
+        },
+        |entry| {
+            if let Some((id, text, item)) = entry {
+                raw.push((id.clone(), text));
+                out.insert(id, item);
+            }
+        },
+    );
+    let parse_ms = parse_started.elapsed().as_millis();
+    let write_started = std::time::Instant::now();
+    if let Some(cache) = cache {
+        let _ = cache.write_value(&raw);
+    }
+    let write_ms = write_started.elapsed().as_millis();
+    log::info!(
+        "Horizon: stage=item_definitions cache=miss threads={} files={} count={} walk_ms={} parse_ms={} read_thread_ms={} slowest_read_ms={} write_ms={} elapsed_ms={}",
+        threads,
+        file_count,
+        out.len(),
+        walk_ms,
+        parse_ms,
+        read_ns.into_inner() / 1_000_000,
+        slowest_read_ns.into_inner() / 1_000_000,
+        write_ms,
+        started.elapsed().as_millis()
+    );
     out
+}
+
+fn load_item_ids(root: &Path) -> HashMap<String, i32> {
+    let Some(reg_path) = horizon_protocol::registry::Builtin::find(root) else {
+        return HashMap::new();
+    };
+    let cache = horizon_world::resource_cache::Cache::new(
+        root,
+        "item-registry-ids-v1",
+        &[reg_path.as_path()],
+        &[],
+    );
+    if let Some(map) = cache
+        .as_ref()
+        .and_then(|c| c.read_value::<HashMap<String, i32>>())
+        .filter(|map| map.iter().all(|(k, &v)| !k.is_empty() && v >= 0))
+    {
+        return map;
+    }
+    let map = horizon_protocol::registry::Builtin::load(&reg_path)
+        .ok()
+        .and_then(|b| {
+            let ids = b.get("minecraft:item")?;
+            let mut out = HashMap::new();
+            for i in 0.. {
+                let Some(name) = ids.name(i) else { break };
+                out.insert(name.to_owned(), i);
+            }
+            Some(out)
+        })
+        .unwrap_or_default();
+    if let Some(cache) = cache
+        && !map.is_empty()
+    {
+        let _ = cache.write_value(&map);
+    }
+    map
+}
+
+/// Components kept whole: the item resolver reads some, and the game reads the rest from an
+/// item's defaults (`game/hand.rs`, `game/item_draw.rs`, `game/totem.rs`, `game.rs`).
+const FIXED_KEPT_COMPONENTS: &[&str] = &[
+    "minecraft:attack_range",
+    "minecraft:item_model",
+    "minecraft:enchantment_glint_override",
+    "minecraft:enchantments",
+    "minecraft:lodestone_tracker",
+    "minecraft:max_damage",
+    "minecraft:unbreakable",
+    "minecraft:damage",
+    "minecraft:max_stack_size",
+    "minecraft:bundle_contents",
+    "minecraft:custom_model_data",
+    "minecraft:charged_projectiles",
+    "minecraft:trim",
+    "minecraft:block_state",
+    "minecraft:dyed_color",
+    "minecraft:firework_explosion",
+    "minecraft:potion_contents",
+    "minecraft:banner_patterns",
+    "minecraft:pot_decorations",
+    "minecraft:profile",
+    "minecraft:base_color",
+    "minecraft:consumable",
+    "minecraft:blocks_attacks",
+    "minecraft:kinetic_weapon",
+    "minecraft:death_protection",
+];
+
+fn collect_referenced_components(node: &ItemModelNode, out: &mut HashSet<String>) {
+    match node {
+        ItemModelNode::Empty | ItemModelNode::Model(_) | ItemModelNode::BundleSelectedItem => {}
+        ItemModelNode::Composite { models, .. } => {
+            for model in models {
+                collect_referenced_components(model, out);
+            }
+        }
+        ItemModelNode::Condition {
+            property,
+            on_true,
+            on_false,
+            ..
+        } => {
+            if let ConditionProperty::Component(predicate) = property
+                && let Some(map) = predicate.as_object()
+            {
+                for key in map.keys() {
+                    out.insert(key.clone());
+                }
+            }
+            collect_referenced_components(on_true, out);
+            collect_referenced_components(on_false, out);
+        }
+        ItemModelNode::Select {
+            property,
+            cases,
+            fallback,
+            ..
+        } => {
+            if let SelectProperty::Component(component) = property {
+                out.insert(component.clone());
+            }
+            for case in cases {
+                collect_referenced_components(&case.model, out);
+            }
+            if let Some(fallback) = fallback {
+                collect_referenced_components(fallback, out);
+            }
+        }
+        ItemModelNode::RangeDispatch {
+            entries, fallback, ..
+        } => {
+            for (_, model) in entries {
+                collect_referenced_components(model, out);
+            }
+            if let Some(fallback) = fallback {
+                collect_referenced_components(fallback, out);
+            }
+        }
+        ItemModelNode::Special { .. } => {}
+    }
+}
+
+/// Deserialize `items.json` while discarding heavy component JSON payloads
+/// that neither item model resolution nor item draw code inspects. Pruned
+/// keys remain in each item's `Components` map as `Value::Null` so presence
+/// queries such as `minecraft:has_component` keep vanilla behaviour.
+fn load_prototypes_pruned(
+    bytes: &[u8],
+    definitions: &BTreeMap<String, ClientItem>,
+) -> std::result::Result<BTreeMap<String, Components>, serde_json::Error> {
+    use serde::de::{Deserializer, IgnoredAny, MapAccess, Visitor};
+
+    let mut kept: HashSet<String> = FIXED_KEPT_COMPONENTS
+        .iter()
+        .map(|&s| s.to_owned())
+        .collect();
+    for def in definitions.values() {
+        collect_referenced_components(&def.model, &mut kept);
+    }
+
+    struct ComponentMapSeed<'a>(&'a HashSet<String>);
+    impl<'de> serde::de::DeserializeSeed<'de> for ComponentMapSeed<'_> {
+        type Value = Components;
+        fn deserialize<D: Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> std::result::Result<Self::Value, D::Error> {
+            struct ComponentVisitor<'a>(&'a HashSet<String>);
+            impl<'de> Visitor<'de> for ComponentVisitor<'_> {
+                type Value = Components;
+                fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                    f.write_str("component map")
+                }
+                fn visit_map<A: MapAccess<'de>>(
+                    self,
+                    mut map: A,
+                ) -> std::result::Result<Self::Value, A::Error> {
+                    let mut out = Components::new();
+                    while let Some(key) = map.next_key::<String>()? {
+                        let value = if self.0.contains(&key) {
+                            map.next_value::<Value>()?
+                        } else {
+                            map.next_value::<IgnoredAny>()?;
+                            Value::Null
+                        };
+                        out.insert(key, value);
+                    }
+                    Ok(out)
+                }
+            }
+            deserializer.deserialize_map(ComponentVisitor(self.0))
+        }
+    }
+
+    struct PrototypesVisitor<'a>(&'a HashSet<String>);
+    impl<'de> Visitor<'de> for PrototypesVisitor<'_> {
+        type Value = BTreeMap<String, Components>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("item prototypes map")
+        }
+        fn visit_map<A: MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            let mut out = BTreeMap::new();
+            while let Some(item) = map.next_key::<String>()? {
+                let components = map.next_value_seed(ComponentMapSeed(self.0))?;
+                out.insert(item, components);
+            }
+            Ok(out)
+        }
+    }
+
+    let mut de = serde_json::Deserializer::from_slice(bytes);
+    let out = de.deserialize_map(PrototypesVisitor(&kept))?;
+    de.end()?;
+    Ok(out)
 }
 
 impl ItemRenderer {
@@ -500,17 +862,35 @@ impl ItemRenderer {
             crate::model_library::ParsedModels::load(root).into_item_library(),
         )
     }
+    /// Load item definitions at top-level parallelism, before joining a
+    /// coarser stage such as `pack_tables`.
+    pub fn load_definitions(root: &Path, threads: usize) -> ItemDefinitions {
+        ItemDefinitions(load_definitions_with_threads(root, threads))
+    }
     /// Reuse the immutable models prepared with the block resources at `root`.
     /// Defer item-only validation failures until after item definitions are loaded.
     pub fn load_with_library(
         root: &Path,
         library: std::result::Result<Arc<ModelLibrary>, String>,
     ) -> crate::Result<Self> {
-        let prototypes: BTreeMap<String, Components> =
-            serde_json::from_slice(&fs::read(root.join("items.json"))?)?;
+        let definitions = Self::load_definitions(root, horizon_core::par::threads());
+        Self::load_with_definitions(root, definitions, library)
+    }
+    /// Like [`ItemRenderer::load_with_library`], reusing definitions preloaded
+    /// by [`ItemRenderer::load_definitions`].
+    pub fn load_with_definitions(
+        root: &Path,
+        definitions: ItemDefinitions,
+        library: std::result::Result<Arc<ModelLibrary>, String>,
+    ) -> crate::Result<Self> {
+        let definitions = definitions.0;
+        let prototypes = {
+            let bytes = fs::read(root.join("items.json"))?;
+            load_prototypes_pruned(&bytes, &definitions)?
+        };
         let models = ItemModels {
-            definitions: load_definitions(root),
-            prototypes,
+            definitions,
+            prototypes: prototypes.into(),
         };
         let library = library?;
         let permutations = PalettedPermutations::from_atlas(
@@ -521,18 +901,7 @@ impl ItemRenderer {
         let grass = crate::hud::decode(&root.join("assets/minecraft/textures/colormap/grass.png"))
             .map(|(_, _, rgba)| argb_pixels(&rgba).into_iter().map(|p| p as i32).collect())
             .unwrap_or_default();
-        let item_ids = horizon_protocol::registry::Builtin::find(root)
-            .and_then(|p| horizon_protocol::registry::Builtin::load(&p).ok())
-            .and_then(|b| {
-                let ids = b.get("minecraft:item")?;
-                let mut out = HashMap::new();
-                for i in 0.. {
-                    let Some(name) = ids.name(i) else { break };
-                    out.insert(name.to_owned(), i);
-                }
-                Some(out)
-            })
-            .unwrap_or_default();
+        let item_ids = load_item_ids(root);
         Ok(Self {
             item_ids,
             models,
@@ -550,31 +919,35 @@ impl ItemRenderer {
             grass,
         })
     }
+    /// The parsed model library loaded with this renderer.
+    pub fn library(&self) -> &Arc<ModelLibrary> {
+        &self.library
+    }
     /// `ModelBakery` item baking, cached per model.
     pub fn bake(&self, model: &str) -> Arc<BakedItemModel> {
         if let Ok(cache) = self.baked.lock()
-            && let Some(hit) = cache.get(model)
+            && let Some(hit) = cache.by_name.get(model)
         {
             return hit.clone();
         }
         let baked = bake_item_model(&self.library, &self.sprites, model)
             .or_else(|_| bake_item_model(&self.library, &self.sprites, MISSING_MODEL))
-            .map(Arc::new)
-            .unwrap_or_else(|_| {
-                Arc::new(BakedItemModel {
-                    quads: Vec::new(),
-                    uses_block_light: false,
-                    particle: horizon_assets::model::Material {
-                        sprite: horizon_assets::item_bake::MISSING_SPRITE.to_owned(),
-                        force_translucent: false,
-                    },
-                    transforms: Default::default(),
-                })
+            .unwrap_or_else(|_| BakedItemModel {
+                quads: Vec::new(),
+                uses_block_light: false,
+                particle: horizon_assets::model::Material {
+                    sprite: horizon_assets::item_bake::MISSING_SPRITE.to_owned(),
+                    force_translucent: false,
+                },
+                transforms: Default::default(),
             });
         if let Ok(mut cache) = self.baked.lock() {
-            cache.insert(model.to_owned(), baked.clone());
+            if let Some(hit) = cache.by_name.get(model) {
+                return hit.clone();
+            }
+            return cache.insert(model, baked);
         }
-        baked
+        Arc::new(baked)
     }
     /// `CuboidItemModelWrapper.computeExtents`: the distinct quad corners.
     fn quad_extents(&self, model: &str, baked: &BakedItemModel) -> Arc<Vec<Vec3>> {
@@ -936,5 +1309,390 @@ mod tests {
         assert_eq!(transform_normal(m, Vec3::X), Vec3::X);
         let r = Mat4::from_rotation_y(std::f32::consts::FRAC_PI_2);
         assert!((transform_normal(r, Vec3::Z) - Vec3::X).length() < 1e-6);
+    }
+
+    #[test]
+    fn definitions_and_item_ids_snapshots_hit_recover_and_invalidate() {
+        let temp =
+            std::env::temp_dir().join(format!("horizon-item-defs-cache-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp);
+        let items_dir = temp.join("assets/minecraft/items");
+        fs::create_dir_all(&items_dir).unwrap();
+        fs::write(temp.join("horizon-mod-content.stamp"), "item-defs-test-v1").unwrap();
+        fs::write(
+            items_dir.join("stick.json"),
+            r#"{"model":{"type":"minecraft:model","model":"minecraft:item/stick"}}"#,
+        )
+        .unwrap();
+        let reg_path = temp.join("registries.json");
+        fs::write(
+            &reg_path,
+            r#"{"minecraft:item":{"default":"minecraft:air","entries":{"minecraft:air":{"protocol_id":0},"minecraft:stone":{"protocol_id":1}},"protocol_id":5}}"#,
+        )
+        .unwrap();
+
+        let defs = load_definitions(&temp);
+        assert!(defs.contains_key("minecraft:stick"));
+        let ids = load_item_ids(&temp);
+        assert_eq!(ids.get("minecraft:stone"), Some(&1));
+
+        // Prove cache hit path runs without scanning files again.
+        let defs_cache =
+            horizon_world::resource_cache::Cache::for_tree(&temp, "client-item-defs-v1", &[])
+                .unwrap();
+        let mut seeded_defs = defs_cache.read_value::<Vec<(String, String)>>().unwrap();
+        seeded_defs.push((
+            "minecraft:cached_marker".into(),
+            r#"{"model":{"type":"minecraft:model","model":"minecraft:item/stick"}}"#.into(),
+        ));
+        defs_cache.write_value(&seeded_defs).unwrap();
+        assert!(load_definitions(&temp).contains_key("minecraft:cached_marker"));
+
+        let ids_cache = horizon_world::resource_cache::Cache::new(
+            &temp,
+            "item-registry-ids-v1",
+            &[reg_path.as_path()],
+            &[],
+        )
+        .unwrap();
+        let mut seeded_ids = ids_cache.read_value::<HashMap<String, i32>>().unwrap();
+        seeded_ids.insert("minecraft:cached_marker".into(), 99);
+        ids_cache.write_value(&seeded_ids).unwrap();
+        assert_eq!(
+            load_item_ids(&temp).get("minecraft:cached_marker"),
+            Some(&99)
+        );
+
+        // Corrupt snapshots and confirm fallback rebuilds cleanly.
+        for entry in fs::read_dir(temp.join(".horizon-derived"))
+            .unwrap()
+            .flatten()
+        {
+            if entry.path().is_file() {
+                fs::write(entry.path(), b"corrupted").unwrap();
+            }
+        }
+        let rebuilt_defs = load_definitions(&temp);
+        assert!(rebuilt_defs.contains_key("minecraft:stick"));
+        assert!(!rebuilt_defs.contains_key("minecraft:cached_marker"));
+        let rebuilt_ids = load_item_ids(&temp);
+        assert_eq!(rebuilt_ids.get("minecraft:stone"), Some(&1));
+        assert!(!rebuilt_ids.contains_key("minecraft:cached_marker"));
+
+        // Modifying source files invalidates snapshots.
+        fs::write(
+            items_dir.join("blaze_rod.json"),
+            r#"{"model":{"type":"minecraft:model","model":"minecraft:item/blaze_rod"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            &reg_path,
+            r#"{"minecraft:item":{"default":"minecraft:air","entries":{"minecraft:air":{"protocol_id":0},"minecraft:stone":{"protocol_id":1},"minecraft:dirt":{"protocol_id":2}},"protocol_id":5}}"#,
+        )
+        .unwrap();
+        let updated_defs = load_definitions(&temp);
+        assert!(updated_defs.contains_key("minecraft:blaze_rod"));
+        assert_eq!(load_item_ids(&temp).get("minecraft:dirt"), Some(&2));
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn pruned_prototypes_keep_components_the_game_reads() {
+        let read_by_game = [
+            "minecraft:attack_range",
+            "minecraft:consumable",
+            "minecraft:blocks_attacks",
+            "minecraft:kinetic_weapon",
+            "minecraft:death_protection",
+            "minecraft:item_model",
+            "minecraft:max_stack_size",
+            "minecraft:bundle_contents",
+        ];
+        let body = read_by_game
+            .iter()
+            .map(|id| format!("\"{id}\": {{\"kept\": true}}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let raw =
+            format!("{{\"minecraft:trident\": {{{body}, \"minecraft:tool\": {{\"x\": 1}}}}}}");
+        let prototypes = load_prototypes_pruned(raw.as_bytes(), &BTreeMap::new()).unwrap();
+        let components = &prototypes["minecraft:trident"];
+        for id in read_by_game {
+            assert_eq!(
+                components.get(id),
+                Some(&serde_json::json!({"kept": true})),
+                "{id} was pruned"
+            );
+        }
+        assert_eq!(components.get("minecraft:tool"), Some(&Value::Null));
+    }
+
+    #[test]
+    fn pruned_prototypes_keep_has_component_and_select_component_values() {
+        let def = ClientItem::from_json(
+            r#"{
+                "model": {
+                    "type": "minecraft:condition",
+                    "property": "minecraft:has_component",
+                    "component": "minecraft:tool",
+                    "on_true": {
+                        "type": "minecraft:select",
+                        "property": "minecraft:component",
+                        "component": "minecraft:custom_name",
+                        "cases": [{"when": "pick", "model": {"type": "minecraft:model", "model": "minecraft:item/diamond_pickaxe"}}],
+                        "fallback": {"type": "minecraft:model", "model": "minecraft:item/stone_pickaxe"}
+                    },
+                    "on_false": {"type": "minecraft:empty"}
+                }
+            }"#,
+        )
+        .unwrap();
+        let definitions = BTreeMap::from([("minecraft:diamond_pickaxe".to_owned(), def)]);
+        let raw_items = br##"{
+            "minecraft:diamond_pickaxe": {
+                "minecraft:item_model": "minecraft:diamond_pickaxe",
+                "minecraft:max_stack_size": 1,
+                "minecraft:tool": {"rules": [{"blocks": "#minecraft:mineable/pickaxe", "speed": 8.0}]},
+                "minecraft:attribute_modifiers": [{"type": "minecraft:attack_damage", "amount": 5.0}],
+                "minecraft:item_name": {"text": "Diamond Pickaxe"},
+                "minecraft:custom_name": "pick"
+            }
+        }"##;
+
+        let prototypes = load_prototypes_pruned(raw_items, &definitions).unwrap();
+        let components = &prototypes["minecraft:diamond_pickaxe"];
+        assert_eq!(
+            components.get("minecraft:item_model"),
+            Some(&Value::String("minecraft:diamond_pickaxe".to_owned()))
+        );
+        assert_eq!(
+            components.get("minecraft:max_stack_size"),
+            Some(&serde_json::json!(1))
+        );
+        assert_eq!(
+            components.get("minecraft:custom_name"),
+            Some(&Value::String("pick".to_owned()))
+        );
+        // Heavy components keep key presence for `has_component` without retaining large trees.
+        assert_eq!(components.get("minecraft:tool"), Some(&Value::Null));
+        assert_eq!(
+            components.get("minecraft:attribute_modifiers"),
+            Some(&Value::Null)
+        );
+        assert_eq!(components.get("minecraft:item_name"), Some(&Value::Null));
+
+        let models = ItemModels {
+            definitions,
+            prototypes: prototypes.into(),
+        };
+        let view = StackView::new("minecraft:diamond_pickaxe", 1);
+        let ctx = Context {
+            display: DisplayContext::Gui,
+            owner: None,
+            level: None,
+            seed: 0,
+        };
+        struct DummyEnv;
+        impl ItemEnv for DummyEnv {}
+        let resolved = models.resolve(&view, &ctx, &DummyEnv);
+        assert_eq!(resolved.layers.len(), 1);
+        assert_eq!(
+            resolved.layers[0].content,
+            LayerContent::Model {
+                model: "minecraft:item/diamond_pickaxe".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn load_definitions_is_byte_identical_across_thread_counts_and_matches_load_with_library() {
+        let base = std::env::temp_dir().join(format!(
+            "horizon-item-defs-par-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let setup = |root: &Path| {
+            let _ = fs::remove_dir_all(root);
+            fs::create_dir_all(root).unwrap();
+            fs::write(root.join("horizon-mod-content.stamp"), b"defs-par-test").unwrap();
+            let defaults: BTreeMap<String, Value> = (0..24)
+                .flat_map(|i| {
+                    [
+                        format!("minecraft:item_{i:02}"),
+                        format!("mod_a:tools/tool_{i:02}"),
+                    ]
+                })
+                .map(|id| {
+                    (
+                        id.clone(),
+                        serde_json::json!({
+                            "minecraft:item_model": id,
+                            "minecraft:max_stack_size": 64,
+                            "minecraft:tool": {"discarded": true},
+                        }),
+                    )
+                })
+                .collect();
+            fs::write(
+                root.join("items.json"),
+                serde_json::to_vec(&defaults).unwrap(),
+            )
+            .unwrap();
+            let write = |rel: &str, body: &str| {
+                let p = root.join(rel);
+                fs::create_dir_all(p.parent().unwrap()).unwrap();
+                fs::write(p, body).unwrap();
+            };
+            for i in 0..24 {
+                write(
+                    &format!("assets/minecraft/items/item_{i:02}.json"),
+                    &format!(
+                        r#"{{"model":{{"type":"minecraft:model","model":"minecraft:item/item_{i:02}"}}}}"#
+                    ),
+                );
+                write(
+                    &format!("assets/mod_a/items/tools/tool_{i:02}.json"),
+                    &format!(
+                        r#"{{"model":{{"type":"minecraft:model","model":"mod_a:item/tool_{i:02}"}}}}"#
+                    ),
+                );
+            }
+            write("assets/mod_a/items/broken.json", "{");
+            let cube = r##"{"textures":{"particle":"minecraft:missingno"},"elements":[{"from":[0,0,0],"to":[16,16,16],"faces":{"up":{"texture":"#particle"}}}]}"##;
+            for path in ["item_00", "item_01"] {
+                write(&format!("assets/minecraft/models/item/{path}.json"), cube);
+            }
+            write(
+                "assets/minecraft/models/item/item_02.json",
+                &cube.replace("[16,16,16]", "[8,8,8]"),
+            );
+        };
+        let (root_serial, root_par) = (base.join("serial"), base.join("parallel"));
+        setup(&root_serial);
+        setup(&root_par);
+
+        let serial_defs = ItemRenderer::load_definitions(&root_serial, 1);
+        let par_defs = ItemRenderer::load_definitions(&root_par, 6);
+        assert_eq!(serial_defs.0.len(), 48);
+        assert_eq!(par_defs.0.len(), 48);
+        assert_eq!(
+            serial_defs.0.keys().collect::<Vec<_>>(),
+            par_defs.0.keys().collect::<Vec<_>>()
+        );
+
+        let read_cache = |root: &Path| -> Vec<u8> {
+            let mut entries: Vec<_> = fs::read_dir(root.join(".horizon-derived"))
+                .unwrap()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_file())
+                .collect();
+            entries.sort();
+            assert_eq!(entries.len(), 1);
+            fs::read(&entries[0]).unwrap()
+        };
+        // Bytes 8..40 are the cache key, which hashes each root's own tree;
+        // the payload digest and the payload after it must match.
+        assert_eq!(read_cache(&root_serial)[40..], read_cache(&root_par)[40..]);
+
+        let lib_a = crate::model_library::ParsedModels::load(&root_par).into_item_library();
+        let lib_b = crate::model_library::ParsedModels::load(&root_serial).into_item_library();
+        let via_defs = ItemRenderer::load_with_definitions(&root_par, par_defs, lib_a).unwrap();
+        let via_lib = ItemRenderer::load_with_library(&root_serial, lib_b).unwrap();
+        assert_eq!(
+            via_defs.models.definitions.keys().collect::<Vec<_>>(),
+            via_lib.models.definitions.keys().collect::<Vec<_>>()
+        );
+        struct FixtureEnv;
+        impl ItemEnv for FixtureEnv {}
+        let context = Context {
+            display: DisplayContext::Gui,
+            owner: None,
+            level: None,
+            seed: 0,
+        };
+        for id in via_defs.models.definitions.keys() {
+            let stack = StackView::new(id, 1);
+            for renderer in [&via_defs, &via_lib] {
+                let resolved = renderer.models.resolve(&stack, &context, &FixtureEnv);
+                let (namespace, path) = id.split_once(':').unwrap();
+                let path = path.strip_prefix("tools/").unwrap_or(path);
+                let model = format!("{namespace}:item/{path}");
+                assert_eq!(resolved.layers.len(), 1);
+                assert_eq!(
+                    resolved.layers[0].content,
+                    LayerContent::Model {
+                        model: model.clone()
+                    }
+                );
+                let reference =
+                    bake_item_model(renderer.library(), &renderer.sprites, &model).unwrap();
+                let baked = renderer.bake(&model);
+                assert_eq!(baked.quads, reference.quads);
+                assert_eq!(baked.particle, reference.particle);
+                assert_eq!(baked.transforms, reference.transforms);
+                assert_eq!(baked.uses_block_light, reference.uses_block_light);
+                assert_eq!(
+                    renderer.models.prototypes.get(id, "minecraft:tool"),
+                    Some(&Value::Null)
+                );
+                assert_eq!(
+                    renderer
+                        .models
+                        .prototypes
+                        .get(id, "minecraft:max_stack_size"),
+                    Some(&serde_json::json!(64))
+                );
+            }
+        }
+        for renderer in [&via_defs, &via_lib] {
+            let cube = renderer.bake("minecraft:item/item_00");
+            assert_eq!(cube.quads.len(), 1);
+            assert!(Arc::ptr_eq(&cube, &renderer.bake("minecraft:item/item_01")));
+            assert!(!Arc::ptr_eq(
+                &cube,
+                &renderer.bake("minecraft:item/item_02")
+            ));
+            assert!(Arc::ptr_eq(
+                &renderer.bake("mod_a:item/tool_00"),
+                &renderer.bake(MISSING_MODEL),
+            ));
+        }
+
+        let mut bakes = BakedModels::default();
+        let reference = via_defs.bake(MISSING_MODEL).as_ref().clone();
+        let mut signed_zero = reference.clone();
+        let quad = signed_zero
+            .quads
+            .iter_mut()
+            .find(|q| q.positions.iter().flatten().any(|&p| p == 0.0))
+            .unwrap();
+        let zero = quad
+            .positions
+            .iter_mut()
+            .flatten()
+            .find(|p| **p == 0.0)
+            .unwrap();
+        *zero = if zero.is_sign_negative() { 0.0 } else { -0.0 };
+        assert!(!Arc::ptr_eq(
+            &bakes.insert("original", reference),
+            &bakes.insert("signed_zero", signed_zero)
+        ));
+
+        let prototypes = &via_defs.models.prototypes;
+        assert!(std::ptr::eq(
+            prototypes
+                .get("minecraft:item_00", "minecraft:max_stack_size")
+                .unwrap(),
+            prototypes
+                .get("minecraft:item_01", "minecraft:max_stack_size")
+                .unwrap(),
+        ));
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

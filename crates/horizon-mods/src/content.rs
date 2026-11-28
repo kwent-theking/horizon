@@ -5,7 +5,8 @@
 //! Content is data, not code: nothing here runs in the sandbox. What a mod
 //! may add is fenced instead. Its own namespaces (its id and the ones its
 //! manifest lists), plus additions to vanilla tags and to the convention
-//! tags (`c`, which NeoForge and Fabric mods share). Paths are plain, files
+//! tags (`c`, which NeoForge and Fabric mods share), plus CBC hit-effect rules for
+//! vanilla targets. Paths are plain, files
 //! and totals are capped, vanilla ids cannot be redefined, and no two mods
 //! share a namespace ([`clash`]).
 use crate::manifest::{Capability, MANIFEST, Manifest};
@@ -45,6 +46,16 @@ pub fn check_path(name: &str) -> Result<(), String> {
         return Err(bad());
     }
     Ok(())
+}
+
+/// CBC rules in the vanilla namespace target vanilla block, tag and entity ids.
+pub fn shared_hit_effect_asset(root: &str, namespace: &str, path: &str) -> bool {
+    root == "assets"
+        && namespace == "minecraft"
+        && path.ends_with(".json")
+        && (path.starts_with("block_hit_effects/block/")
+            || path.starts_with("block_hit_effects/fluid/")
+            || path.starts_with("projectile_hit_effects/"))
 }
 
 /// A vanilla identifier, `minecraft:path`.
@@ -284,10 +295,10 @@ impl Content {
             );
             let own = namespace == id;
             let owned = own || manifest.namespaces.iter().any(|n| n == namespace);
-            // Vanilla's own files stay vanilla's; a mod may only add to its
-            // tags, and to the convention tags mods share.
             let shared = matches!(namespace, "minecraft" | "c");
-            let allowed = owned || (top == "data" && shared && rest.starts_with("tags/"));
+            let allowed = owned
+                || (top == "data" && shared && rest.starts_with("tags/"))
+                || shared_hit_effect_asset(top, namespace, rest);
             if !allowed {
                 return Err(format!(
                     "{name}: a mod adds files in its own namespaces ({top}/{id}/ and those listed in namespaces) or to vanilla and convention (c) tags"
@@ -321,10 +332,25 @@ impl Content {
                 ));
             }
         }
+        // One reader for every declaration: opening the archive per file re-reads its whole
+        // central directory (minutes for a mod with thousands of blocks).
+        let (blocks, items) = {
+            let mut reader = self.reader()?;
+            let mut read =
+                |list: Vec<(String, String)>| -> Result<Vec<(String, String, Vec<u8>)>, String> {
+                    let mut out = Vec::with_capacity(list.len());
+                    for (id, name) in list {
+                        let bytes = reader.read(&name)?;
+                        out.push((id, name, bytes));
+                    }
+                    Ok(out)
+                };
+            (read(blocks)?, read(items)?)
+        };
         let mut ids = BTreeSet::new();
-        for (block, name) in blocks {
+        for (block, name, bytes) in blocks {
             let file: BlockFile =
-                serde_json::from_slice(&self.file(&name)?).map_err(|e| format!("{name}: {e}"))?;
+                serde_json::from_slice(&bytes).map_err(|e| format!("{name}: {e}"))?;
             check_block(&file).map_err(|e| format!("{name}: {e}"))?;
             if file.item {
                 ids.insert(block.clone());
@@ -336,9 +362,9 @@ impl Content {
                 item: file.item,
             });
         }
-        for (item, name) in items {
+        for (item, name, bytes) in items {
             let file: ItemFile =
-                serde_json::from_slice(&self.file(&name)?).map_err(|e| format!("{name}: {e}"))?;
+                serde_json::from_slice(&bytes).map_err(|e| format!("{name}: {e}"))?;
             if !vanilla_id(&file.template) {
                 return Err(format!(
                     "{name}: template {:?} is not a vanilla item (minecraft:...)",
@@ -548,6 +574,18 @@ capabilities = ["registries"]
         assert_eq!(content.files, ["data/ruby/horizon/block/ruby_block.json"]);
         assert_eq!(content.file(&content.files[0]).unwrap(), BLOCK);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn cbc_hit_rules_can_target_vanilla_tags_from_a_content_mod() {
+        let path = "assets/minecraft/block_hit_effects/block/tags/leaves.json";
+        let content = hmod("cbc-leaves", MANIFEST_TEXT, &[(path, b"{}")]).unwrap();
+        assert_eq!(content.files, [path]);
+        assert!(!shared_hit_effect_asset(
+            "assets",
+            "minecraft",
+            "block_hit_effects/block/image.png"
+        ));
     }
 
     #[test]

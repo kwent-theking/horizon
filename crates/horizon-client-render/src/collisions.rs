@@ -9,7 +9,7 @@ use horizon_core::{
 use horizon_world::{
     block_collision::{BlockCollisionRegistry, DynamicCollisionWorld, ShulkerCollisionState},
     block_collision_scan::{BlockCollisionWorld, CollisionBlock},
-    collision::CachedCollisionRegistry,
+    collision::{CachedCollisionRegistry, OracleShapes},
     collision_context::{CollisionContext, CollisionEntity, CollisionItem},
     dynamic_support::DynamicSupportWorld,
     entity_obstruction::EntityIdentity,
@@ -28,9 +28,11 @@ use std::{io, path::Path, sync::Arc};
 pub fn load<'r>(root: &Path, registry: &'r BlockRegistry) -> Result<BlockCollisionRegistry<'r>> {
     let file = BlockTableFile::open(&root.join("cached-collision.nbt"), registry)?;
     let cached = CachedCollisionRegistry::from_table(file.table("collision")?)?;
+    drop(file);
     if !cached.has_canonical_identities() {
         return Err("scene collisions require canonical shape identities".into());
     }
+    let cached = cached.with_oracle_shapes(OracleShapes::load(registry)?);
     Ok(BlockCollisionRegistry::new(Arc::new(cached))?)
 }
 
@@ -373,6 +375,10 @@ impl PistonCollisionWorld for SceneCollisions<'_, '_> {
     }
 }
 impl DynamicCollisionWorld for SceneCollisions<'_, '_> {
+    fn collision_neighbour(&mut self, [x, y, z]: [i32; 3]) -> Option<BlockStateId> {
+        Some(self.world.block(x, y, z))
+    }
+
     fn shulker_collision_state(
         &mut self,
         _: [i32; 3],
@@ -505,6 +511,10 @@ impl DynamicSupportWorld for LookupCollisions<'_, '_> {
     }
 }
 impl DynamicCollisionWorld for LookupCollisions<'_, '_> {
+    fn collision_neighbour(&mut self, [x, y, z]: [i32; 3]) -> Option<BlockStateId> {
+        Some((self.block)(x, y, z))
+    }
+
     fn shulker_collision_state(
         &mut self,
         _: [i32; 3],

@@ -264,6 +264,16 @@ impl Game<'_> {
         if self.remote.is_none() {
             self.tick_conduit_servers();
         }
+        if self.renderer.is_some() {
+            self.tick_kinetic_arms();
+            self.tick_create_deployers();
+            self.tick_create_fluids();
+            self.tick_create_pistons();
+            self.tick_create_indicators();
+            self.tick_kinetic_aux();
+            self.tick_kinetic_logistics();
+            self.tick_kinetic_contraptions();
+        }
         let Some(r) = &self.renderer else {
             if self.remote.is_none() {
                 self.tick_gateway_servers();

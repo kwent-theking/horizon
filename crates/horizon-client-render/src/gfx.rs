@@ -7,7 +7,6 @@ use crate::{
     graphics::GraphicsApi,
     hud::{HudBatch, HudRenderer},
     mesher::{SectionMesh, Sides, TerrainVertex, Vertex},
-    sprites::SpriteAnimation,
 };
 use glam::{DVec3, Mat4, Vec3, Vec4};
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
@@ -32,11 +31,15 @@ fn entity_shader() -> String {
     crate::overlay::wgsl_constants() + include_str!("entity.wgsl")
 }
 
+pub(crate) mod bc;
 #[cfg(test)]
 mod crumbling_tests;
 mod entity_batch;
 mod entity_outline;
 mod weather;
+pub use bc::{VramKind, VramLedger, VramSnapshot};
+pub use entity_batch::CBC_EYES_OVERLAY;
+pub(crate) use entity_batch::CBC_SHARD_OVERLAY;
 use entity_batch::EntityBatch;
 pub use entity_batch::{
     ENERGY_SWIRL_OVERLAY, SHADOW_OVERLAY, TEXT_POLYGON_OFFSET_OVERLAY,
@@ -44,6 +47,25 @@ pub use entity_batch::{
     WATER_MASK_OVERLAY,
 };
 pub use view::{View, ViewSet};
+
+/// Upload and VRAM configuration applied when opening or rebuilding [`Renderer`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RenderOptions {
+    /// Compress eligible static textures to BC1/BC7 when the GPU supports `TEXTURE_COMPRESSION_BC`.
+    pub texture_compression: bool,
+    /// Cap mipmap levels stored per sprite layer (`0` stores the full chain).
+    pub max_mipmap_levels: u32,
+    /// Disable BC compression on block sprite arrays while a shader pack copies them via `PackAtlas`.
+    pub shader_pack_active: bool,
+}
+
+/// The shared texture used by HUD, entities and first-person items.
+pub enum HudAtlasSource<'a> {
+    /// Fresh RGBA pixels, width and height.
+    Pixels((&'a [u8], u32, u32)),
+    /// Keep the atlas and its runtime uploads from the renderer being replaced.
+    Previous,
+}
 
 /// Window.getAppropriateLineWidth, in framebuffer pixels.
 pub fn outline_width(width: u32) -> f32 {
@@ -74,6 +96,7 @@ pub mod compositor;
 mod cull;
 mod end_sky;
 mod flat;
+mod gpu_memory;
 mod hdr;
 pub mod lightning;
 mod lod;
@@ -94,10 +117,14 @@ pub mod pack_uniforms;
 mod pack_weather;
 mod page_runs;
 pub mod panorama;
+mod plot_terrain;
 mod readback;
 mod resident;
+pub use plot_terrain::PlotSection;
 mod stars;
 mod sunrise_fan;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_frame;
 mod timing;
 pub mod translucency;
 pub(crate) mod upload;
@@ -444,6 +471,7 @@ pub struct Renderer {
     additive_pipeline: wgpu::RenderPipeline,
     /// `RenderPipelines.ENERGY_SWIRL`: additive, unlit, the sprite repeated within itself.
     energy_swirl_pipeline: wgpu::RenderPipeline,
+    cbc_eyes_pipeline: wgpu::RenderPipeline,
     lightning_pipeline: wgpu::RenderPipeline,
     lightning: lightning::Renderer,
     see_through_pipeline: wgpu::RenderPipeline,
@@ -529,6 +557,7 @@ pub struct Renderer {
     indirect_capacity: u64,
     /// Indirect draws may set `first_instance` (the section origin).
     pub multi_draw: bool,
+    plot_terrain: Option<plot_terrain::PlotTerrain>,
     /// Per-frame scratch, kept to avoid allocating every frame.
     visible: Vec<resident::Visible>,
     visible_lods: Vec<lod::Visible>,
@@ -606,6 +635,7 @@ pub struct Renderer {
     /// Advance animated block textures (Horizon setting; vanilla always does).
     pub animated_textures: bool,
     present_modes: Vec<wgpu::PresentMode>,
+    vram: bc::VramLedger,
 }
 /// Every layer's mip levels, layer major (`first` is the first layer's
 /// index into `settings`), made by `MipmapGenerator`.
@@ -700,9 +730,10 @@ fn terrain_group(
 }
 /// CPU texture uploads prepared by the resource worker. Consumed by renderer
 /// construction so the temporary mip chains are released after GPU upload.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct PreparedTextures {
-    sprites: Vec<(Vec<u8>, u32)>,
-    forcefield: (Vec<u8>, u32),
+    sprites: Vec<(crate::compact_bytes::CompactBytes, u32)>,
+    forcefield: (crate::compact_bytes::CompactBytes, u32),
 }
 impl PreparedTextures {
     pub fn new(
@@ -715,6 +746,157 @@ impl PreparedTextures {
         Self::with_split(pixels, size, layers, settings, forcefield, sprite_split())
     }
 
+    /// Reuse exact CPU mip chains from an immutable resource tree when available.
+    /// The cache key covers both the tree and the effective upload inputs, so a
+    /// changed layout or generator setting naturally falls back to preparation.
+    pub fn load_or_prepare(
+        root: &std::path::Path,
+        pixels: &crate::compact_bytes::CompactBytes,
+        size: u32,
+        layers: u32,
+        settings: &[crate::mipmap::Settings],
+        forcefield: (&[u8], u32),
+    ) -> Self {
+        Self::load_or_prepare_with_mip_cap(root, pixels, size, layers, settings, forcefield, 0)
+    }
+
+    pub fn load_or_prepare_with_mip_cap(
+        root: &std::path::Path,
+        pixels: &crate::compact_bytes::CompactBytes,
+        size: u32,
+        layers: u32,
+        settings: &[crate::mipmap::Settings],
+        forcefield: (&[u8], u32),
+        max_mips: u32,
+    ) -> Self {
+        let started = std::time::Instant::now();
+        let split = sprite_split();
+        let mut identity = sha2::Sha256::new();
+        use sha2::Digest;
+        identity.update(b"prepared-textures-v1");
+        identity.update(size.to_le_bytes());
+        identity.update(layers.to_le_bytes());
+        identity.update(split.to_le_bytes());
+        if max_mips > 0 {
+            identity.update(b"max-mips");
+            identity.update(max_mips.to_le_bytes());
+        }
+        identity.update((pixels.len() as u64).to_le_bytes());
+        // Hash compact backing directly; a hit never expands the base atlas.
+        let Some(pixel_identity) = horizon_world::resource_cache::Cache::value_identity(pixels)
+        else {
+            return Self::with_split_capped(
+                &pixels.decode(),
+                size,
+                layers,
+                settings,
+                forcefield,
+                split,
+                max_mips,
+            );
+        };
+        identity.update(pixel_identity);
+        identity.update((settings.len() as u64).to_le_bytes());
+        for setting in settings {
+            identity.update(setting.native_size.to_le_bytes());
+            identity.update([setting.strategy as u8]);
+            identity.update(setting.alpha_cutoff_bias.to_bits().to_le_bytes());
+            identity.update([u8::from(setting.has_transparent), u8::from(setting.item)]);
+        }
+        identity.update(forcefield.1.to_le_bytes());
+        identity.update((forcefield.0.len() as u64).to_le_bytes());
+        identity.update(forcefield.0);
+        let identity = identity.finalize();
+        let cache =
+            horizon_world::resource_cache::Cache::for_tree(root, "prepared-textures-v1", &identity);
+        if let Some(prepared) = cache
+            .as_ref()
+            .and_then(|cache| cache.read_value::<Self>())
+            .filter(|prepared| prepared.valid_with_cap(size, layers, split, forcefield.1, max_mips))
+        {
+            log::info!(
+                "Horizon: stage=texture_mips cache=hit elapsed_ms={}",
+                started.elapsed().as_millis()
+            );
+            return prepared;
+        }
+
+        let prepared = Self::with_split_capped(
+            &pixels.decode(),
+            size,
+            layers,
+            settings,
+            forcefield,
+            split,
+            max_mips,
+        );
+        if let Some(cache) =
+            cache.filter(|_| prepared.valid_with_cap(size, layers, split, forcefield.1, max_mips))
+        {
+            let _ = cache.write_value(&prepared);
+        }
+        log::info!(
+            "Horizon: stage=texture_mips cache=miss elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
+        prepared
+    }
+
+    fn valid(&self, size: u32, layers: u32, split: u32, forcefield_size: u32) -> bool {
+        self.valid_with_cap(size, layers, split, forcefield_size, 0)
+    }
+
+    fn valid_with_cap(
+        &self,
+        size: u32,
+        layers: u32,
+        split: u32,
+        forcefield_size: u32,
+        max_mips: u32,
+    ) -> bool {
+        fn chain_bytes(size: u32, max_mips: u32) -> Option<(u32, usize)> {
+            if size == 0 || !size.is_power_of_two() {
+                return None;
+            }
+            let full_levels = size.trailing_zeros() + 1;
+            let levels = if max_mips > 0 {
+                full_levels.min(max_mips)
+            } else {
+                full_levels
+            };
+            let base = (size as usize).checked_mul(size as usize)?.checked_mul(4)?;
+            let bytes = (0..levels).try_fold(0usize, |sum, level| {
+                sum.checked_add(base.checked_shr(2 * level).unwrap_or(0))
+            })?;
+            Some((levels, bytes))
+        }
+        let Some((levels, chain)) = chain_bytes(size, max_mips) else {
+            return false;
+        };
+        if split == 0 || self.sprites.len() != layers.div_ceil(split).max(1) as usize {
+            return false;
+        }
+        for (array, (bytes, actual_levels)) in self.sprites.iter().enumerate() {
+            let first = array as u32 * split;
+            let used = layers.saturating_sub(first).clamp(1, split) as usize;
+            let Some(expected) = chain.checked_mul(used) else {
+                return false;
+            };
+            if expected > crate::compact_bytes::MAX_COMPACT_BYTES
+                || *actual_levels != levels
+                || bytes.len() != expected
+            {
+                return false;
+            }
+        }
+        let Some((border_levels, border_bytes)) = chain_bytes(forcefield_size, 0) else {
+            return false;
+        };
+        border_bytes <= crate::compact_bytes::MAX_COMPACT_BYTES
+            && self.forcefield.1 == border_levels
+            && self.forcefield.0.len() == border_bytes
+    }
+
     fn with_split(
         pixels: &[u8],
         size: u32,
@@ -723,6 +905,18 @@ impl PreparedTextures {
         forcefield: (&[u8], u32),
         split: u32,
     ) -> Self {
+        Self::with_split_capped(pixels, size, layers, settings, forcefield, split, 0)
+    }
+
+    fn with_split_capped(
+        pixels: &[u8],
+        size: u32,
+        layers: u32,
+        settings: &[crate::mipmap::Settings],
+        forcefield: (&[u8], u32),
+        split: u32,
+        max_mips: u32,
+    ) -> Self {
         let layer_bytes = (size * size * 4) as usize;
         Self {
             sprites: (0..layers.div_ceil(split).max(1))
@@ -730,10 +924,15 @@ impl PreparedTextures {
                     let first = array * split;
                     let count = layers.saturating_sub(first).clamp(1, split);
                     let start = (first as usize * layer_bytes).min(pixels.len());
-                    mip_chain(&pixels[start..], size, settings, first, count)
+                    let (bytes, levels) =
+                        mip_chain_capped(&pixels[start..], size, settings, first, count, max_mips);
+                    (crate::compact_bytes::CompactBytes::new(bytes), levels)
                 })
                 .collect(),
-            forcefield: mip_chain(forcefield.0, forcefield.1, &[], 0, 1),
+            forcefield: {
+                let (bytes, levels) = mip_chain(forcefield.0, forcefield.1, &[], 0, 1);
+                (crate::compact_bytes::CompactBytes::new(bytes), levels)
+            },
         }
     }
 }
@@ -745,7 +944,23 @@ fn mip_chain(
     first: u32,
     layers: u32,
 ) -> (Vec<u8>, u32) {
-    let levels = size.trailing_zeros() + 1;
+    mip_chain_capped(pixels, size, settings, first, layers, 0)
+}
+
+fn mip_chain_capped(
+    pixels: &[u8],
+    size: u32,
+    settings: &[crate::mipmap::Settings],
+    first: u32,
+    layers: u32,
+    max_mips: u32,
+) -> (Vec<u8>, u32) {
+    let full_levels = size.trailing_zeros() + 1;
+    let levels = if max_mips > 0 {
+        full_levels.min(max_mips)
+    } else {
+        full_levels
+    };
     let layer_bytes = (size * size * 4) as usize;
     // Exactly the chain's size: cached animation frames count their capacity.
     let chain_bytes: usize = (0..levels).map(|l| layer_bytes >> (2 * l)).sum();
@@ -989,7 +1204,8 @@ async fn open_device(
                     | wgpu::Features::MAPPABLE_PRIMARY_BUFFERS
                     | wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
                     | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
-                    | wgpu::Features::RG11B10UFLOAT_RENDERABLE));
+                    | wgpu::Features::RG11B10UFLOAT_RENDERABLE
+                    | wgpu::Features::TEXTURE_COMPRESSION_BC));
         let driver = format!("{} {}", info.driver, info.driver_info);
         startup_step(format_args!(
             "requesting the device (driver {}) with features [{features}] and the adapter's \
@@ -1021,6 +1237,7 @@ async fn open_device(
         };
         match opened {
             Ok((device, queue)) => {
+                gpu_memory::log(&device, "device ready", None);
                 return Ok(Opened {
                     instance,
                     surface,
@@ -1088,8 +1305,105 @@ impl Renderer {
             .sum();
         [self.arena.bytes(), vertices * stride]
     }
+    /// Current resident GPU bytes grouped by resource kind.
+    pub fn vram_usage(&self) -> bc::VramSnapshot {
+        self.vram
+            .set(bc::VramKind::TerrainArena, self.arena.bytes());
+        self.vram.snapshot()
+    }
+    /// Logs the GPU allocator's report beside the renderer's own tally
+    /// (`memory: gpu <stage>`, gfx/gpu_memory.rs). Load boundaries only: the
+    /// report lists every allocation.
+    pub fn log_gpu_memory(&self, stage: &str) {
+        gpu_memory::log(&self.device, stage, Some(self.vram_usage().total()));
+    }
+
+    /// Checks the atlas dimensions before handing it to a renderer using the same assets.
+    pub fn has_matching_hud_atlas(&self, width: u32, height: u32) -> bool {
+        self.hud
+            .atlas_texture
+            .as_ref()
+            .is_some_and(|atlas| atlas.width() == width && atlas.height() == height)
+    }
+
+    /// True if any sprite array is block-compressed (shader packs require `Rgba8Unorm`).
+    pub fn has_compressed_sprites(&self) -> bool {
+        self.sprite_textures
+            .iter()
+            .any(|t| t.format() != wgpu::TextureFormat::Rgba8Unorm)
+    }
+}
+fn shared_atlas(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    source: HudAtlasSource<'_>,
+    previous: Option<&wgpu::Texture>,
+) -> Result<wgpu::Texture> {
+    let (atlas_pixels, atlas_width, atlas_height) = match source {
+        HudAtlasSource::Pixels(pixels) => pixels,
+        HudAtlasSource::Previous => {
+            return previous
+                .cloned()
+                .ok_or_else(|| "the previous renderer has no shared atlas".into());
+        }
+    };
+    let limit = device.limits().max_texture_dimension_2d;
+    if atlas_width.max(atlas_height) > limit {
+        return Err(format!(
+            "the shared atlas is {atlas_width}x{atlas_height}; this GPU allows {limit}x{limit}"
+        )
+        .into());
+    }
+    let atlas = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("Shared atlas"),
+        size: wgpu::Extent3d {
+            width: atlas_width,
+            height: atlas_height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        // COPY_SRC: a shader pack's weather copies the rain and snow sprites out.
+        usage: wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_DST
+            | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let row_bytes = atlas_width as usize * 4;
+    let mut y = 0u32;
+    while y < atlas_height {
+        let rows = (atlas_height - y).min(512);
+        let start = y as usize * row_bytes;
+        let end = (y + rows) as usize * row_bytes;
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &atlas,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x: 0, y, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &atlas_pixels[start..end],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(atlas_width * 4),
+                rows_per_image: Some(rows),
+            },
+            wgpu::Extent3d {
+                width: atlas_width,
+                height: rows,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit([]);
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        y += rows;
+    }
+    Ok(atlas)
 }
 impl Renderer {
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         window: Arc<Window>,
         offscreen: bool,
@@ -1098,8 +1412,8 @@ impl Renderer {
         sprite_minimum_size: u32,
         layers: u32,
         sprite_mips: &[crate::mipmap::Settings],
-        animations: &[SpriteAnimation],
-        hud_atlas: (&[u8], u32, u32),
+        animations: &[crate::sprites::PackedSpriteAnimation],
+        hud_atlas: HudAtlasSource<'_>,
         glint: (&[u8], u32, u32),
         glint_armor: (&[u8], u32, u32),
         forcefield: (&[u8], u32),
@@ -1107,6 +1421,7 @@ impl Renderer {
         prepared: Option<PreparedTextures>,
         previous: Option<&Self>,
         api: GraphicsApi,
+        render_options: RenderOptions,
     ) -> Result<Self> {
         let split = sprite_split();
         if layers > split * SPRITE_ARRAYS {
@@ -1152,6 +1467,14 @@ impl Renderer {
             None => open_device(&window, offscreen, api, layers).await?,
         };
         let info = adapter.get_info();
+        let bc_supported = device
+            .features()
+            .contains(wgpu::Features::TEXTURE_COMPRESSION_BC);
+        // The WMI memory probe is slow; it runs beside startup and refreshes the advice after.
+        horizon_telemetry::system::prefetch_memory_info(|| {
+            crate::graphics::redetect_hardware();
+        });
+        let hardware = crate::graphics::detect_hardware_from_adapter(&info, bc_supported);
         crate::graphics::suggest_reduced_far_detail(crate::graphics::lod_capped(&info));
         let size = window.inner_size();
         let max_side = device.limits().max_texture_dimension_2d;
@@ -1173,13 +1496,10 @@ impl Renderer {
             config.present_mode = previous
                 .map(|renderer| renderer.config.present_mode)
                 .filter(|mode| caps.present_modes.contains(mode))
-                .unwrap_or_else(|| {
-                    if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
-                        wgpu::PresentMode::Mailbox
-                    } else {
-                        wgpu::PresentMode::Fifo
-                    }
-                });
+                // Fifo (VSync, vanilla's default) until the options apply
+                // theirs: starting on Mailbox made the first set_present_mode
+                // reconfigure the swapchain mid-run on every launch.
+                .unwrap_or(wgpu::PresentMode::Fifo);
             if previous.is_none() {
                 startup_step(format_args!(
                     "device ready; configuring the surface ({}x{} {:?}, {:?})",
@@ -1500,49 +1820,104 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let vram = bc::VramLedger::default();
+        let allow_bc = bc_supported && render_options.texture_compression;
         let prepared = prepared.unwrap_or_else(|| {
-            PreparedTextures::new(sprite_pixels, sprite_size, layers, sprite_mips, forcefield)
+            PreparedTextures::with_split_capped(
+                sprite_pixels,
+                sprite_size,
+                layers,
+                sprite_mips,
+                forcefield,
+                split,
+                render_options.max_mipmap_levels,
+            )
         });
+        let array_animated: Vec<bool> = (0..prepared.sprites.len())
+            .map(|array| animations.iter().any(|a| a.layer() / split == array as u32))
+            .collect();
         let mut mip_levels = 1;
+        let mut sprite_vram_bytes = 0u64;
         let gl = adapter.get_info().backend == wgpu::Backend::Gl;
         let sprite_textures: Vec<wgpu::Texture> = prepared
             .sprites
             .into_iter()
             .enumerate()
-            .map(|(array, (mut mips, levels))| {
+            .map(|(array, (mips, levels))| {
+                let mut mips = mips.into_decoded();
                 let first = array as u32 * split;
                 let used = layers.saturating_sub(first).clamp(1, split);
                 let count = array_layers(used, gl);
                 // The extra layers are empty.
                 mips.resize(mips.len() / used as usize * count as usize, 0);
                 mip_levels = levels;
-                device.create_texture_with_data(
-                    &queue,
-                    &wgpu::TextureDescriptor {
-                        label: Some("Block sprites"),
-                        size: wgpu::Extent3d {
-                            width: sprite_size,
-                            height: sprite_size,
-                            depth_or_array_layers: count,
+                let can_bc = allow_bc
+                    && !render_options.shader_pack_active
+                    && !array_animated[array]
+                    && sprite_size >= 4
+                    && sprite_size % 4 == 0;
+                let tex = if can_bc {
+                    let bc_fmt = bc::pick_format(&mips);
+                    let compressed =
+                        bc::compress_layer_major_mips(&mips, sprite_size, levels, count, bc_fmt);
+                    drop(mips);
+                    sprite_vram_bytes += compressed.len() as u64;
+                    device.create_texture_with_data(
+                        &queue,
+                        &wgpu::TextureDescriptor {
+                            label: Some("Block sprites (BC)"),
+                            size: wgpu::Extent3d {
+                                width: sprite_size,
+                                height: sprite_size,
+                                depth_or_array_layers: count,
+                            },
+                            mip_level_count: levels,
+                            sample_count: 1,
+                            dimension: wgpu::TextureDimension::D2,
+                            format: bc_fmt.wgpu(),
+                            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                                | wgpu::TextureUsages::COPY_DST,
+                            view_formats: &[],
                         },
-                        mip_level_count: levels,
-                        sample_count: 1,
-                        dimension: wgpu::TextureDimension::D2,
-                        format: wgpu::TextureFormat::Rgba8Unorm,
-                        usage: wgpu::TextureUsages::TEXTURE_BINDING
-                            | wgpu::TextureUsages::COPY_DST
-                            // Shader packs' atlas copies them (pack_atlas.rs).
-                            | wgpu::TextureUsages::COPY_SRC
-                            | wgpu::TextureUsages::STORAGE_BINDING,
-                        view_formats: &[],
-                    },
-                    wgpu::util::TextureDataOrder::LayerMajor,
-                    &mips,
-                )
+                        wgpu::util::TextureDataOrder::LayerMajor,
+                        &compressed,
+                    )
+                } else {
+                    sprite_vram_bytes +=
+                        bc::rgba_texture_bytes(sprite_size, sprite_size, count, levels);
+                    device.create_texture_with_data(
+                        &queue,
+                        &wgpu::TextureDescriptor {
+                            label: Some("Block sprites"),
+                            size: wgpu::Extent3d {
+                                width: sprite_size,
+                                height: sprite_size,
+                                depth_or_array_layers: count,
+                            },
+                            mip_level_count: levels,
+                            sample_count: 1,
+                            dimension: wgpu::TextureDimension::D2,
+                            format: wgpu::TextureFormat::Rgba8Unorm,
+                            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                                | wgpu::TextureUsages::COPY_DST
+                                // Shader packs' atlas copies them (pack_atlas.rs).
+                                | wgpu::TextureUsages::COPY_SRC
+                                | wgpu::TextureUsages::STORAGE_BINDING,
+                            view_formats: &[],
+                        },
+                        wgpu::util::TextureDataOrder::LayerMajor,
+                        &mips,
+                    )
+                };
+                queue.submit([]);
+                let _ = device.poll(wgpu::PollType::wait_indefinitely());
+                tex
             })
             .collect();
-        let animations = animate::SpriteAnimator::new(
+        vram.set(bc::VramKind::SpriteArrays, sprite_vram_bytes);
+        let animations = animate::SpriteAnimator::new_packed(
             &device,
+            &queue,
             animations,
             sprite_size,
             sprite_mips,
@@ -1643,60 +2018,59 @@ impl Renderer {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let (atlas_pixels, atlas_width, atlas_height) = hud_atlas;
-        let limit = device.limits().max_texture_dimension_2d;
-        if atlas_width.max(atlas_height) > limit {
-            return Err(format!(
-                "the shared atlas is {atlas_width}x{atlas_height}; this GPU allows {limit}x{limit}"
-            )
-            .into());
-        }
-        let atlas = device.create_texture_with_data(
+        let atlas = shared_atlas(
+            &device,
             &queue,
-            &wgpu::TextureDescriptor {
-                label: Some("Shared atlas"),
-                size: wgpu::Extent3d {
-                    width: atlas_width,
-                    height: atlas_height,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
-                // COPY_SRC: a shader pack's weather copies the rain and snow sprites out.
-                usage: wgpu::TextureUsages::TEXTURE_BINDING
-                    | wgpu::TextureUsages::COPY_DST
-                    | wgpu::TextureUsages::COPY_SRC,
-                view_formats: &[],
-            },
-            wgpu::util::TextureDataOrder::LayerMajor,
-            atlas_pixels,
+            hud_atlas,
+            previous.and_then(|renderer| renderer.hud.atlas_texture.as_ref()),
+        )?;
+        vram.set(
+            bc::VramKind::HudAtlas,
+            u64::from(atlas.width()) * u64::from(atlas.height()) * 4,
         );
         let atlas_view = atlas.create_view(&Default::default());
+        let upload_static_rgba_or_bc = |label: &'static str, px: &[u8], w: u32, h: u32| {
+            let can_bc = allow_bc && w >= 4 && h >= 4 && w % 4 == 0 && h % 4 == 0;
+            let (fmt, data, used_bytes): (wgpu::TextureFormat, std::borrow::Cow<'_, [u8]>, u64) =
+                if can_bc {
+                    let bf = bc::pick_format(px);
+                    let enc = bc::compress_rgba(px, w, h, bf);
+                    let b = enc.len() as u64;
+                    (bf.wgpu(), std::borrow::Cow::Owned(enc), b)
+                } else {
+                    (
+                        wgpu::TextureFormat::Rgba8Unorm,
+                        std::borrow::Cow::Borrowed(px),
+                        px.len() as u64,
+                    )
+                };
+            vram.add(bc::VramKind::MiscTextures, used_bytes);
+            device.create_texture_with_data(
+                &queue,
+                &wgpu::TextureDescriptor {
+                    label: Some(label),
+                    size: wgpu::Extent3d {
+                        width: w,
+                        height: h,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: fmt,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                },
+                wgpu::util::TextureDataOrder::LayerMajor,
+                data.as_ref(),
+            )
+        };
         // vanilla's `GlintSampler`: enchanted_glint_item as its own texture,
         // repeated per pixel (`clamp: false`), linear without mipmaps
         // (`blur: true`).
         let (glint_pixels, glint_width, glint_height) = glint;
-        let glint_texture = device.create_texture_with_data(
-            &queue,
-            &wgpu::TextureDescriptor {
-                label: Some("Enchanted glint"),
-                size: wgpu::Extent3d {
-                    width: glint_width,
-                    height: glint_height,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            },
-            wgpu::util::TextureDataOrder::LayerMajor,
-            glint_pixels,
-        );
+        let glint_texture =
+            upload_static_rgba_or_bc("Enchanted glint", glint_pixels, glint_width, glint_height);
         let glint_view = glint_texture.create_view(&Default::default());
         let glint_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("Glint"),
@@ -1709,24 +2083,11 @@ impl Renderer {
         // ARMOR_ENTITY_GLINT_TEXTURING's sampler is vanilla's GlintSampler: the
         // same repeat and linear filtering as the item glint.
         let (glint_armor_pixels, glint_armor_width, glint_armor_height) = glint_armor;
-        let glint_armor_texture = device.create_texture_with_data(
-            &queue,
-            &wgpu::TextureDescriptor {
-                label: Some("Enchanted armor glint"),
-                size: wgpu::Extent3d {
-                    width: glint_armor_width,
-                    height: glint_armor_height,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            },
-            wgpu::util::TextureDataOrder::LayerMajor,
+        let glint_armor_texture = upload_static_rgba_or_bc(
+            "Enchanted armor glint",
             glint_armor_pixels,
+            glint_armor_width,
+            glint_armor_height,
         );
         let glint_armor_view = glint_armor_texture.create_view(&Default::default());
         let mut hud = HudRenderer::new(
@@ -2128,6 +2489,20 @@ impl Renderer {
             "fs_energy_swirl",
             wgpu::ColorWrites::ALL,
         );
+        let cbc_eyes_pipeline = entity_pipeline_with(
+            "CBC eyes",
+            None,
+            false,
+            wgpu::CompareFunction::GreaterEqual,
+            Default::default(),
+            wgpu::BlendState {
+                color: one_one,
+                alpha: one_one,
+            },
+            false,
+            "fs_cbc_eyes",
+            wgpu::ColorWrites::ALL,
+        );
         // HDR output's mark on light-giving particles (entity.wgsl fs_hdr_mark).
         let hdr_mark_pipeline = entity_pipeline_with(
             "HDR particle mark",
@@ -2259,6 +2634,26 @@ impl Renderer {
         // (repeat, linear minification with mipmaps, nearest magnification).
         let forcefield_size = forcefield.1;
         let (forcefield_mips, forcefield_levels) = prepared.forcefield;
+        let forcefield_mips = forcefield_mips.decode();
+        let can_bc_forcefield = allow_bc && forcefield_size >= 4 && forcefield_size % 4 == 0;
+        let (ff_format, ff_bytes): (wgpu::TextureFormat, std::borrow::Cow<'_, [u8]>) =
+            if can_bc_forcefield {
+                let bf = bc::pick_format(forcefield_mips.as_ref());
+                let enc = bc::compress_layer_major_mips(
+                    forcefield_mips.as_ref(),
+                    forcefield_size,
+                    forcefield_levels,
+                    1,
+                    bf,
+                );
+                (bf.wgpu(), std::borrow::Cow::Owned(enc))
+            } else {
+                (
+                    wgpu::TextureFormat::Rgba8Unorm,
+                    std::borrow::Cow::Borrowed(forcefield_mips.as_ref()),
+                )
+            };
+        vram.add(bc::VramKind::MiscTextures, ff_bytes.len() as u64);
         let forcefield_texture = device.create_texture_with_data(
             &queue,
             &wgpu::TextureDescriptor {
@@ -2271,12 +2666,12 @@ impl Renderer {
                 mip_level_count: forcefield_levels,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
+                format: ff_format,
                 usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             },
             wgpu::util::TextureDataOrder::LayerMajor,
-            &forcefield_mips,
+            ff_bytes.as_ref(),
         );
         let forcefield_view = forcefield_texture.create_view(&Default::default());
         let forcefield_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -2603,7 +2998,21 @@ impl Renderer {
             &queue,
             config.format.remove_srgb_suffix(),
             panorama_faces,
+            allow_bc,
         );
+        vram.add(bc::VramKind::MiscTextures, panorama.gpu_bytes);
+        vram.set(bc::VramKind::TerrainArena, arena.bytes());
+        vram.set(
+            bc::VramKind::EntityBuffers,
+            entity_buffer.size() + screen_buffer.size() + celestial_buffer.size() + indirect.size(),
+        );
+        vram.set(
+            bc::VramKind::RenderTargets,
+            u64::from(config.width) * u64::from(config.height) * 20,
+        );
+        if layers > 1 {
+            log::info!("{}", vram.format_summary(hardware.profile.vram_mb));
+        }
         if previous.is_none() {
             startup_step(format_args!(
                 "pipelines ready (multi-draw {}, occlusion culling {}, GPU timer {})",
@@ -2667,6 +3076,7 @@ impl Renderer {
             cloud_group,
             additive_pipeline,
             energy_swirl_pipeline,
+            cbc_eyes_pipeline,
             lightning_pipeline,
             lightning: lightning::Renderer::new(),
             see_through_pipeline,
@@ -2729,6 +3139,7 @@ impl Renderer {
             indirect,
             indirect_capacity: 1024,
             multi_draw,
+            plot_terrain: None,
             visible: Vec::new(),
             visible_lods: Vec::new(),
             shadow_visible: Vec::new(),
@@ -2772,6 +3183,7 @@ impl Renderer {
             fullbright: false,
             animated_textures: true,
             present_modes,
+            vram,
         })
     }
     /// LevelRenderer.submitBlockOutline: the buffer holds `edges` per stroke, the black
@@ -3696,14 +4108,18 @@ impl Renderer {
         }
     }
     pub fn render(&mut self, frame: &Frame) -> Result<bool> {
-        let rendered = self.draw_frame(frame);
+        self.render_with_plots(frame, &[])
+    }
+
+    pub fn render_with_plots(&mut self, frame: &Frame, plots: &[PlotSection<'_>]) -> Result<bool> {
+        let rendered = self.draw_frame(frame, plots);
         // A frame that was not drawn still submits the section copies.
         if let Some(copies) = self.take_section_copies() {
             self.queue.submit([copies]);
         }
         rendered
     }
-    fn draw_frame(&mut self, frame: &Frame) -> Result<bool> {
+    fn draw_frame(&mut self, frame: &Frame, plots: &[PlotSection<'_>]) -> Result<bool> {
         self.arena.trim();
         self.sorted_indices.trim();
         if let Some(flat) = &mut self.flat {
@@ -3743,8 +4159,22 @@ impl Renderer {
                 self.recreate_surface()?;
                 return Ok(false);
             }
+            // wgpu reports every acquire error (AlreadyAcquired, NotConfigured,
+            // a driver hiccup) as Validation; treat it like a lost surface
+            // instead of ending the game.
             Some(wgpu::CurrentSurfaceTexture::Validation) => {
-                return Err("surface acquisition failed validation".into());
+                static FAILURES: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
+                let n = FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < 8 || n.is_power_of_two() {
+                    log::warn!(
+                        "Horizon renderer: surface acquisition failed validation \
+                         ({} times); recreating the surface",
+                        n + 1
+                    );
+                }
+                self.recreate_surface()?;
+                return Ok(false);
             }
         };
         let size = [self.config.width, self.config.height];
@@ -3939,6 +4369,14 @@ impl Renderer {
         }
         let reachable = &self.occlusion;
         let cutout = &self.lod_cutout;
+        let plot_quads = if frame.title || plots.is_empty() {
+            self.plot_terrain = None;
+            0
+        } else {
+            self.plot_terrain
+                .get_or_insert_with(|| plot_terrain::PlotTerrain::new(&self.device))
+                .prepare(&self.device, &mut self.uploads, &mut encoder, plots, &view)
+        };
         let mut visible = std::mem::take(&mut self.visible);
         visible.clear();
         crate::spans::time("visibility", || {
@@ -4396,6 +4834,7 @@ impl Renderer {
             water_mask_quads,
             swirl_quads,
             shadow_quads,
+            cbc_eyes_quads,
             translucent_particle_quads,
             translucent_item_quads,
         ] = self
@@ -4409,6 +4848,7 @@ impl Renderer {
             + water_mask_quads
             + swirl_quads
             + shadow_quads
+            + cbc_eyes_quads
             + translucent_particle_quads
             + translucent_item_quads;
         let cloud_quads = if let Some(input) = &frame.clouds {
@@ -4506,6 +4946,7 @@ impl Renderer {
                 lightning::QUADS
             })
             .max(weather_quads)
+            .max(plot_quads)
             .max(frame.glowing.len() as u32 / 4);
         if max_quads > self.index_quads {
             self.index_quads = max_quads.next_power_of_two();
@@ -4935,6 +5376,9 @@ impl Renderer {
                     }
                 }
             }
+            if let Some(plots) = &self.plot_terrain {
+                plots.draw(&mut pass, solid_pipeline, &self.indices, false);
+            }
             if entity_quads > 0 {
                 pass.set_pipeline(&self.entity_pipeline);
                 pass.set_bind_group(0, &self.entity_group, &[]);
@@ -4988,6 +5432,7 @@ impl Renderer {
                     ((world_quads
                         - translucent_item_quads
                         - translucent_particle_quads
+                        - cbc_eyes_quads
                         - shadow_quads)
                         * 4) as i32,
                     0..1,
@@ -5025,6 +5470,21 @@ impl Renderer {
                         + crumbling_quads
                         + translucent_crumbling_quads
                         + water_mask_quads)
+                        * 4) as i32,
+                    0..1,
+                );
+                pass.set_bind_group(0, &self.group, &[]);
+            }
+            if cbc_eyes_quads > 0 {
+                pass.set_pipeline(&self.cbc_eyes_pipeline);
+                pass.set_bind_group(0, &self.entity_group, &[]);
+                pass.set_vertex_buffer(0, self.entity_buffer.slice(..));
+                pass.draw_indexed(
+                    0..cbc_eyes_quads * 6,
+                    ((world_quads
+                        - translucent_item_quads
+                        - translucent_particle_quads
+                        - cbc_eyes_quads)
                         * 4) as i32,
                     0..1,
                 );
@@ -5073,6 +5533,9 @@ impl Renderer {
                         translucent_draws,
                     );
                 }
+            }
+            if let Some(plots) = &self.plot_terrain {
+                plots.draw(&mut pass, translucent_pipeline, &self.indices, true);
             }
             // LevelRenderer.executeTranslucentAfterTerrain: vanilla's
             // translucent particle layer draws after translucent terrain —
@@ -5801,6 +6264,29 @@ fn frustum(m: Mat4) -> [Vec4; 6] {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn startup_hud_atlas_reuses_the_same_gpu_texture() {
+        use super::{HudAtlasSource, shared_atlas};
+
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
+            eprintln!("no GPU adapter: skipped");
+            return;
+        };
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+        let pixels = HudAtlasSource::Pixels((&[255; 16], 2, 2));
+        let original = shared_atlas(&device, &queue, pixels, None).unwrap();
+        let reused =
+            shared_atlas(&device, &queue, HudAtlasSource::Previous, Some(&original)).unwrap();
+        assert_eq!(reused, original);
+
+        // A replacement pack can have the same dimensions but different pixels.
+        let pixels = HudAtlasSource::Pixels((&[0; 16], 2, 2));
+        let fresh = shared_atlas(&device, &queue, pixels, Some(&original)).unwrap();
+        assert_ne!(fresh, original);
+    }
+
+    #[test]
     fn drawable_size_skips_minimized_and_oversized_windows() {
         use super::drawable_size;
         assert!(drawable_size(1280, 720, 8192));
@@ -5881,6 +6367,7 @@ mod tests {
             (11, 2),
             (15, 10),
             (7, 3),
+            (super::CBC_EYES_OVERLAY, 12),
             (35, 11),
             (4, 4),
             (12, 7),
@@ -5891,7 +6378,7 @@ mod tests {
         let mut batch = super::EntityBatch::default();
         let counts = batch.update(&entities, &quad(3, 5), &quad(0, 6), &quad(0, 8));
         let vertices = &batch.combined;
-        assert_eq!(counts, [4, 1, 1, 1, 0, 0, 1, 1, 0]);
+        assert_eq!(counts, [4, 1, 1, 1, 0, 0, 1, 1, 1, 0]);
         assert_eq!(
             vertices
                 .as_chunks::<4>()
@@ -5899,7 +6386,7 @@ mod tests {
                 .iter()
                 .map(|q| q[0].light)
                 .collect::<Vec<_>>(),
-            [0, 1, 3, 4, 11, 2, 7, 9, 10, 5, 6, 8]
+            [0, 1, 3, 4, 11, 2, 7, 9, 12, 10, 5, 6, 8]
         );
     }
     #[test]
@@ -6227,18 +6714,113 @@ mod sprite_upload_tests {
                 (&border, size),
                 split,
             );
+            assert!(prepared.valid(size, layers, split, size));
             assert_eq!(prepared.sprites.len(), layers.div_ceil(split) as usize);
             let actual: Vec<_> = prepared
                 .sprites
                 .iter()
                 .flat_map(|(bytes, levels)| {
                     assert_eq!(*levels, expected.1);
-                    bytes.iter().copied()
+                    bytes.decode().into_owned()
                 })
                 .collect();
             assert_eq!(actual, expected.0);
-            assert_eq!(prepared.forcefield, mip_chain(&border, size, &[], 0, 1));
+            let expected_forcefield = mip_chain(&border, size, &[], 0, 1);
+            assert_eq!(
+                prepared.forcefield.0.decode().as_ref(),
+                expected_forcefield.0
+            );
+            assert_eq!(prepared.forcefield.1, expected_forcefield.1);
+
+            let encoded = postcard::to_allocvec(&prepared).unwrap();
+            let restored: PreparedTextures = postcard::from_bytes(&encoded).unwrap();
+            assert!(restored.valid(size, layers, split, size));
+            assert_eq!(
+                restored
+                    .sprites
+                    .iter()
+                    .map(|(bytes, _)| bytes.decode().into_owned())
+                    .collect::<Vec<_>>(),
+                prepared
+                    .sprites
+                    .iter()
+                    .map(|(bytes, _)| bytes.decode().into_owned())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                restored.forcefield.0.decode().as_ref(),
+                prepared.forcefield.0.decode().as_ref()
+            );
+            assert_eq!(restored.forcefield.1, prepared.forcefield.1);
+            assert!(!restored.valid(size, layers + 1, split, size));
         }
+    }
+
+    #[test]
+    fn prepared_texture_snapshot_reuses_exact_mips_and_repairs_corruption() {
+        use horizon_world::resource_cache::Cache;
+        let root =
+            std::env::temp_dir().join(format!("horizon-mip-snapshot-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("horizon-mod-content.stamp"), "mips-a").unwrap();
+        let pixels = crate::compact_bytes::CompactBytes::new([20, 40, 80, 128].repeat(16));
+        let border = [10, 30, 70, 255].repeat(16);
+        let load = || PreparedTextures::load_or_prepare(&root, &pixels, 4, 1, &[], (&border, 4));
+        let cold = load();
+        let warm = load();
+        let path = root.join(".horizon-derived/prepared-textures-v1");
+        let original = std::fs::read(&path).unwrap();
+        assert!(warm.valid(4, 1, sprite_split(), 4));
+        assert!(cold.forcefield == warm.forcefield);
+        assert_eq!(cold.sprites[0].0.decode(), warm.sprites[0].0.decode());
+        assert!(!warm.valid(8, 1, sprite_split(), 4));
+        assert!(!warm.valid(4, 1, 0, 4));
+        let mut corrupt = original.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        for bytes in [&original[..40], &corrupt[..]] {
+            std::fs::write(&path, bytes).unwrap();
+            let repaired = load();
+            assert_eq!(repaired.sprites[0].0.decode(), cold.sprites[0].0.decode());
+            assert!(repaired.forcefield == cold.forcefield);
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
+
+        // Same dimensions, different upload inputs: never reuse the old pixels.
+        let changed_pixels = crate::compact_bytes::CompactBytes::new([90, 60, 30, 255].repeat(16));
+        let changed_border = [255, 0, 100, 128].repeat(16);
+        let changed = PreparedTextures::load_or_prepare(
+            &root,
+            &changed_pixels,
+            4,
+            1,
+            &[],
+            (&changed_border, 4),
+        );
+        let expected = PreparedTextures::with_split(
+            &changed_pixels.decode(),
+            4,
+            1,
+            &[],
+            (&changed_border, 4),
+            sprite_split(),
+        );
+        assert_ne!(changed.sprites[0].0.decode(), cold.sprites[0].0.decode());
+        assert_eq!(
+            changed.sprites[0].0.decode(),
+            expected.sprites[0].0.decode()
+        );
+        assert!(changed.forcefield == expected.forcefield);
+        assert_ne!(std::fs::read(&path).unwrap(), original);
+
+        let cache = Cache::new(&root, "test-mips-v1", &[], &[]).unwrap();
+        cache.write_value(&cold).unwrap();
+        let mut invalid: PreparedTextures = cache.read_value().unwrap();
+        invalid.forcefield.0 = crate::compact_bytes::CompactBytes::new(vec![0; 3]);
+        assert!(!invalid.valid(4, 1, sprite_split(), 4));
+        invalid = cache.read_value().unwrap();
+        invalid.sprites[0].1 = 999;
+        assert!(!invalid.valid(4, 1, sprite_split(), 4));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -6248,6 +6830,10 @@ mod sprite_upload_tests {
             let (chain, _) = mip_chain(animation.pixels(0), size, &[], 0, 1);
             assert_eq!(chain.capacity(), chain.len());
         }
+        let animation = crate::sprites::test_animation(64, 0);
+        let (capped, levels) = mip_chain_capped(animation.pixels(0), 64, &[], 0, 1, 2);
+        assert_eq!(levels, 2);
+        assert_eq!(capped.len(), (64 * 64 + 32 * 32) * 4);
     }
 }
 

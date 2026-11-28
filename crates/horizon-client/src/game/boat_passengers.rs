@@ -341,6 +341,9 @@ impl Game<'_> {
     pub(super) fn seat_boat_mobs(&mut self) {
         for i in 0..self.boats.len() {
             let id = self.boats[i].id;
+            if self.waiting_for_plot_vehicle(id) {
+                continue;
+            }
             let mobs = self.boat_mobs(id);
             if mobs.is_empty() {
                 continue;
@@ -373,10 +376,19 @@ impl Game<'_> {
                         .res
                         .mob_data()
                         .entity_has("minecraft:can_turn_in_boats", &m.kind.id);
+                    let [previous, at] = self.plot_passenger_feet(
+                        b.id,
+                        [
+                            b.seat(index, count, animal, offset, true),
+                            b.seat(index, count, animal, offset, false),
+                        ],
+                        [b.previous, b.position],
+                        m.eye_height(),
+                    );
                     (
                         j,
-                        b.seat(index, count, animal, offset, false),
-                        b.seat(index, count, animal, offset, true),
+                        at,
+                        previous,
                         turns.then_some((b.yaw + turn, b.previous_yaw + turn)),
                     )
                 })

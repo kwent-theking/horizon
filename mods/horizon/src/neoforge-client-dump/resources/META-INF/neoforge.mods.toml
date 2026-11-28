@@ -1,0 +1,12 @@
+# Dev-only: dumps a NeoForge 1.21.1 client's modded entity models for Horizon (the client reads
+# them with horizon_client::mobs::modded). Built by tools/neoforge_client_dump.py; run once from a
+# launcher profile with the server's mods; never shipped.
+modLoader = "javafml"
+loaderVersion = "[4,)"
+license = "MIT"
+
+[[mods]]
+modId = "horizon_model_dump"
+version = "1"
+displayName = "Horizon model dump (dev only)"
+description = "Writes every modded entity's model, texture and keyframe clips for Horizon, then quits."

@@ -490,7 +490,15 @@ impl Game<'_> {
                 .as_ref()
                 .map(|p| ([p.position.x, p.position.y, p.position.z], p.velocity.y)),
         };
-        self.particles.tick(&level);
+        let sprite = |state, pos| {
+            if self.res.facts().is_air(state)
+                || self.pack.assets.registry.state(state)?.name == "minecraft:moving_piston"
+            {
+                return None;
+            }
+            Self::particle_sprite_at(world, &self.pack, &self.res, &self.streaming, state, pos)
+        };
+        self.particles.tick_with_cbc_sprites(&level, Some(&sprite));
         self.tick_pickups();
         for (name, at, volume, pitch) in std::mem::take(&mut self.particles.sounds) {
             self.audio.play(name, Some(at), volume, pitch);

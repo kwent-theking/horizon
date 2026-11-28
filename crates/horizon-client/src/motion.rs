@@ -91,6 +91,7 @@ impl MotionResources {
         )?)?)?);
         let file = BlockTableFile::open(&root.join("movement-properties.nbt"), assets.registry)?;
         let properties = MovementProperties::from_table(file.table("movement")?)?;
+        drop(file);
         let bundle: BTreeMap<String, String> =
             serde_json::from_slice(&fs::read(root.join("block-tags.json"))?)?;
         let mut definitions = TagDefinitions::default();
@@ -770,6 +771,10 @@ impl PlayerMotion {
 }
 
 pub struct MotionWorld<'p, 'w, 'r> {
+    pub decks: Option<(
+        &'w crate::sublevel::SubLevelManager,
+        &'p mut crate::sublevel::DeckRider,
+    )>,
     /// Entity boxes selected by the host for this player's collision queries.
     pub entities: &'w [Aabb],
     pub player: &'p mut PlayerMotion,
@@ -777,6 +782,9 @@ pub struct MotionWorld<'p, 'w, 'r> {
     pub assets: &'r Assets,
     pub collision_binding: &'w BlockCollisionRegistry<'r>,
     pub resources: &'w MotionResources,
+}
+fn vec3(point: glam::DVec3) -> Vec3 {
+    Vec3::new(point.x, point.y, point.z)
 }
 enum TickInput {
     Living([f32; 3]),
@@ -813,6 +821,12 @@ impl MotionWorld<'_, '_, '_> {
     }
     /// `Level.noCollision(player, bounds)`: blocks and the host's entity boxes.
     pub fn no_player_collision(&mut self, bounds: Aabb) -> Result<bool> {
+        if let Some((plots, rider)) = &self.decks
+            && !self.player.spectator
+            && plots.deck_intersects(bounds, rider.advanced, self.collision_binding)?
+        {
+            return Ok(false);
+        }
         let context = self.context();
         Ok(world_movement::no_world_collision(
             &mut self.movement_collisions(),
@@ -2015,23 +2029,93 @@ impl EntityMoveWorld for MotionWorld<'_, '_, '_> {
             fall_distance: self.player.fall_distance,
             query_budget: 1_000_000,
         };
-        edge_backoff::back_off_from_edge(self, input)
-            .map_err(|e| io::Error::other(e.to_string()).into())
+        let movement = edge_backoff::back_off_from_edge(self, input)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        if let Some((plots, rider)) = &self.decks
+            && !rider.advanced
+            && rider.support.is_none_or(|id| plots.get(id).is_none())
+        {
+            return Ok(movement.add_vector(vec3(rider.inherited)));
+        }
+        Ok(movement)
     }
     fn collide(&mut self, movement: Vec3) -> Result<Vec3> {
         let max_step = self.player.attribute("minecraft:step_height")? as f32;
-        Ok(world_movement::resolve_world_movement(
-            &mut self.movement_collisions(),
-            MovementRequest {
-                entity: EntityIdentity(0),
-                context: self.context(),
-                bounds: self.player.bounds(),
-                movement,
-                max_step,
-                on_ground: self.player.ground.on_ground,
-                candidate_budget: 1_000_000,
-            },
-        )?)
+        let initial = self.player.bounds();
+        let deck = if let Some((plots, rider)) = &self.decks {
+            Some(plots.collide_decks(
+                initial,
+                movement.components().into(),
+                rider,
+                if self.player.ground.on_ground {
+                    f64::from(max_step)
+                } else {
+                    0.0
+                },
+                self.collision_binding,
+            )?)
+        } else {
+            None
+        };
+        let requested = deck.as_ref().map_or(movement, |d| vec3(d.movement));
+        let resolve = |this: &mut Self, bounds, movement, max_step| {
+            world_movement::resolve_world_movement(
+                &mut this.movement_collisions(),
+                MovementRequest {
+                    entity: EntityIdentity(0),
+                    context: this.context(),
+                    bounds,
+                    movement,
+                    max_step,
+                    on_ground: this.player.ground.on_ground,
+                    candidate_budget: 1_000_000,
+                },
+            )
+        };
+        let resolved = resolve(self, initial, requested, max_step)?;
+        if let Some(deck) = deck {
+            // Vanilla clips the voluntary displacement first, then clips the
+            // ship's displacement from the new position.
+            let carry = if deck.carry != glam::DVec3::ZERO {
+                resolve(self, initial.move_by(resolved), vec3(deck.carry), 0.0)?
+            } else {
+                Vec3::ZERO
+            };
+            if carry != Vec3::ZERO {
+                self.player.position = self.player.position.add_vector(carry);
+            }
+            let (_, rider) = self.decks.as_mut().expect("deck collision context");
+            let carried = glam::DVec3::from(carry.components());
+            rider.support = deck.support.filter(|_| {
+                (requested.y - resolved.y).abs() < 1.0e-7
+                    && (deck.carry - carried).length_squared() < 1.0e-8
+            });
+            if !rider.advanced && deck.carry.length_squared() >= 1.0e-8 {
+                rider.inherited = carried;
+            } else if !rider.advanced {
+                rider.inherited *= 0.99;
+                if requested.y != resolved.y || rider.support.is_some() {
+                    rider.inherited *= glam::DVec3::new(0.7, 0.0, 0.7);
+                }
+                if requested.x != resolved.x || requested.z != resolved.z {
+                    rider.inherited *= glam::DVec3::new(0.8, 0.6, 0.8);
+                }
+                if self.player.flying {
+                    rider.inherited *= 0.9;
+                }
+                if self.player.fluids.was_touching_water {
+                    rider.inherited *= 0.9;
+                }
+                if rider.inherited.y.abs() < 0.01 {
+                    rider.inherited.y = 0.0;
+                }
+                if rider.inherited.length_squared() <= 1.0e-7 {
+                    rider.inherited = glam::DVec3::ZERO;
+                }
+            }
+            rider.advanced = true;
+        }
+        Ok(resolved)
     }
     fn fall_distance(&self) -> f64 {
         self.player.fall_distance
@@ -2077,8 +2161,16 @@ impl EntityMoveWorld for MotionWorld<'_, '_, '_> {
             binding: self.collision_binding,
             subject: Some(self.player.powder_snow_subject()),
         };
+        let deck_support = self
+            .decks
+            .as_ref()
+            .is_some_and(|(_, rider)| rider.support.is_some());
+        if deck_support {
+            self.player.collision.below = true;
+            self.player.collision.vertical = true;
+        }
         self.player.ground.set_with_movement(
-            below,
+            below || deck_support,
             horizontal,
             bounds,
             Some(movement),
@@ -2664,6 +2756,7 @@ mod tests {
         let mut player = PlayerMotion::new(&resources, Vec3::new(12.0, 84.0, 12.0)).unwrap();
         let mut tick = |player: &mut PlayerMotion, keys| {
             MotionWorld {
+                decks: None,
                 entities: &entities,
                 player,
                 scene: &mut scene,
@@ -2717,6 +2810,50 @@ mod tests {
         assert!(player.position.y < 84.0);
     }
 
+    #[test]
+    fn an_empty_deck_store_resolves_the_same_world_collision() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.local/horizon-client")
+            .join(horizon_core::VANILLA_VERSION);
+        if !root.join("movement-properties.nbt").exists() {
+            return;
+        }
+        let assets = Assets::load(&root).unwrap();
+        let render = assets.reload(&root).unwrap();
+        let binding = crate::collisions::load(&root, assets.registry).unwrap();
+        let resources = MotionResources::load(&root, &assets).unwrap();
+        let mut scene = World::test_scene(&assets, &render, 1).unwrap();
+        let stone = assets.registry.default_state("minecraft:stone").unwrap();
+        scene.set(20, 4, 20, stone).unwrap();
+        let decks = crate::sublevel::SubLevelManager::default();
+        let mut rider = crate::sublevel::DeckRider::default();
+        let position = Vec3::new(20.5, 5.25, 20.5);
+        let mut ordinary = PlayerMotion::new(&resources, position).unwrap();
+        let mut connected = PlayerMotion::new(&resources, position).unwrap();
+        for (player, decks) in [
+            (&mut ordinary, None),
+            (&mut connected, Some((&decks, &mut rider))),
+        ] {
+            MotionWorld {
+                decks,
+                entities: &[],
+                player,
+                scene: &mut scene,
+                assets: &assets,
+                collision_binding: &binding,
+                resources: &resources,
+            }
+            .move_self(Vec3::new(0.1, -0.5, 0.0))
+            .unwrap();
+        }
+        assert_eq!(ordinary.position.y, 5.0);
+        assert_eq!(connected.position, ordinary.position);
+        assert_eq!(connected.velocity, ordinary.velocity);
+        assert_eq!(connected.ground, ordinary.ground);
+        assert!(connected.collision.below);
+        assert_eq!(rider.support, None);
+    }
+
     /// `MovingPistonBlock.getCollisionShape`: a block halfway through a push
     /// up is solid at its moving position, so a player lands on it.
     #[test]
@@ -2750,6 +2887,7 @@ mod tests {
         let mut player = PlayerMotion::new(&resources, Vec3::new(20.5, 6.0, 20.5)).unwrap();
         for _ in 0..30 {
             MotionWorld {
+                decks: None,
                 entities: &[],
                 player: &mut player,
                 scene: &mut scene,
@@ -2766,6 +2904,7 @@ mod tests {
         scene.moving_pistons.clear();
         for _ in 0..10 {
             MotionWorld {
+                decks: None,
                 entities: &[],
                 player: &mut player,
                 scene: &mut scene,
@@ -2803,6 +2942,7 @@ mod tests {
         scene.set(20, 4, 20, cauldron).unwrap();
         let mut tick = |player: &mut PlayerMotion| {
             MotionWorld {
+                decks: None,
                 entities: &[],
                 player,
                 scene: &mut scene,
@@ -2854,6 +2994,7 @@ mod tests {
         scene.set(20, 4, 20, water).unwrap();
         let mut tick = |player: &mut PlayerMotion| {
             MotionWorld {
+                decks: None,
                 entities: &[],
                 player,
                 scene: &mut scene,
@@ -2915,6 +3056,7 @@ mod tests {
         };
         let mut player = PlayerMotion::new(&resources, Vec3::new(20.5, 4.0, 20.5)).unwrap();
         MotionWorld {
+            decks: None,
             entities: &[],
             player: &mut player,
             scene: &mut scene,
@@ -2929,6 +3071,7 @@ mod tests {
         player.events.clear();
         let from = player.position;
         MotionWorld {
+            decks: None,
             entities: &[],
             player: &mut player,
             scene: &mut scene,
@@ -2942,6 +3085,7 @@ mod tests {
         // Two blocks away, nothing.
         let mut away = PlayerMotion::new(&resources, Vec3::new(22.5, 4.0, 20.5)).unwrap();
         MotionWorld {
+            decks: None,
             entities: &[],
             player: &mut away,
             scene: &mut scene,
@@ -2971,6 +3115,7 @@ mod tests {
         let mut player = PlayerMotion::new(&resources, at).unwrap();
         let mut travel = |player: &mut PlayerMotion| {
             MotionWorld {
+                decks: None,
                 entities: &[],
                 player,
                 scene: &mut scene,
@@ -3031,6 +3176,7 @@ mod tests {
             player.spectator = true;
             player.flying_speed = crate::mouse::spectator_flying_speed(player.flying_speed, steps);
             MotionWorld {
+                decks: None,
                 entities: &[],
                 player: &mut player,
                 scene: &mut scene,
@@ -3089,6 +3235,7 @@ mod tests {
             let mut trajectory = Vec::new();
             for _ in 0..4 {
                 MotionWorld {
+                    decks: None,
                     entities: &[],
                     player: &mut player,
                     scene: &mut scene,
@@ -3386,6 +3533,7 @@ mod tests {
             player.velocity = Vec3::new(0.0, dy, 0.6);
             player.fall_distance = 30.0;
             let mut w = MotionWorld {
+                decks: None,
                 entities: &[],
                 player: &mut player,
                 scene: &mut scene,
@@ -3438,6 +3586,7 @@ mod tests {
             let mut player = PlayerMotion::new(&resources, Vec3::new(20.5, 20.0, 20.5)).unwrap();
             player.fall_distance = 30.0;
             let mut w = MotionWorld {
+                decks: None,
                 entities: &[],
                 player: &mut player,
                 scene: &mut scene,
@@ -3478,6 +3627,7 @@ mod tests {
             player.client_side = client_side;
             player.fall_distance = 30.0;
             let mut w = MotionWorld {
+                decks: None,
                 entities: &[],
                 player: &mut player,
                 scene: &mut scene,
@@ -3531,6 +3681,7 @@ mod tests {
             player.fall_distance = 30.0;
             player.status.slow_falling = slow_falling;
             let mut w = MotionWorld {
+                decks: None,
                 entities: &[],
                 player: &mut player,
                 scene: &mut scene,
@@ -3570,6 +3721,7 @@ mod tests {
         player.auto_spin_attack_ticks = 2;
         player.auto_spin_attack_dmg = 8.0;
         let mut w = MotionWorld {
+            decks: None,
             entities: &[],
             player: &mut player,
             scene: &mut scene,
@@ -3613,6 +3765,7 @@ mod tests {
         let mut scene = World::test_scene(&assets, &render, 2).unwrap();
         let mut player = PlayerMotion::new(&resources, Vec3::new(20.5, 10.0, 20.5)).unwrap();
         let mut w = MotionWorld {
+            decks: None,
             entities: &[],
             player: &mut player,
             scene: &mut scene,
@@ -3665,6 +3818,7 @@ mod tests {
         player.set_pose(crate::pose::Pose::Swimming).unwrap();
         assert_eq!(player.dimensions.eye_height, 0.4);
         let mut w = MotionWorld {
+            decks: None,
             entities: &[],
             player: &mut player,
             scene: &mut scene,
@@ -3698,6 +3852,7 @@ mod tests {
             player.velocity = Vec3::new(0.0, 0.0, 1.0);
             player.spin_targets = target.map(|b| (7, b)).into_iter().collect();
             let mut w = MotionWorld {
+                decks: None,
                 entities: &[],
                 player: &mut player,
                 scene: &mut scene,
@@ -3735,6 +3890,7 @@ mod tests {
         let mut scene = World::test_scene(&assets, &render, 2).unwrap();
         let mut player = PlayerMotion::new(&resources, Vec3::new(20.5, 4.2, 20.5)).unwrap();
         let mut w = MotionWorld {
+            decks: None,
             entities: &[],
             player: &mut player,
             scene: &mut scene,
@@ -3790,6 +3946,7 @@ mod tests {
             }
         }
         let mut w = MotionWorld {
+            decks: None,
             entities: &[],
             player: &mut player,
             scene: &mut scene,
@@ -4043,6 +4200,7 @@ mod tests {
         }
         let mut player = PlayerMotion::new(&resources, Vec3::new(20.5, 4.0, 20.5)).unwrap();
         let mut w = MotionWorld {
+            decks: None,
             entities: &[],
             player: &mut player,
             scene: &mut scene,
@@ -4119,6 +4277,7 @@ mod tests {
             player.fire_ticks = 160;
             player.fall_distance = 8.0;
             let mut w = MotionWorld {
+                decks: None,
                 entities: &[],
                 player: &mut player,
                 scene: &mut scene,
@@ -4171,6 +4330,7 @@ mod tests {
         scene.set(20, 5, 20, water).unwrap();
         let mut player = PlayerMotion::new(&resources, Vec3::new(20.5, 4.0, 20.5)).unwrap();
         let mut w = MotionWorld {
+            decks: None,
             entities: &[],
             player: &mut player,
             scene: &mut scene,
@@ -4256,6 +4416,7 @@ mod tests {
             let mut player = PlayerMotion::new(&resources, Vec3::new(21.0, 4.0, 20.5)).unwrap();
             player.ground.on_ground = true;
             let mut w = MotionWorld {
+                decks: None,
                 entities: &[],
                 player: &mut player,
                 scene: &mut scene,
@@ -4294,6 +4455,7 @@ mod tests {
             let mut count = 0;
             for _ in 0..ticks {
                 MotionWorld {
+                    decks: None,
                     entities: &[],
                     player: &mut *player,
                     scene: &mut scene,
@@ -4365,6 +4527,7 @@ mod tests {
             }
             let mut player = PlayerMotion::new(&resources, Vec3::new(20.5, 4.0, 20.5)).unwrap();
             let mut w = MotionWorld {
+                decks: None,
                 entities: &[],
                 player: &mut player,
                 scene: &mut scene,
@@ -4415,6 +4578,7 @@ mod tests {
         let mut scene = World::test_scene(&assets, &render, 3).unwrap();
         let mut player = PlayerMotion::new(&resources, Vec3::new(20.5, 4.0, 20.5)).unwrap();
         let mut w = MotionWorld {
+            decks: None,
             entities: &[],
             player: &mut player,
             scene: &mut scene,
@@ -4472,6 +4636,7 @@ mod tests {
         let mut scene = World::test_scene(&assets, &render, 3).unwrap();
         let mut player = PlayerMotion::new(&resources, Vec3::new(20.5, 4.0, 20.5)).unwrap();
         let mut w = MotionWorld {
+            decks: None,
             entities: &[],
             player: &mut player,
             scene: &mut scene,
@@ -4523,6 +4688,7 @@ mod tests {
         let mut scene = World::test_scene(&assets, &render, 3).unwrap();
         let mut player = PlayerMotion::new(&resources, Vec3::new(20.5, 10.0, 20.5)).unwrap();
         let mut w = MotionWorld {
+            decks: None,
             entities: &[],
             player: &mut player,
             scene: &mut scene,

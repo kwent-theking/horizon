@@ -10,6 +10,7 @@ use horizon_core::{
     position::BlockPos,
     random::RandomSource,
 };
+use horizon_world::content_view;
 use std::sync::Arc;
 
 /// A baked frame model: (corners in block units, unit UVs, sprite) per quad.
@@ -24,7 +25,7 @@ pub(super) fn bake_frame(root: &std::path::Path, name: &str) -> FrameModel {
             continue;
         };
         let Ok(text) =
-            std::fs::read_to_string(root.join(format!("assets/{ns}/models/{path}.json")))
+            content_view::read_to_string(root.join(format!("assets/{ns}/models/{path}.json")))
         else {
             continue;
         };
@@ -195,8 +196,9 @@ impl Game<'_> {
     pub(super) fn before_block(&self, distance: f64) -> bool {
         self.pick().is_none_or(|h| {
             let eye = self.aim().map(|(eye, _)| eye).unwrap_or_default();
+            let point = h.world_point();
             (0..3)
-                .map(|a| (h.point[a] - eye[a]).powi(2))
+                .map(|a| (point[a] - eye[a]).powi(2))
                 .sum::<f64>()
                 .sqrt()
                 > distance

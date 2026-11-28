@@ -24,7 +24,7 @@ impl PropertyValues {
 }
 /// Indices into the original definition. An empty multipart selection is distinct
 /// from an absent root: the native root exists but contributes no model parts.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SelectedModels {
     Variant(usize),
     Multipart(Vec<usize>),
@@ -86,6 +86,20 @@ impl BoundCondition {
         }
     }
 }
+impl Condition {
+    fn has_unknown_value(&self, schema: &PropertySchema) -> bool {
+        match self {
+            Self::Or(values) | Self::And(values) => {
+                values.iter().any(|v| v.has_unknown_value(schema))
+            }
+            Self::Properties(values) => values.iter().any(|(key, terms)| {
+                schema
+                    .get(key)
+                    .is_some_and(|domain| terms.iter().any(|t| domain.parse(&t.value).is_none()))
+            }),
+        }
+    }
+}
 fn variant_predicate(text: &str, schema: &PropertySchema) -> Result<Properties> {
     let mut result = Properties::new();
     for clause in text.split(',') {
@@ -106,6 +120,18 @@ fn variant_predicate(text: &str, schema: &PropertySchema) -> Result<Properties> 
     Ok(result)
 }
 impl BlockStateDefinition {
+    /// Imported resources can name values absent from the imported registry.
+    /// Drop those multipart selectors before binding and compiling choices.
+    /// Unknown property names remain errors in `bind`.
+    pub fn skip_unknown_multipart_values(&mut self, schema: &PropertySchema) {
+        if let Some(selectors) = &mut self.multipart {
+            selectors.retain(|s| {
+                !s.condition
+                    .as_ref()
+                    .is_some_and(|v| v.has_unknown_value(schema))
+            });
+        }
+    }
     /// `states` must be the block's canonical possible states in native order.
     /// Invalid variant selectors are skipped. On overlapping selectors, vanilla
     /// replaces the first overlapping state before aborting that selector's walk.
@@ -156,5 +182,200 @@ impl BlockStateDefinition {
             }
         }
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::blockstate::choice::CompiledChoices;
+    use horizon_core::random::LegacyRandom;
+
+    fn schema() -> PropertySchema {
+        BTreeMap::from([
+            (
+                "north".to_owned(),
+                PropertyValues::Named(["none".to_owned(), "side".to_owned()].into()),
+            ),
+            (
+                "age".to_owned(),
+                PropertyValues::Integer {
+                    minimum: 0,
+                    maximum: 3,
+                },
+            ),
+        ])
+    }
+
+    fn state(north: &str, age: &str) -> Properties {
+        BTreeMap::from([
+            ("north".to_owned(), north.to_owned()),
+            ("age".to_owned(), age.to_owned()),
+        ])
+    }
+
+    #[test]
+    fn imported_multipart_skips_unknown_named_values_and_keeps_choices_aligned() {
+        let mut definition = BlockStateDefinition::from_json(
+            r#"{"multipart":[
+                {"apply":{"model":"test:base"}},
+                {"when":{"north":"low"},"apply":{"model":"test:unused"}},
+                {"when":{"north":"side"},"apply":[
+                    {"model":"test:side","y":90,"uvlock":true,"weight":3}
+                ]}
+            ]}"#,
+        )
+        .unwrap();
+        let original = definition.multipart.clone().unwrap();
+        definition.skip_unknown_multipart_values(&schema());
+        assert_eq!(
+            definition.multipart,
+            Some(vec![original[0].clone(), original[2].clone()])
+        );
+        let bound = definition
+            .bind(&schema(), &[state("none", "0"), state("side", "0")])
+            .unwrap();
+        assert_eq!(
+            bound,
+            vec![
+                Some(SelectedModels::Multipart(vec![0])),
+                Some(SelectedModels::Multipart(vec![0, 1])),
+            ]
+        );
+        let choices = CompiledChoices::new(&definition).unwrap();
+        let mut models = Vec::new();
+        choices
+            .collect(
+                bound[1].as_ref().unwrap(),
+                &mut LegacyRandom::new(0),
+                &mut models,
+            )
+            .unwrap();
+        assert_eq!(
+            models.iter().map(|v| v.model.as_str()).collect::<Vec<_>>(),
+            vec!["test:base", "test:side"]
+        );
+        assert_eq!(models[1].rotations, [0, 1, 0]);
+        assert!(models[1].uv_lock);
+    }
+
+    #[test]
+    fn imported_multipart_checks_every_integer_alternative() {
+        let mut definition = BlockStateDefinition::from_json(
+            r#"{"multipart":[
+                {"when":{"age":"4|5"},"apply":{"model":"test:outside"}},
+                {"when":{"age":"1|9"},"apply":{"model":"test:mixed"}},
+                {"when":{"age":"-1"},"apply":{"model":"test:negative"}},
+                {"when":{"age":"01|+2"},"apply":{"model":"test:valid"}}
+            ]}"#,
+        )
+        .unwrap();
+        definition.skip_unknown_multipart_values(&schema());
+        assert_eq!(definition.multipart.as_ref().unwrap().len(), 1);
+        assert_eq!(
+            definition
+                .bind(
+                    &schema(),
+                    &[
+                        state("none", "0"),
+                        state("none", "1"),
+                        state("none", "2"),
+                        state("none", "3"),
+                    ],
+                )
+                .unwrap(),
+            vec![
+                Some(SelectedModels::Multipart(vec![])),
+                Some(SelectedModels::Multipart(vec![0])),
+                Some(SelectedModels::Multipart(vec![0])),
+                Some(SelectedModels::Multipart(vec![])),
+            ]
+        );
+    }
+
+    #[test]
+    fn imported_multipart_checks_nested_conditions_and_negated_terms() {
+        let mut definition = BlockStateDefinition::from_json(
+            r#"{"multipart":[
+                {"when":{"OR":[{"north":"up"},{"age":"1"}]},
+                 "apply":{"model":"test:unknown_or"}},
+                {"when":{"AND":[{"north":"side"},{"age":"8"}]},
+                 "apply":{"model":"test:unknown_and"}},
+                {"when":{"north":"!low"},"apply":{"model":"test:unknown_negated"}},
+                {"when":{"OR":[{"north":"!none"},{"AND":[{"age":"1"},{"north":"none"}]}]},
+                 "apply":{"model":"test:valid"}}
+            ]}"#,
+        )
+        .unwrap();
+        definition.skip_unknown_multipart_values(&schema());
+        assert_eq!(definition.multipart.as_ref().unwrap().len(), 1);
+        assert_eq!(
+            definition
+                .bind(
+                    &schema(),
+                    &[state("none", "0"), state("none", "1"), state("side", "0")],
+                )
+                .unwrap(),
+            vec![
+                Some(SelectedModels::Multipart(vec![])),
+                Some(SelectedModels::Multipart(vec![0])),
+                Some(SelectedModels::Multipart(vec![0])),
+            ]
+        );
+    }
+
+    #[test]
+    fn imported_multipart_keeps_an_empty_root_when_all_cases_are_skipped() {
+        let mut definition = BlockStateDefinition::from_json(
+            r#"{"multipart":[{"when":{"north":"low"},"apply":{"model":"test:unused"}}]}"#,
+        )
+        .unwrap();
+        definition.skip_unknown_multipart_values(&schema());
+        assert_eq!(definition.multipart, Some(vec![]));
+        assert_eq!(
+            definition.bind(&schema(), &[state("none", "0")]).unwrap(),
+            vec![Some(SelectedModels::Multipart(vec![]))]
+        );
+        let choices = CompiledChoices::new(&definition).unwrap();
+        assert!(
+            choices
+                .particle_variant(&SelectedModels::Multipart(vec![]))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn imported_multipart_leaves_valid_definitions_and_variants_unchanged() {
+        let mut definition = BlockStateDefinition::from_json(
+            r#"{"variants":{"north=unknown":{"model":"test:variant"}},"multipart":[
+                {"apply":{"model":"test:base"}},
+                {"when":{"north":"none|!side","age":"0|3"},
+                 "apply":{"model":"test:valid"}}
+            ]}"#,
+        )
+        .unwrap();
+        let original = definition.clone();
+        definition.skip_unknown_multipart_values(&schema());
+        assert_eq!(definition, original);
+        assert_eq!(
+            definition.bind(&schema(), &[state("none", "0")]).unwrap(),
+            vec![Some(SelectedModels::Multipart(vec![0, 1]))]
+        );
+    }
+
+    #[test]
+    fn strict_binding_and_unknown_multipart_properties_still_fail() {
+        let definition = BlockStateDefinition::from_json(
+            r#"{"multipart":[{"when":{"north":"low"},"apply":{"model":"test:unused"}}]}"#,
+        )
+        .unwrap();
+        assert!(definition.bind(&schema(), &[state("none", "0")]).is_err());
+
+        let mut definition = BlockStateDefinition::from_json(
+            r#"{"multipart":[{"when":{"missing":"side"},"apply":{"model":"test:unused"}}]}"#,
+        )
+        .unwrap();
+        definition.skip_unknown_multipart_values(&schema());
+        assert!(definition.bind(&schema(), &[state("none", "0")]).is_err());
     }
 }

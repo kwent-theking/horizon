@@ -139,7 +139,7 @@ pub struct Visible {
     pub distance: u64,
     pub key: SectionKey,
     pub slot: u32,
-    /// Its camera-relative origin.
+    /// Camera-relative section origin.
     pub origin: [f32; 3],
 }
 
@@ -172,8 +172,7 @@ fn in_view(key: SectionKey, camera: DVec3, radius: i32, frustum: &Frustum) -> Op
     in_frustum(key, camera, frustum, false)
 }
 
-/// `in_view` without the distance test; `inside`: the section's column is
-/// entirely inside the frustum, so the section is too.
+/// Test a section in a column that already passed the distance check.
 fn in_frustum(
     key: SectionKey,
     camera: DVec3,

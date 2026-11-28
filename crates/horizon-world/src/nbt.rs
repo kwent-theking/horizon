@@ -1,5 +1,6 @@
 //! Java Edition NBT with lossless UTF-16 strings and 26.3 mixed-list wrappers.
 use std::collections::BTreeMap;
+use std::io::Write;
 
 /// Java strings can contain unpaired surrogates, which Rust UTF-8 strings cannot.
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -465,23 +466,58 @@ pub fn read_network(bytes: &[u8], limits: Limits) -> Result<(Tag, usize), Error>
     Ok((tag, reader.offset))
 }
 
-struct Writer {
+/// How much a streaming [`Writer`] holds before it hands the bytes on.
+const FLUSH_BYTES: usize = 1 << 20;
+
+struct Writer<'w> {
     bytes: Vec<u8>,
+    /// Bytes already handed to `sink`, still counted against the byte limit.
+    flushed: usize,
+    /// Where full buffers go; without one the whole output stays in `bytes`.
+    sink: Option<&'w mut dyn Write>,
+    io_error: Option<std::io::Error>,
     limits: Limits,
     nodes: usize,
 }
-impl Writer {
+impl<'w> Writer<'w> {
+    fn new(limits: Limits, sink: Option<&'w mut dyn Write>) -> Self {
+        Self {
+            bytes: Vec::new(),
+            flushed: 0,
+            sink,
+            io_error: None,
+            limits,
+            nodes: 0,
+        }
+    }
     fn error(&self, reason: &'static str) -> Error {
         Error {
-            offset: self.bytes.len(),
+            offset: self.flushed + self.bytes.len(),
             reason,
         }
     }
     fn put(&mut self, bytes: &[u8]) -> Result<(), Error> {
-        if bytes.len() > self.limits.max_bytes.saturating_sub(self.bytes.len()) {
+        let written = self.flushed + self.bytes.len();
+        if bytes.len() > self.limits.max_bytes.saturating_sub(written) {
             return Err(self.error("byte limit exceeded"));
         }
         self.bytes.extend_from_slice(bytes);
+        if self.sink.is_some() && self.bytes.len() >= FLUSH_BYTES {
+            self.flush()?;
+        }
+        Ok(())
+    }
+    /// Hands the buffered bytes to the sink, if there is one.
+    fn flush(&mut self) -> Result<(), Error> {
+        let Some(sink) = self.sink.as_mut() else {
+            return Ok(());
+        };
+        if let Err(error) = sink.write_all(&self.bytes) {
+            self.io_error = Some(error);
+            return Err(self.error("write failed"));
+        }
+        self.flushed += self.bytes.len();
+        self.bytes.clear();
         Ok(())
     }
     fn count(&mut self, len: usize) -> Result<(), Error> {
@@ -610,11 +646,7 @@ impl Writer {
 }
 
 pub fn write_named(root: &NamedTag, limits: Limits) -> Result<Vec<u8>, Error> {
-    let mut writer = Writer {
-        bytes: Vec::new(),
-        limits,
-        nodes: 0,
-    };
+    let mut writer = Writer::new(limits, None);
     writer.put(&[root.tag.id()])?;
     if root.tag.id() != 0 {
         writer.string(&root.name)?;
@@ -624,14 +656,67 @@ pub fn write_named(root: &NamedTag, limits: Limits) -> Result<Vec<u8>, Error> {
 }
 
 pub fn write_network(tag: &Tag, limits: Limits) -> Result<Vec<u8>, Error> {
-    let mut writer = Writer {
-        bytes: Vec::new(),
-        limits,
-        nodes: 0,
-    };
+    let mut writer = Writer::new(limits, None);
     writer.put(&[tag.id()])?;
     writer.payload(tag, 0)?;
     Ok(writer.bytes)
+}
+
+/// Writes a file root a piece at a time, so a table with hundreds of
+/// thousands of generated rows never exists as a tree or as one buffer: the
+/// caller walks the root compound itself and hands over each entry's header
+/// and payload. The bytes are those [`write_named`] gives for the same tree.
+pub struct StreamWriter<'w> {
+    writer: Writer<'w>,
+}
+impl<'w> StreamWriter<'w> {
+    /// A writer into `sink`, whose output counts against `limits.max_bytes`.
+    pub fn new(sink: &'w mut dyn Write, limits: Limits) -> Self {
+        Self {
+            writer: Writer::new(limits, Some(sink)),
+        }
+    }
+    fn io(&mut self, written: Result<(), Error>) -> std::io::Result<()> {
+        written.map_err(|error| {
+            self.writer.io_error.take().unwrap_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
+            })
+        })
+    }
+    /// The root compound's header; its entries follow, then [`Self::end_compound`].
+    pub fn begin_root(&mut self, name: &JavaString) -> std::io::Result<()> {
+        let written = self.writer.put(&[10]).and_then(|()| self.writer.string(name));
+        self.io(written)
+    }
+    /// The header of a compound entry: its type and name. The payload follows.
+    pub fn entry(&mut self, id: u8, name: &JavaString) -> std::io::Result<()> {
+        let written = self.writer.put(&[id]).and_then(|()| self.writer.string(name));
+        self.io(written)
+    }
+    /// A whole tag's payload, `depth` compounds and lists below the root.
+    pub fn payload(&mut self, tag: &Tag, depth: usize) -> std::io::Result<()> {
+        let written = self.writer.payload(tag, depth);
+        self.io(written)
+    }
+    /// A list's or array's header; `element_id` is 0 for an empty list and ignored by arrays.
+    pub fn list_header(&mut self, element_id: Option<u8>, len: usize) -> std::io::Result<()> {
+        let written = match element_id {
+            Some(id) => self.writer.put(&[id]),
+            None => Ok(()),
+        }
+        .and_then(|()| self.writer.count(len));
+        self.io(written)
+    }
+    /// The end of the compound whose entries were just written.
+    pub fn end_compound(&mut self) -> std::io::Result<()> {
+        let written = self.writer.put(&[0]);
+        self.io(written)
+    }
+    /// Hands over what is still buffered.
+    pub fn finish(mut self) -> std::io::Result<()> {
+        let written = self.writer.flush();
+        self.io(written)
+    }
 }
 
 /// SNBT (`TagParser`): compounds, lists, typed arrays, quoted and bare
@@ -1048,5 +1133,55 @@ mod tests {
         assert_eq!(parse_snbt("1.5f").unwrap().0, Tag::Float(1.5f32.to_bits()));
         assert_eq!(parse_snbt("3b").unwrap().0, Tag::Byte(3));
         assert_eq!(parse_snbt("-2L").unwrap().0, Tag::Long(-2));
+    }
+    #[test]
+    fn stream_writer_matches_write_named() {
+        let row = |n: i32| Tag::compound([("id", Tag::Int(n)), ("name", Tag::String("x".into()))]);
+        let rows: Vec<Tag> = (0..120_000).map(row).collect();
+        let root = NamedTag {
+            name: "root".into(),
+            tag: Tag::compound([
+                ("a", Tag::Byte(1)),
+                ("states", Tag::List(rows.clone())),
+                ("shapes", Tag::IntArray(vec![1, 2, 3])),
+            ]),
+        };
+        let expected = write_named(&root, Limits::default()).unwrap();
+        // Past the flush size, so the buffer is handed on in pieces.
+        assert!(expected.len() > 2 * FLUSH_BYTES);
+
+        let mut streamed = Vec::new();
+        let mut writer = StreamWriter::new(&mut streamed, Limits::default());
+        // A compound's entries are sorted by name: a, shapes, states.
+        writer.begin_root(&root.name).unwrap();
+        writer.entry(1, &"a".into()).unwrap();
+        writer.payload(&Tag::Byte(1), 1).unwrap();
+        writer.entry(11, &"shapes".into()).unwrap();
+        writer.list_header(None, 3).unwrap();
+        for item in [1, 2, 3] {
+            writer.payload(&Tag::Int(item), 2).unwrap();
+        }
+        writer.entry(9, &"states".into()).unwrap();
+        writer.list_header(Some(10), rows.len()).unwrap();
+        for row in &rows {
+            writer.payload(row, 2).unwrap();
+        }
+        writer.end_compound().unwrap();
+        writer.finish().unwrap();
+        assert_eq!(streamed, expected);
+    }
+    #[test]
+    fn stream_writer_keeps_the_byte_limit_across_flushes() {
+        let limits = Limits {
+            max_bytes: 3 * FLUSH_BYTES,
+            ..Limits::default()
+        };
+        let mut sink = Vec::new();
+        let mut writer = StreamWriter::new(&mut sink, limits);
+        writer.begin_root(&"".into()).unwrap();
+        let block = Tag::ByteArray(vec![0; FLUSH_BYTES]);
+        let results: Vec<_> = (0..4).map(|_| writer.payload(&block, 1)).collect();
+        assert!(results[..2].iter().all(Result::is_ok));
+        assert!(results[3].is_err());
     }
 }

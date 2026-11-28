@@ -2,7 +2,7 @@
 //! (smooth light and ambient occlusion, including the partial-face weights)
 //! and `ModelBlockRenderer`'s integer colour arithmetic (`ARGB.gray`,
 //! `scaleRGB`, `multiply`).
-use super::{Info, Padded, pi};
+use super::{Info, Padded, StateInfo, pi};
 use horizon_assets::model::Direction as D;
 
 /// `LightCoordsUtil.FULL_BRIGHT`.
@@ -33,7 +33,7 @@ pub(super) fn step(p: [i32; 3], face: D) -> [i32; 3] {
     let n = normal(face);
     [p[0] + n[0], p[1] + n[1], p[2] + n[2]]
 }
-fn state<'a>(pad: &Padded, info: &'a [Info], p: [i32; 3]) -> &'a Info {
+fn state<'a>(pad: &Padded, info: &'a StateInfo, p: [i32; 3]) -> &'a Info {
     &info[pad.blocks[pi(p[0], p[1], p[2])] as usize]
 }
 /// `LightCoordsUtil.getLightCoords`: light at `p` as seen through `state`
@@ -304,7 +304,7 @@ pub(super) fn flat_position(
 /// and smooth light coords, by vertex index.
 pub(super) fn ambient_occlusion(
     pad: &Padded,
-    info: &[Info],
+    info: &StateInfo,
     own: &Info,
     pos: [i32; 3],
     positions: &[[f32; 3]; 4],
@@ -316,7 +316,7 @@ pub(super) fn ambient_occlusion(
     let corner = |i: usize| step(base, adjacency.corners[i]);
     let sample = |p: [i32; 3]| {
         let s = state(pad, info, p);
-        (coords(pad, s, p), s.shade)
+        (coords(pad, s, p), s.shade())
     };
     let (light0, shade0) = sample(corner(0));
     let (light1, shade1) = sample(corner(1));
@@ -343,9 +343,9 @@ pub(super) fn ambient_occlusion(
         coords(pad, own, pos)
     };
     let shade_center = if shape.cubic {
-        state(pad, info, base).shade
+        state(pad, info, base).shade()
     } else {
-        own.shade
+        own.shade()
     };
     let ao = [
         (shade3 + shade0 + shade03 + shade_center) * 0.25,

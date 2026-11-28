@@ -33,7 +33,8 @@ use horizon_client::cushion::blocks_in;
 struct PlacementWorld<'a, 'r>(&'a Game<'r>);
 impl horizon_client::cushion::World for PlacementWorld<'_, '_> {
     fn outline_bounds(&self, p: [i32; 3]) -> Option<Aabb> {
-        let boxes = self.0.outline_boxes(p);
+        let state = self.0.world.block(p[0], p[1], p[2]);
+        let boxes = self.0.outline_boxes(p, state, None);
         let mut shape = *boxes.first()?;
         for b in &boxes[1..] {
             for k in 0..3 {
@@ -141,11 +142,7 @@ impl Game<'_> {
     pub(super) fn cushion_spawn(&self, hit: &Hit) -> Option<(Vec3, Aabb)> {
         // CushionItem.recalculateContextForSpecialCollisionShapes: open containers
         // (cauldrons, hoppers and composters) use the collision ray's actual height.
-        let mut adjusted = Hit {
-            pos: hit.pos,
-            face: hit.face,
-            point: hit.point,
-        };
+        let mut adjusted = *hit;
         let state = self.world.block(hit.pos[0], hit.pos[1], hit.pos[2]);
         if self.res.items().block_in_tag(
             "minecraft:cushion_uses_collision_shape",

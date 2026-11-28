@@ -2,7 +2,7 @@
 //! Context-sensitive families override the no-context cache explicitly.
 use crate::{
     block_collision_scan::CollisionBlock,
-    collision::CachedCollisionRegistry,
+    collision::{CachedCollisionRegistry, OutlineGeometry},
     collision_context::CollisionContext,
     dynamic_support::{DynamicSupport, DynamicSupportError, DynamicSupportWorld},
     liquid_collision::{LiquidCollision, LiquidCollisionWorld},
@@ -49,6 +49,12 @@ impl ShulkerCollisionState {
 }
 
 pub trait DynamicCollisionWorld: DynamicSupportWorld {
+    /// A resident state for NeoForge neighbour samples. Worlds without a block
+    /// lookup use the all-air sample.
+    fn collision_neighbour(&mut self, _position: [i32; 3]) -> Option<BlockStateId> {
+        None
+    }
+
     /// One block-entity lookup. None denotes absence or another entity type.
     fn shulker_collision_state(
         &mut self,
@@ -97,11 +103,14 @@ impl<'r> BlockCollisionRegistry<'r> {
         for index in 0..cached.registry().len() {
             let id = BlockStateId(index as u32);
             let state = cached.registry().state(id).unwrap();
-            let large = cached.cached_shape(id)?.is_none_or(|shape| {
+            let reaches_out = |shape: &VoxelShape| {
                 Axis::ALL
                     .into_iter()
                     .any(|axis| shape.min(axis) < 0.0 || shape.max(axis) > 1.0)
-            });
+            };
+            let oracle_sides = cached.oracle().collision_sides(id);
+            let large = cached.cached_shape(id)?.is_none_or(reaches_out)
+                || (oracle_sides != 0 && cached.oracle().any_collision_variant(id, reaches_out));
             if let Some(rule) = ScaffoldingCollision::from_state(state)? {
                 contextual.insert(id, ContextualRule::Scaffolding(rule));
             } else if let Some(rule) = LiquidCollision::from_state(state)? {
@@ -111,12 +120,17 @@ impl<'r> BlockCollisionRegistry<'r> {
             }
             // No contextual rule and an empty cached shape: empty everywhere.
             let empty = !contextual.contains_key(&id)
+                && (oracle_sides == 0
+                    || !cached
+                        .oracle()
+                        .any_collision_variant(id, |shape| !shape.is_empty()))
                 && cached.cached_shape(id)?.is_some_and(VoxelShape::is_empty);
             scan_flags.push(
                 u8::from(large)
                     | (u8::from(state.name == "minecraft:moving_piston") << 1)
                     | (u8::from(empty) << 2)
-                    | (u8::from(contextual.contains_key(&id)) << 3),
+                    | (u8::from(contextual.contains_key(&id)) << 3)
+                    | (u8::from(oracle_sides != 0) << 4),
             );
             if cached.cached_shape(id)?.is_none() {
                 if let Some(rule) =
@@ -165,12 +179,69 @@ impl<'r> BlockCollisionRegistry<'r> {
             .get(state.0 as usize)
             .is_none_or(|flags| flags & 3 != 0)
     }
+
+    fn neighbour_mask(
+        &self,
+        position: [i32; 3],
+        sides: u8,
+        mut neighbour_at: impl FnMut([i32; 3]) -> Option<BlockStateId>,
+    ) -> io::Result<u8> {
+        let mut mask = 0;
+        let cube = Aabb::new(Vec3::ZERO, Vec3::new(1.0, 1.0, 1.0));
+        for direction in Direction::ALL {
+            let bit = 1 << direction as u8;
+            if sides & bit == 0 {
+                continue;
+            }
+            let offset = direction.normal();
+            let neighbour = std::array::from_fn(|i| position[i].saturating_add(offset[i]));
+            if let Some(id) = neighbour_at(neighbour)
+                && self
+                    .cached
+                    .cached_shape(id)?
+                    .is_some_and(|shape| shape.boxes() == [cube])
+            {
+                mask |= bit;
+            }
+        }
+        Ok(mask)
+    }
+
+    /// A NeoForge outline override for the resident neighbours. Returns `None`
+    /// when the caller's original outline can be used.
+    pub fn neighbour_outline(
+        &self,
+        state: BlockStateId,
+        position: [i32; 3],
+        neighbour_at: impl FnMut([i32; 3]) -> Option<BlockStateId>,
+    ) -> io::Result<Option<&OutlineGeometry>> {
+        let oracle = self.cached.oracle();
+        let Some(sides) = oracle.outline_sides(state) else {
+            return Ok(None);
+        };
+        let mask = self.neighbour_mask(position, sides, neighbour_at)?;
+        Ok(oracle.outline_override(state, mask))
+    }
+
     pub fn collision_shape<W: DynamicCollisionWorld>(
         &self,
         world: &mut W,
         state: BlockStateId,
         position: [i32; 3],
     ) -> Result<VoxelShape, CollisionQueryError<W::Error>> {
+        if self
+            .scan_flags
+            .get(state.0 as usize)
+            .is_some_and(|flags| flags & 16 != 0)
+        {
+            let sides = self.cached.oracle().collision_sides(state);
+            let mask = self
+                .neighbour_mask(position, sides, |pos| world.collision_neighbour(pos))
+                .map_err(CollisionQueryError::Data)?;
+            if let Some(shape) = self.cached.oracle().collision(state, mask) {
+                return Ok(shape.clone());
+            }
+        }
         if let Some(shape) = self
             .cached
             .cached_shape(state)

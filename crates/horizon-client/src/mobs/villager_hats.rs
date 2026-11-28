@@ -3,7 +3,8 @@ use super::{
     anim::Poses,
     render::{PROFESSIONS, VILLAGER_TYPES},
 };
-use std::{collections::HashMap, fs, path::Path};
+use horizon_world::content_view;
+use std::{collections::HashMap, path::Path};
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 enum Hat {
@@ -27,7 +28,7 @@ impl VillagerHats {
                 for name in names {
                     let texture = format!("entity/{folder}/{group}/{name}");
                     let path = root.join(format!("assets/minecraft/textures/{texture}.png.mcmeta"));
-                    let metadata = fs::read(path)
+                    let metadata = content_view::read(path)
                         .ok()
                         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
                     let hat = match metadata

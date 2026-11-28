@@ -6,6 +6,21 @@ use horizon_core::random::LegacyRandom;
 use horizon_world::registry::BlockStateId;
 use std::sync::Arc;
 
+mod create_fluid_state;
+mod create_piston_state;
+mod deployer_state;
+mod flap_display_state;
+mod indicator_state;
+pub use create_fluid_state::{
+    CreateFluid, CreateFluidFlow, CreateFluidState, CreateFluidTank, CreateVesselKind,
+};
+pub use create_piston_state::CreatePistonState;
+pub use deployer_state::{DeployerMode, DeployerPhase, DeployerState};
+pub use flap_display_state::{
+    FlapDisplayRow, FlapDisplaySection, FlapDisplayState, FlapDisplayTransition,
+};
+pub use indicator_state::{NixieLamp, NixieState, TrackSignalState, WhistleState};
+
 /// Sections (x, section index, z) waiting to be remeshed, kept by column
 /// (a bit per section index), so the mesh scheduler looks at each column once
 /// rather than at every section of it.
@@ -97,6 +112,345 @@ pub struct World {
     /// The moving-piston block entities of the level, by position, copied
     /// from the block ticks after each tick: collision and rendering read them.
     pub moving_pistons: Vec<([i32; 3], horizon_world::piston_shape::MovingPistonState)>,
+    /// Create's shafts and small cogwheels by position, with the `Speed` (rpm)
+    /// of their block entity: drawn turning, not in the chunk mesh.
+    pub kinetic_speeds: std::collections::HashMap<(i32, i32, i32), f32>,
+    /// Create bearings that do not turn: the angle in degrees their top keeps
+    /// (their block entity's `Angle`).
+    pub kinetic_held_angles: std::collections::HashMap<(i32, i32, i32), f32>,
+    /// Create speed and stress gauges: where the dial points, 0 at rest to
+    /// 1.125 (their block entity's `Value`).
+    pub kinetic_dials: std::collections::HashMap<(i32, i32, i32), f32>,
+    /// Create pulleys and mechanical arms: what their update tag says about
+    /// the parts they draw besides the turning shaft.
+    pub kinetic_machines: std::collections::HashMap<(i32, i32, i32), MachineState>,
+    /// Create mechanical arms: phase, interaction points, held item and smoothed joint angles.
+    pub kinetic_arms: std::collections::HashMap<(i32, i32, i32), ArmAnimState>,
+    pub create_deployers: FxHashMap<(i32, i32, i32), DeployerState>,
+    pub create_fluids: FxHashMap<(i32, i32, i32), CreateFluidState>,
+    pub create_pistons: FxHashMap<(i32, i32, i32), CreatePistonState>,
+    pub create_whistles: FxHashMap<(i32, i32, i32), WhistleState>,
+    pub create_nixies: FxHashMap<(i32, i32, i32), NixieState>,
+    pub create_track_signals: FxHashMap<(i32, i32, i32), TrackSignalState>,
+    pub create_display_boards: FxHashMap<(i32, i32, i32), FlapDisplayState>,
+    pub create_printer_ticks: FxHashMap<(i32, i32, i32), i32>,
+    pub create_cannon_mounts: FxHashMap<(i32, i32, i32), CreateCannonMountState>,
+    pub aeronautics_part_poses: FxHashMap<(i32, i32, i32), AeronauticsPartPose>,
+    /// Create valves, analog levers, ejectors, stickers, toolboxes, packagers and portable interfaces.
+    pub kinetic_aux: std::collections::HashMap<(i32, i32, i32), KineticAuxState>,
+    /// Create belts, tunnels, blaze burners, depots, chutes, basins and frogports.
+    pub kinetic_logistics: std::collections::HashMap<(i32, i32, i32), KineticLogisticsState>,
+    /// Create schematicannons, rollers, chain conveyors, doors, bells, drains, stations and bogeys.
+    pub kinetic_contraptions: std::collections::HashMap<(i32, i32, i32), KineticContraptionState>,
+}
+/// Pose data reported separately from a Create Aeronautics block's kinetic RPM.
+#[derive(Clone, Copy, Debug)]
+pub enum AeronauticsPartPose {
+    Rotor {
+        angle: f32,
+        degrees_per_tick: f32,
+        tick: i64,
+    },
+    Bearing {
+        angle: f32,
+        degrees_per_tick: f32,
+        tick: i64,
+    },
+    CogSpeed(f32),
+    SwivelCogSpeed(f32),
+    SpringAngle(f32),
+}
+
+/// What a pulley's or mechanical arm's update tag says about its moving parts.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MachineState {
+    /// `LinearActuatorBlockEntity.offset`: blocks of rope or belt paid out (`Offset`).
+    pub offset: f32,
+    /// `LinearActuatorBlockEntity.running` (`Running`).
+    pub running: bool,
+    /// `ArmBlockEntity.goggles` (`Goggles`).
+    pub goggles: bool,
+    /// `KineticBlockEntity.source` (`Source`): position of the driving kinetic block.
+    pub source: Option<[i32; 3]>,
+}
+/// Create `ArmBlockEntity.Phase`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ArmPhase {
+    #[default]
+    SearchInputs,
+    MoveToInput,
+    SearchOutputs,
+    MoveToOutput,
+    Dancing,
+}
+/// How a mechanical arm's `ArmInteractionPoint` computes its target offset and claw direction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArmPointKind {
+    Default,
+    TopFace,
+    Depot,
+    Composter,
+    Crafter,
+    Deployer,
+    Funnel,
+}
+/// One serialized interaction point of a Create mechanical arm, relative to the arm block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArmPoint {
+    pub rel_pos: [i32; 3],
+    pub kind: ArmPointKind,
+}
+/// Joint angles of a Create mechanical arm (`ArmAngleTarget`, in degrees).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ArmAngleSet {
+    pub base: f32,
+    pub lower: f32,
+    pub upper: f32,
+    pub head: f32,
+}
+impl ArmAngleSet {
+    /// `ArmAngleTarget.NO_TARGET`: resting pose.
+    pub const NO_TARGET: Self = Self {
+        base: 0.0,
+        lower: 135.0,
+        upper: 45.0,
+        head: 0.0,
+    };
+}
+/// Client animation state for one Create mechanical arm (`ArmBlockEntity`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ArmAnimState {
+    pub phase: ArmPhase,
+    pub target_index: i32,
+    pub progress: f32,
+    pub goggles: bool,
+    pub inputs: Vec<ArmPoint>,
+    pub outputs: Vec<ArmPoint>,
+    pub held_item: Option<horizon_items::items::ItemStack>,
+    pub previous_target: ArmAngleSet,
+    pub previous_base_angle: f32,
+    pub prev_angles: ArmAngleSet,
+    pub curr_angles: ArmAngleSet,
+    pub initialized: bool,
+}
+impl Default for ArmAnimState {
+    fn default() -> Self {
+        Self {
+            phase: ArmPhase::default(),
+            target_index: -1,
+            progress: 0.0,
+            goggles: false,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            held_item: None,
+            previous_target: ArmAngleSet::NO_TARGET,
+            previous_base_angle: ArmAngleSet::NO_TARGET.base,
+            prev_angles: ArmAngleSet::NO_TARGET,
+            curr_angles: ArmAngleSet::NO_TARGET,
+            initialized: false,
+        }
+    }
+}
+/// Scalar chaser mirroring Catnip's `LerpedFloat` (linear and exponential).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct LerpedValue {
+    pub prev: f32,
+    pub value: f32,
+    pub target: f32,
+    pub speed: f32,
+    pub exp: bool,
+}
+impl LerpedValue {
+    pub fn start_with(v: f32) -> Self {
+        Self {
+            prev: v,
+            value: v,
+            target: v,
+            speed: 0.0,
+            exp: false,
+        }
+    }
+    pub fn set_value(&mut self, v: f32) {
+        self.prev = self.value;
+        self.value = v;
+    }
+    pub fn chase_linear(&mut self, target: f32, speed: f32) {
+        self.target = target;
+        self.speed = speed;
+        self.exp = false;
+    }
+    pub fn chase_exp(&mut self, target: f32, speed: f32) {
+        self.target = target;
+        self.speed = speed;
+        self.exp = true;
+    }
+    pub fn tick(&mut self) {
+        self.prev = self.value;
+        if (self.value - self.target).abs() < 1e-5 {
+            self.value = self.target;
+            return;
+        }
+        if self.exp {
+            self.value += (self.target - self.value) * self.speed;
+        } else if self.speed > 0.0 {
+            let diff = self.target - self.value;
+            let step = self.speed.abs();
+            self.value += diff.clamp(-step, step);
+        }
+    }
+    pub fn get(&self, alpha: f64) -> f32 {
+        self.prev + (self.value - self.prev) * (alpha as f32)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct CreateCannonMountState {
+    pub running: bool,
+    pub yaw: LerpedValue,
+    pub pitch: LerpedValue,
+    pub yaw_rpm: f32,
+    pub pitch_rpm: f32,
+}
+
+/// One item carried on a Create belt or depot (`TransportedItemStack`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TransportedItem {
+    pub stack: horizon_items::items::ItemStack,
+    pub belt_pos: f32,
+    pub prev_belt_pos: f32,
+    pub side_offset: f32,
+    pub prev_side_offset: f32,
+    pub angle: i32,
+    pub inserted_from: u8,
+    pub locked: bool,
+    pub locked_externally: bool,
+}
+/// Item holdings of a Create depot or weighted ejector (`DepotBehaviour`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DepotItems {
+    pub held_item: Option<TransportedItem>,
+    pub incoming: Vec<TransportedItem>,
+    pub output_buffer: Vec<(usize, horizon_items::items::ItemStack)>,
+}
+/// Client animation state for Create Group B blocks, packagers and portable interfaces.
+#[derive(Clone, Debug, PartialEq)]
+pub enum KineticAuxState {
+    FluidValve {
+        pointer: LerpedValue,
+    },
+    Funnel {
+        flap: LerpedValue,
+    },
+    AnalogLever {
+        level: LerpedValue,
+    },
+    Ejector {
+        lid: LerpedValue,
+        depot: DepotItems,
+    },
+    Sticker {
+        piston: LerpedValue,
+    },
+    Toolbox {
+        open_count: i32,
+        lid: LerpedValue,
+        drawers: LerpedValue,
+    },
+    Packager {
+        animation_ticks: i32,
+        animation_inward: bool,
+        held_box: Option<horizon_items::items::ItemStack>,
+        inserted_box: Option<horizon_items::items::ItemStack>,
+    },
+    PortableInterface {
+        transfer_timer: i32,
+        distance: f32,
+        powered: bool,
+        animation: LerpedValue,
+    },
+}
+/// Client animation state for Create belts, tunnels, blaze burners and item carriers.
+#[derive(Clone, Debug, PartialEq)]
+pub enum KineticLogisticsState {
+    Belt {
+        is_controller: bool,
+        belt_length: i32,
+        dye: Option<u8>,
+        items: Vec<TransportedItem>,
+        lazy_item: Option<TransportedItem>,
+    },
+    BeltTunnel {
+        flaps: Vec<(u8, LerpedValue)>,
+    },
+    BlazeBurner {
+        goggles: bool,
+        hat: bool,
+        stock_keeper: bool,
+        head_angle: LerpedValue,
+        head_animation: LerpedValue,
+    },
+    Depot {
+        items: DepotItems,
+    },
+    Chute {
+        item: Option<horizon_items::items::ItemStack>,
+        item_pos: LerpedValue,
+        pull: f32,
+        push: f32,
+        bottom_pull_distance: f32,
+    },
+    Basin {
+        input_items: Vec<horizon_items::items::ItemStack>,
+        output_items: Vec<horizon_items::items::ItemStack>,
+        visualized_outputs: Vec<(i32, horizon_items::items::ItemStack)>,
+        ingredient_rotation: LerpedValue,
+        ingredient_rotation_speed: LerpedValue,
+    },
+    Frogport {
+        passive_yaw: f32,
+        goggles: bool,
+        target_rel: Option<[i32; 3]>,
+        animated_package: Option<horizon_items::items::ItemStack>,
+        depositing: bool,
+        open_count: i32,
+        animation_progress: LerpedValue,
+        anticipation_progress: LerpedValue,
+        manual_open: LerpedValue,
+    },
+}
+/// Client animation state for Create schematicannons, chain conveyors, doors, bells, drains, stations and bogeys.
+#[derive(Clone, Debug, PartialEq)]
+pub enum KineticContraptionState {
+    Schematicannon {
+        default_yaw: f32,
+        target: Option<[i32; 3]>,
+        prev_target: Option<[i32; 3]>,
+        recoil_ticks: i32,
+    },
+    ChainConveyor {
+        connections: Vec<[i32; 3]>,
+    },
+    SlidingDoor {
+        animation: LerpedValue,
+        bridge_ticks: i32,
+    },
+    Bell {
+        ringing: bool,
+        ringing_ticks: i32,
+        ring_direction: u8,
+    },
+    DeskBell {
+        animation: LerpedValue,
+        animation_offset: f32,
+    },
+    ItemDrain {
+        held_item: Option<TransportedItem>,
+        processing_ticks: i32,
+    },
+    TrackStation {
+        flag: LerpedValue,
+        depot: DepotItems,
+    },
 }
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Weather {
@@ -163,6 +517,29 @@ impl Weather {
     }
 }
 impl World {
+    pub fn retain_create_visuals(&mut self, keep: impl Fn(i32, i32) -> bool) {
+        self.create_deployers
+            .retain(|&(x, _, z), _| keep(x >> 4, z >> 4));
+        self.create_fluids
+            .retain(|&(x, _, z), _| keep(x >> 4, z >> 4));
+        self.create_pistons
+            .retain(|&(x, _, z), _| keep(x >> 4, z >> 4));
+        self.create_whistles
+            .retain(|&(x, _, z), _| keep(x >> 4, z >> 4));
+        self.create_nixies
+            .retain(|&(x, _, z), _| keep(x >> 4, z >> 4));
+        self.create_track_signals
+            .retain(|&(x, _, z), _| keep(x >> 4, z >> 4));
+        self.create_display_boards
+            .retain(|&(x, _, z), _| keep(x >> 4, z >> 4));
+        self.create_printer_ticks
+            .retain(|&(x, _, z), _| keep(x >> 4, z >> 4));
+        self.create_cannon_mounts
+            .retain(|&(x, _, z), _| keep(x >> 4, z >> 4));
+        self.aeronautics_part_poses
+            .retain(|&(x, _, z), _| keep(x >> 4, z >> 4));
+    }
+
     pub fn new(air: BlockStateId, seed: i64) -> Self {
         Self {
             chunks: Default::default(),
@@ -189,6 +566,24 @@ impl World {
             light_log: None,
             moving_piston_fallback: Vec::new(),
             moving_pistons: Vec::new(),
+            kinetic_speeds: Default::default(),
+            kinetic_held_angles: Default::default(),
+            kinetic_dials: Default::default(),
+            kinetic_machines: Default::default(),
+            kinetic_arms: Default::default(),
+            create_deployers: Default::default(),
+            create_fluids: Default::default(),
+            create_pistons: Default::default(),
+            create_whistles: Default::default(),
+            create_nixies: Default::default(),
+            create_track_signals: Default::default(),
+            create_display_boards: Default::default(),
+            create_printer_ticks: Default::default(),
+            create_cannon_mounts: Default::default(),
+            aeronautics_part_poses: Default::default(),
+            kinetic_aux: Default::default(),
+            kinetic_logistics: Default::default(),
+            kinetic_contraptions: Default::default(),
             pois: Default::default(),
         }
     }
@@ -384,7 +779,14 @@ impl World {
                 .0
         })
     }
+    #[inline]
     pub fn light(&self, x: i32, y: i32, z: i32) -> u8 {
+        if y < crate::chunk::MIN_Y {
+            return 0;
+        }
+        if y >= crate::chunk::MIN_Y + (crate::chunk::SECTIONS as i32) * 16 {
+            return 0xF0;
+        }
         self.chunks
             .get(&(x >> 4, z >> 4))
             .map_or(0xF0, |chunk| chunk.light(x & 15, y, z & 15))
@@ -497,5 +899,16 @@ mod tests {
         // Past the top, and the palette of air below it.
         assert!(!world.may_hold([0, 400, 0], [0, 401, 0], nine));
         assert!(world.may_hold([0, 400, 0], [0, 401, 0], |s| s.0 == 0));
+    }
+
+    #[test]
+    fn light_outside_world_bounds_short_circuits_without_chunk_lookup() {
+        let world = World::new(BlockStateId(0), 0);
+        // Under the world (void), light is pitch black (0).
+        assert_eq!(world.light(0, MIN_Y - 1, 0), 0);
+        assert_eq!(world.light(100, -100, 200), 0);
+        // Above the world (sky), light is full sky light (0xF0).
+        assert_eq!(world.light(0, MIN_Y + (SECTIONS as i32) * 16, 0), 0xF0);
+        assert_eq!(world.light(100, 500, 200), 0xF0);
     }
 }

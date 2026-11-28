@@ -1250,15 +1250,15 @@ impl Game<'_> {
                     return;
                 }
                 let face = direction(p.face);
-                let hit = Hit {
-                    pos: p.pos,
+                let hit = Hit::world(
+                    p.pos,
                     face,
-                    point: [
+                    [
                         f64::from(p.pos[0]) + f64::from(p.cursor[0]),
                         f64::from(p.pos[1]) + f64::from(p.cursor[1]),
                         f64::from(p.pos[2]) + f64::from(p.cursor[2]),
                     ],
-                };
+                );
                 let hand = if p.hand == 1 { Hand::Off } else { Hand::Main };
                 // handleUseItemOn: under spawn protection nothing is used or
                 // placed; the player is told and the blocks below go back.
@@ -2294,15 +2294,15 @@ impl Game<'_> {
                 self.as_guest(host, conn, |g| {
                     g.attack_ticks = g.attack_ticks.saturating_add(1);
                     if let Some((pos, face)) = digging {
-                        g.forced_hit = Some(Hit {
+                        g.forced_hit = Some(Hit::world(
                             pos,
                             face,
-                            point: [
+                            [
                                 f64::from(pos[0]) + 0.5,
                                 f64::from(pos[1]) + 0.5,
                                 f64::from(pos[2]) + 0.5,
                             ],
-                        });
+                        ));
                     }
                     let _ = g.tick_mining();
                     g.forced_hit = None;
@@ -2646,6 +2646,7 @@ impl Game<'_> {
                 return (Vec::new(), None);
             };
             let mut w = MotionWorld {
+                decks: None,
                 entities: &[],
                 player,
                 scene: &mut game.world,
@@ -2762,6 +2763,7 @@ impl Game<'_> {
             let _ = player.food_tick(health, rules);
             events.append(&mut player.events);
             let _ = MotionWorld {
+                decks: None,
                 entities: &[],
                 player,
                 scene: &mut game.world,

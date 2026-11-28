@@ -211,7 +211,7 @@ impl Game<'_> {
     /// interpolated eye, or a point up to the camera distance behind (or in
     /// front of) it, pulled in where visual shapes are in the way. Returns the
     /// position, yaw and pitch to render from.
-    pub(super) fn camera_view(&mut self, partial: f32) -> Option<(glam::DVec3, f32, f32)> {
+    pub(super) fn camera_view(&mut self, partial: f32) -> Option<(glam::DVec3, f32, f32, f32)> {
         let (scale, distance) = {
             let p = self.player.as_mut()?;
             (
@@ -259,7 +259,7 @@ impl Game<'_> {
             .riding
             .and_then(|id| self.boats.iter().find(|b| b.id == id))
             .map_or(0.0, |b| b.delta_rotation);
-        let entity = CameraEntity {
+        let mut entity = CameraEntity {
             position: [p.position.x, p.position.y, p.position.z],
             previous: [
                 self.previous_position.x,
@@ -281,6 +281,38 @@ impl Game<'_> {
             }),
             mount,
         };
+        let mut roll = 0.0;
+        if let Some(deck) = self.player_deck() {
+            let t = f64::from(partial);
+            let height = self.view.eye_height_old
+                + (self.view.eye_height - self.view.eye_height_old) * partial;
+            let eye = glam::DVec3::Y * f64::from(height);
+            let previous = glam::DVec3::from(entity.previous) + eye;
+            let current = glam::DVec3::from(entity.position) + eye;
+            let feet = (deck.render_point(previous, current, t) - eye).to_array();
+            entity.previous = feet;
+            entity.position = feet;
+            if self.riding.is_some() {
+                let yaw = entity.view_y_rot(partial);
+                let pitch = entity.view_x_rot(partial);
+                let local = glam::DQuat::from_euler(
+                    glam::EulerRot::YXZ,
+                    (180.0 - f64::from(yaw)).to_radians(),
+                    -f64::from(pitch).to_radians(),
+                    0.0,
+                );
+                let (yaw, pitch, bank) =
+                    (deck.render_pose(t).orientation() * local).to_euler(glam::EulerRot::YXZ);
+                entity.y_rot = (180.0 - yaw.to_degrees()) as f32;
+                entity.x_rot = -pitch.to_degrees() as f32;
+                entity.y_rot_o = entity.y_rot;
+                entity.x_rot_o = entity.x_rot;
+                roll = -bank.to_degrees() as f32;
+                if self.camera_type == CameraType::ThirdPersonFront {
+                    roll = -roll;
+                }
+            }
+        }
         let mut view = self.view;
         let kind = match self.camera_type {
             CameraType::FirstPerson => horizon_client::camera::CameraType::FirstPerson,
@@ -322,6 +354,7 @@ impl Game<'_> {
             glam::DVec3::from_array(view.position),
             view.y_rot,
             view.x_rot,
+            roll,
         ))
     }
     /// Keep the player's model in step with the player (`LivingEntity.tick`

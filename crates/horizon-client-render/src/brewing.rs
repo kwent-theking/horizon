@@ -7,8 +7,9 @@ use crate::{
     items::{ItemStack, Items},
     providers::Providers,
 };
+use horizon_world::content_view;
 use serde_json::Value;
-use std::{collections::HashSet, fs, path::Path};
+use std::{collections::HashSet, path::Path};
 
 pub use horizon_client_core::potions::{
     BASE_POTION_COLOR, Category, EFFECTS, EffectDef, POTIONS, PotionDef, effect, namespaced,
@@ -143,16 +144,15 @@ pub struct Brewing {
 }
 impl Brewing {
     pub fn load(root: &Path, items: &Items) -> Self {
-        let mut files: Vec<_> = fs::read_dir(root.join("data/minecraft/recipe/brewing"))
+        let mut files: Vec<_> = content_view::read_dir(root.join("data/minecraft/recipe/brewing"))
             .into_iter()
-            .flatten()
             .flatten()
             .map(|e| e.path())
             .collect();
         files.sort();
         let mut recipes = Vec::new();
         for p in files {
-            let Ok(bytes) = fs::read(&p) else { continue };
+            let Ok(bytes) = content_view::read(&p) else { continue };
             let Ok(v) = serde_json::from_slice::<Value>(&bytes) else {
                 continue;
             };

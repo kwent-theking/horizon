@@ -2,17 +2,39 @@
 //! This supplies identities and default properties, not block behavior.
 mod facts;
 mod json;
+#[cfg(test)]
+mod snapshot_tests;
+mod table_cache;
 use crate::{DATA_VERSION, chunk::BlockState, compression::invalid, nbt::Tag};
 pub use json::BlockStateJsonCodec;
 pub(crate) use json::java_integer;
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     hash::{DefaultHasher, Hash, Hasher},
     io,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BlockStateId(pub u32);
+
+// Only ordered descriptors and defaults belong on disk. Runtime hash indexes
+// are rebuilt and validated, never trusted from a snapshot.
+impl serde::Serialize for BlockRegistry {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let defaults: BTreeMap<&str, i64> = self
+            .defaults
+            .iter()
+            .map(|(name, id)| (name.as_str(), i64::from(id.0)))
+            .collect();
+        serde::Serialize::serialize(&(&self.states, defaults), serializer)
+    }
+}
+impl<'de> serde::Deserialize<'de> for BlockRegistry {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let (states, defaults) = serde::Deserialize::deserialize(deserializer)?;
+        Self::from_ordered_states(states, defaults).map_err(serde::de::Error::custom)
+    }
+}
 
 pub struct BlockRegistry {
     states: Vec<BlockState>,
@@ -23,6 +45,7 @@ pub struct BlockRegistry {
     /// States whose hash an earlier state already took (none in vanilla).
     collided: BTreeMap<BlockState, BlockStateId>,
     defaults: BTreeMap<String, BlockStateId>,
+    cache_identity: std::sync::OnceLock<[u8; 32]>,
 }
 /// The hash [`BlockRegistry`] indexes states by (fixed keys: the same in
 /// every process).
@@ -60,7 +83,7 @@ impl BlockRegistry {
                 Ok((name, i64::from(*id)))
             })
             .collect::<io::Result<_>>()?;
-        Self::from_states(states, defaults)
+        Self::from_ordered_states(states, defaults)
     }
 
     /// The registry of a resources `facts.json` (`{"states": [[..., ..., ...,
@@ -79,35 +102,51 @@ impl BlockRegistry {
             .map_err(|e| invalid(e.to_string()))?;
         let flags = facts.states.iter().map(|r| (r.air, r.fluid)).collect();
         let states = facts.states.into_iter().map(|r| r.state).collect();
-        Ok((Self::from_states(states, facts.defaults)?, flags))
+        Ok((Self::from_ordered_states(states, facts.defaults)?, flags))
     }
 
-    fn from_states(states: Vec<BlockState>, defaults: BTreeMap<String, i64>) -> io::Result<Self> {
+    /// Rebuild the runtime indexes from ordered registry descriptors. The
+    /// descriptor order defines every `BlockStateId` and must be preserved.
+    pub fn from_ordered_states(
+        mut states: Vec<BlockState>,
+        defaults: BTreeMap<String, i64>,
+    ) -> io::Result<Self> {
         if states.is_empty() || states.len() > i32::MAX as usize {
             return Err(invalid("invalid registry size"));
         }
-        let mut result = Self {
-            states: Vec::with_capacity(states.len()),
-            ids: HashMap::with_capacity(states.len()),
-            collided: BTreeMap::new(),
-            defaults: BTreeMap::new(),
-        };
-        for (i, state) in states.into_iter().enumerate() {
-            if result.id(&state).is_some() {
-                return Err(invalid("duplicate block registry state"));
+        {
+            let mut property_maps = HashSet::new();
+            let mut property_strings = HashSet::new();
+            for state in &mut states {
+                state
+                    .properties
+                    .intern(&mut property_maps, &mut property_strings);
             }
-            match result.ids.entry(state_key(&state)) {
+        }
+        let mut ids: HashMap<u64, u32> = HashMap::with_capacity(states.len());
+        let mut collided: BTreeMap<BlockState, BlockStateId> = BTreeMap::new();
+        for (i, state) in states.iter().enumerate() {
+            let key = state_key(state);
+            match ids.entry(key) {
                 std::collections::hash_map::Entry::Vacant(slot) => {
                     slot.insert(i as u32);
                 }
-                std::collections::hash_map::Entry::Occupied(_) => {
-                    result
-                        .collided
-                        .insert(state.clone(), BlockStateId(i as u32));
+                std::collections::hash_map::Entry::Occupied(slot) => {
+                    if states[*slot.get() as usize] == *state || collided.contains_key(state) {
+                        return Err(invalid("duplicate block registry state"));
+                    }
+                    collided.insert(state.clone(), BlockStateId(i as u32));
                 }
             }
-            result.states.push(state);
         }
+        states.shrink_to_fit();
+        let mut result = Self {
+            states,
+            ids,
+            collided,
+            defaults: BTreeMap::new(),
+            cache_identity: std::sync::OnceLock::new(),
+        };
         for (name, id) in defaults {
             if id < 0
                 || id > i64::from(i32::MAX)
@@ -147,6 +186,11 @@ impl BlockRegistry {
     }
     pub fn default_state(&self, name: &str) -> Option<BlockStateId> {
         self.defaults.get(name).copied()
+    }
+    /// Stable digest of the complete state identity list, computed once for
+    /// derived resource caches. Defaults are deliberately not part of it.
+    pub fn cache_identity(&self) -> &[u8; 32] {
+        table_cache::identity(self)
     }
 
     /// The values `property` takes on `block`, in `Property.getPossibleValues`
@@ -261,8 +305,18 @@ pub struct BlockTableFile<'r> {
 impl<'r> BlockTableFile<'r> {
     /// [`Self::read`] of the file at `path`.
     pub fn open(path: &std::path::Path, registry: &'r BlockRegistry) -> io::Result<Self> {
+        let cache = table_cache::cache(path, registry);
+        if let Some(tag) = cache.as_ref().and_then(table_cache::read) {
+            return Ok(Self { tag, registry });
+        }
         let bytes = std::fs::read(path)?;
-        Self::read(&bytes, registry).map_err(|e| invalid(format!("{}: {e}", path.display())))
+        let file = Self::read(&bytes, registry)
+            .map_err(|e| invalid(format!("{}: {e}", path.display())))?;
+        drop(bytes);
+        if let Some(cache) = cache {
+            table_cache::write(&cache, &file.tag);
+        }
+        Ok(file)
     }
     /// Reads `bytes`, checking every `states` list of the root compound and
     /// of the compounds directly under it against `registry`.

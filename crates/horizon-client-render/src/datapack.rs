@@ -3,6 +3,7 @@
 //! line continuation), function tags and predicates.
 use crate::zip::Zip;
 use horizon_world::{
+    content_view,
     nbt::Tag,
     worldgen::overrides::{self, PackFile, WorldgenOverrides},
 };
@@ -45,10 +46,10 @@ impl DataPack {
         let Source::Dir(root) = &self.source else {
             return self.list("data/");
         };
-        let Ok(entries) = std::fs::read_dir(root.join("data")) else {
+        let Ok(entries) = content_view::read_dir(root.join("data")) else {
             return Vec::new();
         };
-        let mut namespaces: Vec<_> = entries.flatten().map(|e| e.path()).collect();
+        let mut namespaces: Vec<_> = entries.into_iter().map(|e| e.path()).collect();
         namespaces.sort();
         let mut out = Vec::new();
         for ns in namespaces {
@@ -61,7 +62,7 @@ impl DataPack {
     fn read(&self, path: &str) -> Option<Vec<u8>> {
         match &self.source {
             Source::Zip(z) => z.read(path).ok(),
-            Source::Dir(root) => std::fs::read(root.join(path)).ok(),
+            Source::Dir(root) => content_view::read(root.join(path)).ok(),
         }
     }
     /// The `description` of `pack.mcmeta`, as text.
@@ -77,14 +78,13 @@ impl DataPack {
     }
 }
 fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
+    let Ok(mut entries) = content_view::read_dir(dir) else {
         return;
     };
-    let mut entries: Vec<_> = entries.flatten().collect();
-    entries.sort_by_key(std::fs::DirEntry::file_name);
+    entries.sort_by_key(content_view::DirEntry::file_name);
     for e in entries {
         let p = e.path();
-        if p.is_dir() {
+        if e.is_dir() {
             walk(root, &p, out);
         } else if let Ok(rel) = p.strip_prefix(root) {
             out.push(rel.to_string_lossy().replace('\\', "/"));

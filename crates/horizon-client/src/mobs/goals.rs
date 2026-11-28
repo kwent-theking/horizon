@@ -21,7 +21,9 @@ pub struct Cx<'a, 'w> {
     pub lr: &'a mut LegacyRandom,
     pub events: &'a mut Vec<MobEvent>,
 }
-pub trait Goal: std::fmt::Debug {
+// Goals own their state. These safe bounds let render workers borrow a Mob;
+// AI mutation and random draws still happen serially through &mut Mob.
+pub trait Goal: std::fmt::Debug + Send + Sync {
     fn flags(&self) -> u8;
     fn can_use(&mut self, m: &mut Mob, cx: &mut Cx) -> bool;
     fn can_continue(&mut self, m: &mut Mob, cx: &mut Cx) -> bool {
@@ -45,6 +47,20 @@ pub trait Goal: std::fmt::Debug {
             .unwrap_or("Goal")
     }
 }
+
+#[cfg(test)]
+mod parallel_render_bounds_tests {
+    use crate::mobs::{Mob, MobData};
+
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    #[test]
+    fn mob_render_inputs_are_safe_to_share_between_workers() {
+        assert_send_sync::<Mob>();
+        assert_send_sync::<MobData>();
+    }
+}
+
 impl Clone for Box<dyn Goal> {
     fn clone(&self) -> Self {
         self.box_clone()

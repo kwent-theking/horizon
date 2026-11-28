@@ -551,15 +551,15 @@ impl Game<'_> {
             _ => [0, 1, 0],
         };
         let centre = |c: i32, f: i32| f64::from(c) + 0.5 + f64::from(f) * 0.5;
-        self.forced_hit = Some(super::Hit {
-            pos: [pos.x, pos.y, pos.z],
+        self.forced_hit = Some(super::Hit::world(
+            [pos.x, pos.y, pos.z],
             face,
-            point: [
+            [
                 centre(pos.x, face[0]),
                 centre(pos.y, face[1]),
                 centre(pos.z, face[2]),
             ],
-        });
+        ));
         self.chat_capture = Some(Vec::new());
         let used = self.use_item_as_player();
         self.forced_hit = None;

@@ -11,7 +11,7 @@ use std::{
 
 fn digest(render: &RenderAssets) -> u64 {
     let mut h = DefaultHasher::new();
-    render.pixels.hash(&mut h);
+    render.decode_pixels().hash(&mut h);
     (
         render.sprite_size,
         render.sprite_minimum_size,
@@ -22,6 +22,7 @@ fn digest(render: &RenderAssets) -> u64 {
     render.translucent_layers.hash(&mut h);
     format!("{:?}", render.sprite_mips).hash(&mut h);
     for animation in &render.animations {
+        let animation = animation.decode();
         animation.layer.hash(&mut h);
         for frame in 0..animation.frame_count() {
             animation.pixels(frame).hash(&mut h);

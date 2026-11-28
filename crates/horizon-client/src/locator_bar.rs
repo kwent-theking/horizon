@@ -10,6 +10,7 @@ use horizon_core::geometry::trig;
 use horizon_protocol::packets::play::{
     TrackedWaypoint, WaypointId, WaypointTarget, waypoint_operation,
 };
+use horizon_world::content_view;
 use std::{borrow::Cow, collections::HashMap, fs, path::Path};
 
 /// `WaypointStyle`: the sprites (under `hud/locator_bar_dot/`) from near to far.
@@ -90,13 +91,13 @@ pub struct SpriteFrames {
 impl SpriteFrames {
     /// None for a still sprite or invalid metadata.
     fn load(png: &Path) -> Option<Self> {
-        let text = fs::read_to_string(png.with_extension("png.mcmeta")).ok()?;
+        let text = content_view::read_to_string(png.with_extension("png.mcmeta")).ok()?;
         let meta: HashMap<String, Box<serde_json::value::RawValue>> =
             serde_json::from_str(&text).ok()?;
         let animation = AnimationMetadata::from_json(meta.get("animation")?.get()).ok()?;
         // The PNG header: width and height at bytes 16..24 of IHDR.
         let mut header = [0u8; 24];
-        std::io::Read::read_exact(&mut fs::File::open(png).ok()?, &mut header).ok()?;
+        std::io::Read::read_exact(&mut content_view::open(png).ok()?, &mut header).ok()?;
         let dim = |at: usize| i32::from_be_bytes(header[at..at + 4].try_into().unwrap_or_default());
         let image = [dim(16), dim(20)];
         let frame = animation.frame_size(image[0], image[1]);
@@ -131,9 +132,8 @@ impl WaypointStyles {
     pub fn load(root: &Path) -> Self {
         let mut frames = HashMap::new();
         let hud = root.join("assets/minecraft/textures/gui/sprites/hud");
-        let dots = fs::read_dir(hud.join("locator_bar_dot"))
+        let dots = content_view::read_dir(hud.join("locator_bar_dot"))
             .into_iter()
-            .flatten()
             .flatten()
             .map(|e| e.path());
         let arrows = ["locator_bar_arrow_up", "locator_bar_arrow_down"]

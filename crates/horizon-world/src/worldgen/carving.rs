@@ -26,11 +26,11 @@ impl CarvingBlocks {
         registry: &BlockRegistry,
         uncarvable: &BTreeSet<String>,
     ) -> Result<Self, TerrainError> {
-        for name in uncarvable.iter().map(String::as_str).chain([
+        for name in [
             "minecraft:grass_block",
             "minecraft:mycelium",
             "minecraft:dirt",
-        ]) {
+        ] {
             if registry.default_state(name).is_none() {
                 return Err(TerrainError::InvalidState);
             }

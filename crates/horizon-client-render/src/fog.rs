@@ -8,6 +8,7 @@ use crate::{
     environment::Sky,
     world::World,
 };
+use horizon_world::content_view;
 use std::path::Path;
 
 /// `FogType` of the camera position.
@@ -44,7 +45,7 @@ impl FogTables {
                 "data/minecraft/worldgen/biome/{}.json",
                 name.trim_start_matches("minecraft:")
             ));
-            let Ok(bytes) = std::fs::read(path) else {
+            let Ok(bytes) = content_view::read(path) else {
                 continue;
             };
             let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) else {

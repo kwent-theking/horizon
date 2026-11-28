@@ -5,7 +5,7 @@
 //! light (`ARGB.meanLinear`).
 
 /// `MipmapStrategy`, from the texture's `.mcmeta` `texture` section.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Strategy {
     #[default]
     Auto,
@@ -29,7 +29,7 @@ impl Strategy {
 
 /// How a sprite's mips are made: its `.mcmeta` `texture` section, whether
 /// it has a fully transparent pixel and whether it is an `item/` sprite.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Settings {
     /// Original square frame edge, before fitting the sprite into the array.
     /// Zero means the supplied image is already at its native size.

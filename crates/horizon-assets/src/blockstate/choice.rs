@@ -3,7 +3,7 @@ use super::{BlockStateDefinition, Variant, VariantSet, bind::SelectedModels};
 use crate::json::{Result, error};
 use horizon_core::random::RandomSource;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 enum Choice<T> {
     Single(T),
     Weighted {
@@ -77,7 +77,7 @@ impl<T> Choice<T> {
 /// Compile once per definition and share across its bound block states. Prefix
 /// sums avoid rebuilding weight totals or scanning all entries during selection.
 /// `map` swaps each variant for what it stands for (its baked model).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct CompiledChoices<T = Variant> {
     variants: Vec<Choice<T>>,
     multipart: Vec<Choice<T>>,
@@ -101,6 +101,39 @@ impl CompiledChoices {
     }
 }
 impl<T> CompiledChoices<T> {
+    /// Validate disk snapshot indexes and weighted-prefix invariants before use.
+    pub fn valid(&self, valid: impl Fn(&T) -> bool) -> bool {
+        self.variants
+            .iter()
+            .chain(&self.multipart)
+            .all(|choice| match choice {
+                Choice::Single(value) => valid(value),
+                Choice::Weighted {
+                    variants,
+                    ends,
+                    total,
+                } => {
+                    !variants.is_empty()
+                        && variants.len() == ends.len()
+                        && variants.iter().all(&valid)
+                        && *total > 0
+                        && ends.first().is_some_and(|v| *v > 0)
+                        && ends.windows(2).all(|v| v[0] < v[1])
+                        && ends.last() == Some(total)
+                }
+            })
+    }
+    pub fn valid_selection(&self, selected: &SelectedModels) -> bool {
+        match selected {
+            SelectedModels::Variant(index) => *index < self.variants.len(),
+            SelectedModels::Multipart(indices) => self.valid_multipart(indices),
+        }
+    }
+    /// Whether every index of a multipart selection names a part.
+    pub fn valid_multipart(&self, indices: &[usize]) -> bool {
+        indices.iter().all(|i| *i < self.multipart.len())
+    }
+
     /// The same choices, with `f` of each variant in its place.
     pub fn map<U>(&self, mut f: impl FnMut(&T) -> U) -> CompiledChoices<U> {
         CompiledChoices {
@@ -147,16 +180,24 @@ impl<T> CompiledChoices<T> {
                     .ok_or_else(|| error("invalid variant selection"))?;
                 f(choice.select(random));
             }
-            SelectedModels::Multipart(indices) => {
-                if indices.iter().any(|index| *index >= self.multipart.len()) {
-                    return Err(error("invalid multipart selection"));
-                }
-                let seed = random.next_long();
-                for index in indices {
-                    random.set_seed(seed);
-                    f(self.multipart[*index].select(random));
-                }
-            }
+            SelectedModels::Multipart(indices) => self.for_each_multipart(indices, random, f)?,
+        }
+        Ok(())
+    }
+    /// [`for_each`](Self::for_each) of a multipart selection, borrowed.
+    pub fn for_each_multipart<'a>(
+        &'a self,
+        indices: &[usize],
+        random: &mut impl RandomSource,
+        mut f: impl FnMut(&'a T),
+    ) -> Result<()> {
+        if !self.valid_multipart(indices) {
+            return Err(error("invalid multipart selection"));
+        }
+        let seed = random.next_long();
+        for index in indices {
+            random.set_seed(seed);
+            f(self.multipart[*index].select(random));
         }
         Ok(())
     }

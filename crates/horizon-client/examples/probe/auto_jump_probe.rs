@@ -101,6 +101,7 @@ pub fn main() -> Result<()> {
         player.auto_jump_enabled = p["enabled"].as_bool().unwrap();
         player.auto_jump_time = p["time"].as_i64().unwrap() as i32;
         MotionWorld {
+            decks: None,
             entities: &[],
             player: &mut player,
             scene: &mut scene,
