@@ -16,7 +16,7 @@
 //! changed level is copied into its layer.
 use super::upload::Uploads;
 use crate::mipmap::Settings;
-use crate::sprites::{FrameBlend, SpriteAnimation};
+use crate::sprites::{FrameBlend, SpriteAnimation, SpriteTiming};
 use wgpu::util::DeviceExt;
 
 /// Bytes of `animate.wgsl`'s `Job`.
@@ -25,7 +25,7 @@ const JOB_BYTES: usize = 20;
 const WORKGROUP: u32 = 8;
 
 struct Sprite {
-    animation: SpriteAnimation,
+    animation: SpriteTiming,
     /// What its layer shows (`None`: the frame the array was created with,
     /// rewritten on the first tick).
     shown: Option<FrameBlend>,
@@ -87,6 +87,53 @@ impl SpriteAnimator {
         split: u32,
         compute: bool,
     ) -> Self {
+        Self::new_from_iter(
+            device,
+            None,
+            animations.iter().map(std::borrow::Cow::Borrowed),
+            size,
+            settings,
+            textures,
+            split,
+            compute,
+        )
+    }
+
+    pub(crate) fn new_packed(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        animations: &[crate::sprites::PackedSpriteAnimation],
+        size: u32,
+        settings: &[Settings],
+        textures: &[wgpu::Texture],
+        split: u32,
+        compute: bool,
+    ) -> Self {
+        Self::new_from_iter(
+            device,
+            Some(queue),
+            animations
+                .iter()
+                .map(|packed| std::borrow::Cow::Owned(packed.decode())),
+            size,
+            settings,
+            textures,
+            split,
+            compute,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_from_iter<'a>(
+        device: &wgpu::Device,
+        queue: Option<&wgpu::Queue>,
+        animations: impl IntoIterator<Item = std::borrow::Cow<'a, SpriteAnimation>>,
+        size: u32,
+        settings: &[Settings],
+        textures: &[wgpu::Texture],
+        split: u32,
+        compute: bool,
+    ) -> Self {
         let pipeline = if compute { pipeline(device) } else { None };
         let limits = device.limits();
         let limit = if pipeline.is_some() {
@@ -101,7 +148,7 @@ impl SpriteAnimator {
         // Each group's sprite array and frames buffer.
         let mut keys: Vec<(u32, usize)> = Vec::new();
         let mut counts: Vec<usize> = Vec::new();
-        let mut sprites = Vec::with_capacity(animations.len());
+        let mut sprites = Vec::new();
         for animation in animations {
             let pixels: Vec<_> = (0..animation.frame_count())
                 .map(|frame| animation.pixels(frame))
@@ -139,7 +186,7 @@ impl SpriteAnimator {
             });
             counts[group] += 1;
             sprites.push(Sprite {
-                animation: animation.clone(),
+                animation: animation.timing(),
                 shown: None,
                 layer: animation.layer % split,
                 frames: offsets,
@@ -171,13 +218,19 @@ impl SpriteAnimator {
             };
         };
         let frames: Vec<_> = frames
-            .iter()
+            .into_iter()
             .map(|data| {
-                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                let buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("Animated sprite frames"),
-                    contents: data,
+                    contents: &data,
                     usage: wgpu::BufferUsages::STORAGE,
-                })
+                });
+                drop(data);
+                if let Some(queue) = queue {
+                    queue.submit([]);
+                    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+                }
+                buf
             })
             .collect();
         let align = u64::from(limits.min_storage_buffer_offset_alignment);
@@ -859,5 +912,38 @@ mod tests {
         // but layer 1 at tick 30 (two 9-tick loops after 12), layer 3 when
         // its frame turns over (every 2 ticks, but 12 shows 7's frame).
         assert_eq!(writes, [3, 0, 2, 3, 2, 3, 3, 0, 2, 1]);
+
+        let packed: Vec<_> = animations
+            .iter()
+            .cloned()
+            .map(crate::sprites::PackedSpriteAnimation::new)
+            .collect();
+        let mut packed_animator = SpriteAnimator::new_packed(
+            &device, &queue, &packed, size, &mips, &textures, split, compute,
+        );
+        assert_eq!(packed_animator.sprites.len(), animator.sprites.len());
+        let mut encoder = device.create_command_encoder(&Default::default());
+        packed_animator.animate(&mut encoder, &mut uploads, 12);
+        uploads.finish(&encoder);
+        queue.submit([encoder.finish()]);
+        for animation in &animations {
+            let blend = animation.blend(12);
+            let pixels: Vec<_> = (0..animation.frame_count())
+                .map(|f| animation.pixels(f))
+                .collect();
+            let (chains, edge) = source_chains(&pixels, size, &mips, animation.layer);
+            let (current, next) = (&chains[blend.frame], &chains[blend.next]);
+            let layers = read_back(
+                &device,
+                &queue,
+                &textures[(animation.layer / split) as usize],
+            );
+            assert_eq!(
+                layers[(animation.layer % split) as usize],
+                reference(current, next, blend.millis, edge, size),
+                "packed layer {} at tick 12",
+                animation.layer
+            );
+        }
     }
 }

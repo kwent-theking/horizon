@@ -36,6 +36,25 @@ impl Game<'_> {
         block_entity_nbt::canonical(&tag)
     }
 
+    /// Pick Block into the inventory. A server only hears the carried slot,
+    /// so outside creative it may only select a stack already in the hotbar.
+    pub(super) fn pick_into_inventory(&mut self, stack: &ItemStack) {
+        if self.remote.is_some() && !self.creative {
+            horizon_client::pick_item::pick_hotbar(
+                &self.inventory[..36],
+                &mut self.selected,
+                stack,
+            );
+            return;
+        }
+        horizon_client::pick_item::pick(
+            &mut self.inventory[..36],
+            &mut self.selected,
+            stack,
+            self.creative,
+        );
+    }
+
     /// `BlockState.getCloneItemStack` of the block at `pos`, then, with
     /// `include_data`, `ServerGamePacketListenerImpl.addBlockDataToItem`.
     pub(super) fn picked_stack(&self, pos: [i32; 3], include_data: bool) -> Option<ItemStack> {

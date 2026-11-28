@@ -135,12 +135,12 @@ impl Mesher {
                     || models
                         .iter()
                         .flatten()
-                        .flat_map(|(_, model)| &model.faces)
+                        .flat_map(|(_, model)| model.faces.iter())
                         .any(|face| !face.translucent);
                 let mut matching = models
                     .iter()
                     .flatten()
-                    .flat_map(|(_, model)| &model.faces)
+                    .flat_map(|(_, model)| model.faces.iter())
                     .filter(|face| face.quad.facing == direction);
                 let mut faces = [None; 2];
                 for slot in &mut faces {

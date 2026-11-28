@@ -23,6 +23,13 @@ use std::{
     path::Path,
 };
 
+mod cbc;
+pub(crate) use cbc::gradient_sprites as cbc_gradient_sprites;
+pub use cbc::{CbcImpact, CbcParticle, CbcShard};
+
+/// Resolves a block's particle material and tint at a scattered CBC fragment.
+pub type CbcBlockSprite<'a> =
+    dyn Fn(horizon_world::registry::BlockStateId, [i32; 3]) -> Option<(String, u32)> + 'a;
 pub use horizon_client_core::particle_type::ParticleType;
 pub use horizon_items::firework::{DYE_FIREWORK_COLORS, FireworkExplosion, FireworkShape};
 
@@ -47,18 +54,39 @@ pub struct ParticleOptions {
     /// `GeyserParticleOptions.waterBlocks` and `GeyserBaseParticleOptions`'
     /// `waterBlocks` and `burstImpulseBase` (0 where the type has none).
     pub geyser: Option<(i32, f32)>,
+    /// A content mod's particle (`ns:name`): drawn from its own sprite set as
+    /// a generic particle, `ty` only picking the layer.
+    pub modded: Option<String>,
+    /// A Create Big Cannons particle ported with its own behaviour.
+    pub cbc: Option<CbcParticle>,
 }
 impl ParticleOptions {
     pub fn simple(ty: ParticleType) -> Self {
         Self {
             ty,
             block: None,
+            modded: None,
             color: [1.0; 4],
             scale: 1.0,
             to_color: [1.0, 0.0, 0.0],
             trail: None,
             item: None,
             geyser: None,
+            cbc: None,
+        }
+    }
+    /// A Create Big Cannons particle.
+    pub fn cbc(particle: CbcParticle) -> Self {
+        Self {
+            cbc: Some(particle),
+            ..Self::simple(ParticleType::Poof)
+        }
+    }
+    /// A content mod's particle by registry name.
+    pub fn modded(name: &str) -> Self {
+        Self {
+            modded: Some(name.to_owned()),
+            ..Self::simple(ParticleType::Poof)
         }
     }
     /// `GeyserParticleOptions(type, waterBlocks)`.
@@ -171,6 +199,9 @@ enum Size {
     Shriek,
     /// `FireworkParticles.OverlayParticle.getQuadSize`: a sine pulse.
     Flash,
+    /// `CannonSmokeParticle.getQuadSize`.
+    CbcCannonSmoke,
+    CbcShellExplosionSmoke,
 }
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Light {
@@ -184,6 +215,11 @@ enum Light {
     AgeEmission4,
     /// `FireflyParticle.getLightCoords`: block light fading in and out, no sky.
     Firefly,
+    /// `CannonSmokeParticle.getLightColor`.
+    CbcCannonSmoke,
+    CbcShellExplosionSmoke,
+    CbcSpark,
+    CbcSpray(f32),
 }
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Behaviour {
@@ -317,6 +353,63 @@ enum Behaviour {
         start: [f64; 3],
         colors: [u32; 2],
     },
+    /// CBC `BigCannonPlumeParticle`: smoke, clouds and flames along the shot.
+    CbcBigCannonPlume {
+        direction: [f64; 3],
+        size: f32,
+        power: f32,
+    },
+    /// CBC `AutocannonPlumeParticle`.
+    CbcAutocannonPlume {
+        direction: [f64; 3],
+        scale: f32,
+        visible: bool,
+    },
+    /// CBC `DropMortarPlumeParticle`.
+    CbcDropMortarPlume {
+        direction: [f64; 3],
+        scale: f32,
+        visible: bool,
+    },
+    /// CBC `CannonSmokeParticle`: drifting with the wind it was made in.
+    CbcCannonSmoke {
+        wind: [f64; 3],
+    },
+    /// CBC `ShellExplosionCloudParticle`: replays its trails from the constructor's seed.
+    CbcShellExplosionCloud {
+        power: f32,
+        plume: bool,
+        seed: i64,
+        trail_level: u8,
+    },
+    /// CBC `ShellExplosionSmokeParticle`.
+    CbcShellExplosionSmoke {
+        wind: [f64; 3],
+    },
+    CbcFragmentCloud {
+        flak: bool,
+        seed: i64,
+        trails: i32,
+    },
+    CbcBreechSmoke {
+        direction: [f64; 3],
+    },
+    CbcEmitterSmoke {
+        wind: [f64; 3],
+        max_size: f32,
+        growth: f32,
+        gas: bool,
+    },
+    /// CBC `TrailSmokeParticle`: a shell's trail.
+    CbcTrailSmoke,
+    CbcImpactEmitter(CbcImpact),
+    CbcSpark,
+    CbcShard {
+        yaw: f32,
+        pitch: f32,
+        mask: u32,
+    },
+    CbcSpray,
 }
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum DripStage {
@@ -366,6 +459,8 @@ pub struct Particle {
     pre_tick: bool,
     /// `Particle.random`: the particle's own generator (`RandomSource.create()`).
     random: LegacyRandom,
+    /// A render type's own layer over the particle type's.
+    translucent: Option<bool>,
 }
 fn aabb_at(p: [f64; 3], w: f32, h: f32) -> Aabb {
     let w = f64::from(w) / 2.0;
@@ -703,6 +798,7 @@ impl Particle {
             no_render: false,
             pre_tick: false,
             random: LegacyRandom::new(0),
+            translucent: None,
         }
     }
     /// `Particle(level, x, y, z, xa, ya, za)`: jittered, normalized initial velocity.
@@ -876,6 +972,16 @@ impl Particle {
                 let b = (b * b) * (b * b);
                 (sky, (block + (b.clamp(0.0, 1.0) * 240.0) as u32).min(240))
             }
+            Light::CbcCannonSmoke => (sky, self.cbc_smoke_block_light(partial, block, 1.5)),
+            Light::CbcShellExplosionSmoke => (sky, self.cbc_smoke_block_light(partial, block, 4.0)),
+            Light::CbcSpark => (
+                sky,
+                (block + ((1.0 - t).powi(4).max(0.75) * 240.0) as u32).min(240),
+            ),
+            Light::CbcSpray(light) => (
+                sky,
+                (block + ((1.0 - t).powi(2).max(0.5) * 240.0 * light) as u32).min(240),
+            ),
             Light::Firefly => (
                 0,
                 (255.0 * fade_amount(self.lifetime_progress(self.age as f32 + partial), 0.1, 0.3))
@@ -898,6 +1004,8 @@ impl Particle {
                 self.size * (1.0 - (self.age as f32 + a) / (self.lifetime as f32 * 1.5))
             }
             Size::Shriek => self.size * (t * 0.75).clamp(0.0, 1.0),
+            Size::CbcCannonSmoke => self.cbc_smoke_size(a),
+            Size::CbcShellExplosionSmoke => self.shell_explosion_smoke_size(a),
             Size::Flash => {
                 7.1 * trig::sin(f64::from(
                     (self.age as f32 + a - 1.0) * 0.25 * std::f64::consts::PI as f32,
@@ -1032,6 +1140,66 @@ impl ParticleLevel<'_> {
     }
 }
 
+/// Position-cell and tick-level light cache for particle rendering throttled to 20 Hz tick rate.
+/// Caches world light lookups by block coordinate `[x, y, z]` for a given tick / `game_time`,
+/// deduplicating queries across multiple particles in the same block and throttling
+/// light sampling to 20 Hz instead of per-frame.
+#[derive(Debug, Default)]
+pub struct ParticleLightCache {
+    tick: std::cell::Cell<u64>,
+    cache: std::cell::RefCell<HashMap<[i32; 3], u8>>,
+}
+
+impl ParticleLightCache {
+    pub fn new() -> Self {
+        Self {
+            tick: std::cell::Cell::new(u64::MAX),
+            cache: std::cell::RefCell::new(HashMap::new()),
+        }
+    }
+
+    /// Queries the packed light at `block`, using the cached value if `game_time == self.tick`,
+    /// or calling `sample(block)` and caching the result.
+    pub fn light_at(
+        &self,
+        game_time: u64,
+        block: [i32; 3],
+        sample: impl FnOnce([i32; 3]) -> u8,
+    ) -> u8 {
+        if self.tick.get() != game_time {
+            self.tick.set(game_time);
+            let mut cache = self.cache.borrow_mut();
+            cache.clear();
+            let lit = sample(block);
+            cache.insert(block, lit);
+            return lit;
+        }
+        let mut cache = self.cache.borrow_mut();
+        if let Some(&lit) = cache.get(&block) {
+            lit
+        } else {
+            let lit = sample(block);
+            cache.insert(block, lit);
+            lit
+        }
+    }
+
+    /// Explicitly clears cached entries (e.g. on teleport, dimension change, or pack reload).
+    pub fn clear(&self) {
+        self.tick.set(u64::MAX);
+        self.cache.borrow_mut().clear();
+    }
+
+    /// Number of distinct block cells cached for the current tick.
+    pub fn len(&self) -> usize {
+        self.cache.borrow().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.cache.borrow().is_empty()
+    }
+}
+
 /// `ParticleEngine` plus the sprite sets of `ParticleResources`.
 pub struct ParticleEngine {
     particles: Vec<Particle>,
@@ -1054,6 +1222,8 @@ pub struct ParticleEngine {
     atlas: HashMap<String, (Rect, bool)>,
     sets: HashMap<ParticleType, u32>,
     set_sprites: Vec<Vec<u32>>,
+    /// Content mods' particle types (`ns:name`) to their sprite set.
+    modded_sets: HashMap<String, u32>,
     /// `TrackingEmitter`s: particle type, entity feet position, width, height, ticks left.
     emitters: Vec<(ParticleOptions, [f64; 3], f64, f64, u32)>,
     /// Camera position for the 32-block spawn limiter.
@@ -1069,6 +1239,16 @@ pub struct ParticleEngine {
     /// The item particles' sprites (`BreakingItemParticle`'s slime ball, snowball
     /// and cobweb models, resolved for the ground), one per model layer.
     pub item_sprites: HashMap<ParticleType, Vec<String>>,
+    /// Scratch buffer reused across frames to avoid reallocating the parallel input list.
+    render_scratch: Vec<(usize, Rect, bool, u8)>,
+    /// Incremented on each 20 Hz tick to throttle particle light sampling.
+    pub tick_count: u64,
+    /// Position-cell and tick-level light cache for particle rendering.
+    pub light_cache: ParticleLightCache,
+    /// CBC's `ParticleWindHandler`.
+    cbc_wind: cbc::Wind,
+    /// CBC cannon smoke's sprite set per gradient row (cannon power).
+    cbc_smoke_sets: Vec<u32>,
 }
 /// `ParticleGroup.MAX_PARTICLES` (per render group; one group here).
 const MAX_PARTICLES: usize = 16384;
@@ -1087,6 +1267,7 @@ impl ParticleEngine {
             atlas: HashMap::new(),
             sets: HashMap::new(),
             set_sprites: Vec::new(),
+            modded_sets: HashMap::new(),
             emitters: Vec::new(),
             starters: Vec::new(),
             camera: [0.0; 3],
@@ -1094,6 +1275,11 @@ impl ParticleEngine {
             sounds: Vec::new(),
             made: Default::default(),
             item_sprites: HashMap::new(),
+            render_scratch: Vec::new(),
+            tick_count: 0,
+            light_cache: ParticleLightCache::new(),
+            cbc_wind: cbc::Wind::new(),
+            cbc_smoke_sets: Vec::new(),
         };
         engine.reload(root, atlas, translucent);
         engine
@@ -1116,8 +1302,14 @@ impl ParticleEngine {
             .iter()
             .map(|name| self.atlas.get(name).map(|&(rect, _)| rect))
             .collect();
+        for p in self.particles.iter_mut().chain(&mut self.pending) {
+            if let Behaviour::CbcShard { mask, .. } = p.behaviour {
+                p.uv = self.rects[mask as usize].map_or([0.0; 4], |r| [r.u0, r.v0, r.u1, r.v1]);
+            }
+        }
         self.sets.clear();
         self.set_sprites.clear();
+        self.modded_sets.clear();
         self.item_sprites.clear();
         self.load_sprites(root);
     }
@@ -1147,6 +1339,51 @@ impl ParticleEngine {
                 self.set_sprites.push(sprites);
             }
         }
+        self.load_modded_sprites(root);
+    }
+    /// The sprite sets of content mods' particle definitions; only sprites the
+    /// atlas holds count, and a type with none is left out (it falls back).
+    fn load_modded_sprites(&mut self, root: &Path) {
+        for definition in crate::particle_defs::scan(root) {
+            // A vanilla texture a mod reuses (`minecraft:big_smoke_0`) sits in
+            // the atlas as vanilla's own sprites do, without its namespace.
+            let known: Vec<String> = definition
+                .sprites
+                .iter()
+                .filter_map(|s| {
+                    if self.atlas.contains_key(s.as_str()) {
+                        return Some(s.clone());
+                    }
+                    s.strip_prefix("minecraft:")
+                        .filter(|vanilla| self.atlas.contains_key(*vanilla))
+                        .map(str::to_owned)
+                })
+                .collect();
+            let sprites: Vec<u32> = known.iter().map(|s| self.intern(s)).collect();
+            if !sprites.is_empty() {
+                self.modded_sets
+                    .insert(definition.name, self.set_sprites.len() as u32);
+                self.set_sprites.push(sprites);
+            }
+        }
+        self.load_cbc_sprites();
+    }
+    /// Whether a content mod's particle type has sprites to draw.
+    pub fn has_modded(&self, name: &str) -> bool {
+        self.modded_sets.contains_key(name)
+    }
+    /// A content mod's particle as vanilla's generic `Particle(x, y, z, xa, ya,
+    /// za)`: default lifetime, size and drift, cycling its sprites with age.
+    fn make_modded(&mut self, name: &str, p: [f64; 3], v: [f64; 3], seed: i64) -> Option<Particle> {
+        let set = *self.modded_sets.get(name)?;
+        let mut local = LegacyRandom::new(seed);
+        let mut q = Particle::moving(&mut local, ParticleType::Poof, p, v);
+        q.set = Some(set);
+        q.sprite = Sprite::Index(self.set_sprites[set as usize][0]);
+        q.behaviour = Behaviour::Animated;
+        self.sprite_from_age(&mut q);
+        q.random = local;
+        Some(q)
     }
     fn intern(&mut self, name: &str) -> u32 {
         if let Some(i) = self.names.iter().position(|n| n == name) {
@@ -1166,6 +1403,14 @@ impl ParticleEngine {
         self.emitters.clear();
         self.particles.clear();
         self.pending.clear();
+        self.light_cache.clear();
+        // CBCClientCommon.onLoadClientLevel: each level blows its own wind.
+        let seed = self.level_random.next_long();
+        self.cbc_wind.refresh(seed);
+    }
+    /// Clears the cached 20 Hz particle light entries explicitly.
+    pub fn clear_light_cache(&mut self) {
+        self.light_cache.clear();
     }
     /// A vibration signal flying from `from` to `to` in `ticks`
     /// (`VibrationParticleOption`).
@@ -1506,14 +1751,14 @@ impl ParticleEngine {
         let mut particle = self.make(options, p, v, seed)?;
         if particle.pre_tick {
             particle.pre_tick = false;
-            self.tick_particle(&mut particle, level);
+            self.tick_particle(&mut particle, level, None);
             particle.after_constructor_tick();
         }
         Some(particle)
     }
     /// Parity probes: `Particle.tick`.
     pub fn probe_tick(&mut self, particle: &mut Particle, level: &ParticleLevel) {
-        self.tick_particle(particle, level);
+        self.tick_particle(particle, level, None);
     }
     /// Parity probes: the state vanilla's particle fields hold.
     pub fn snapshot(&self, p: &Particle) -> ParticleSnapshot {
@@ -1593,6 +1838,15 @@ impl ParticleEngine {
         seed: i64,
     ) -> Option<Particle> {
         use ParticleType as T;
+        if let Some(cbc) = o.cbc {
+            return match cbc {
+                CbcParticle::Impact(impact) => self.make_cbc_impact(impact, o, p, v, seed),
+                _ => self.make_cbc(cbc, p, v, seed),
+            };
+        }
+        if let Some(name) = &o.modded {
+            return self.make_modded(name, p, v, seed);
+        }
         let ty = o.ty;
         let set = self.set_of(ty);
         let mut local = LegacyRandom::new(seed);
@@ -3176,6 +3430,17 @@ impl ParticleEngine {
         }
     }
     pub fn tick(&mut self, level: &ParticleLevel) {
+        self.tick_with_cbc_sprites(level, None);
+    }
+
+    pub fn tick_with_cbc_sprites(
+        &mut self,
+        level: &ParticleLevel,
+        sprite: Option<&CbcBlockSprite<'_>>,
+    ) {
+        self.tick_count = self.tick_count.wrapping_add(1);
+        self.light_cache.clear();
+        self.cbc_wind.update();
         self.tick_starters();
         for (options, feet, width, height, life) in std::mem::take(&mut self.emitters) {
             self.emit(&options, feet, width, height);
@@ -3185,7 +3450,7 @@ impl ParticleEngine {
         }
         let mut particles = std::mem::take(&mut self.particles);
         for p in &mut particles {
-            self.tick_particle(p, level);
+            self.tick_particle(p, level, sprite);
         }
         particles.retain(|p| !p.removed);
         self.particles = particles;
@@ -3193,7 +3458,7 @@ impl ParticleEngine {
         for mut p in pending {
             if p.pre_tick {
                 p.pre_tick = false;
-                self.tick_particle(&mut p, level);
+                self.tick_particle(&mut p, level, sprite);
                 p.after_constructor_tick();
             }
             // ParticleGroup.add: the last quarter fills with decreasing probability.
@@ -3211,8 +3476,31 @@ impl ParticleEngine {
         }
     }
     #[allow(clippy::too_many_lines)]
-    fn tick_particle(&mut self, p: &mut Particle, level: &ParticleLevel) {
+    fn tick_particle(
+        &mut self,
+        p: &mut Particle,
+        level: &ParticleLevel,
+        sprite: Option<&CbcBlockSprite<'_>>,
+    ) {
         match p.behaviour {
+            Behaviour::CbcBigCannonPlume { .. }
+            | Behaviour::CbcAutocannonPlume { .. }
+            | Behaviour::CbcDropMortarPlume { .. }
+            | Behaviour::CbcCannonSmoke { .. }
+            | Behaviour::CbcShellExplosionCloud { .. }
+            | Behaviour::CbcShellExplosionSmoke { .. }
+            | Behaviour::CbcFragmentCloud { .. }
+            | Behaviour::CbcBreechSmoke { .. }
+            | Behaviour::CbcEmitterSmoke { .. }
+            | Behaviour::CbcTrailSmoke => {
+                self.tick_cbc(p, level);
+            }
+            Behaviour::CbcImpactEmitter(_)
+            | Behaviour::CbcSpark
+            | Behaviour::CbcShard { .. }
+            | Behaviour::CbcSpray => {
+                self.tick_cbc_impact(p, level, sprite);
+            }
             Behaviour::Base => p.base_tick(level),
             Behaviour::Animated => {
                 p.base_tick(level);
@@ -3958,7 +4246,7 @@ impl ParticleEngine {
 
     /// Camera-facing quads (`QuadParticleRenderState.renderRotatedQuad`).
     pub fn render(
-        &self,
+        &mut self,
         camera: DVec3,
         yaw: f32,
         pitch: f32,
@@ -3966,148 +4254,364 @@ impl ParticleEngine {
         light_at: &dyn Fn([i32; 3]) -> u8,
         out: &mut Vec<Vertex>,
     ) {
+        let timing = particle_timing_enabled().then(std::time::Instant::now);
         // Camera.setRotation: rotationYXZ(PI - yRot, -xRot, 0).
         let base = Quat::from_rotation_y(std::f32::consts::PI - yaw.to_radians())
             * Quat::from_rotation_x(-pitch.to_radians());
-        for p in &self.particles {
-            if p.no_render {
-                continue;
-            }
-            // SparkParticle.extract: twinkling sparks blink after a third of their life.
-            if let Behaviour::Spark { twinkle: true, .. } = p.behaviour
-                && p.age >= p.lifetime / 3
-                && ((p.age + p.lifetime) / 3) % 2 != 0
-            {
-                continue;
-            }
-            // `SubmitNodeCollection.submitQuadParticleGroup`: the translucent
-            // layer draws after translucent terrain, so a crumb of stained
-            // glass cannot hide the glass behind it (`getLayer`).
-            let (rect, layer) = match &p.sprite {
-                Sprite::Index(i) => (
-                    self.rects.get(*i as usize).copied().flatten(),
-                    p.ty.translucent_layer(),
-                ),
-                Sprite::Named(name) => match self.atlas.get(name) {
-                    Some(&(rect, translucent)) => (Some(rect), translucent),
-                    None => (None, false),
-                },
-            };
-            let Some(r) = rect else { continue };
-            let a = f64::from(partial);
-            let pos = DVec3::new(
-                p.previous[0] + (p.position[0] - p.previous[0]) * a,
-                p.previous[1] + (p.position[1] - p.previous[1]) * a,
-                p.previous[2] + (p.position[2] - p.previous[2]) * a,
-            ) - camera;
-            let center = pos.as_vec3();
-            let rotation = if p.roll != 0.0 {
-                base * Quat::from_rotation_z(p.o_roll + (p.roll - p.o_roll) * partial)
-            } else {
-                base
-            };
-            let size = p.quad_size(partial);
-            let mut alpha = p.rgba[3];
-            // OverlayParticle.extract: the flash fades as it pulses.
-            if p.ty == ParticleType::Flash {
-                alpha = 0.6 - (p.age as f32 + partial - 1.0) * 0.25 * 0.5;
-            }
-            if let Behaviour::FlyTowards { alpha: la, .. } = p.behaviour {
-                alpha = lifetime_alpha(la, p.age, p.lifetime, partial);
-            }
-            let mut rotations = [Some(rotation), None];
-            let mut rgb = [p.rgba[0], p.rgba[1], p.rgba[2]];
-            match p.behaviour {
-                // ShriekParticle.extract: two tilted quads, fading out.
-                Behaviour::Shriek { delay } => {
-                    if delay > 0 {
-                        continue;
-                    }
-                    alpha = 1.0 - ((p.age as f32 + partial) / p.lifetime as f32).clamp(0.0, 1.0);
-                    rotations = [
-                        Some(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_3)),
-                        Some(Quat::from_euler(
-                            glam::EulerRot::YXZ,
-                            -std::f32::consts::PI,
-                            std::f32::consts::FRAC_PI_3,
-                            0.0,
-                        )),
-                    ];
+        if self.particles.len() < 256 {
+            for p in &self.particles {
+                if let Some((p, r, layer, packed)) = render_input(self, p, light_at) {
+                    render_particle(p, r, layer, packed, camera, base, partial, out);
                 }
-                // VibrationSignalParticle.extract: two quads along the flight.
-                Behaviour::Vibration {
-                    rot,
-                    rot_o,
-                    pitch,
-                    pitch_o,
-                    ..
-                } => {
-                    let sway =
-                        ((p.age as f32 + partial - std::f32::consts::TAU) * 0.05).sin() * 2.0;
-                    let lerped_rot = rot_o + (rot - rot_o) * partial;
-                    let lerped_pitch =
-                        pitch_o + (pitch - pitch_o) * partial + std::f32::consts::FRAC_PI_2;
-                    rotations = [
-                        Some(
-                            Quat::from_rotation_y(lerped_rot)
-                                * Quat::from_rotation_x(-lerped_pitch)
-                                * Quat::from_rotation_y(sway),
-                        ),
-                        Some(
-                            Quat::from_rotation_y(-std::f32::consts::PI + lerped_rot)
-                                * Quat::from_rotation_x(lerped_pitch)
-                                * Quat::from_rotation_y(sway),
-                        ),
-                    ];
-                }
-                // DustColorTransitionParticle.lerpColors.
-                Behaviour::Transition { from, to } => {
-                    let t = (p.age as f32 + partial) / (p.lifetime as f32 + 1.0);
-                    rgb = std::array::from_fn(|i| from[i] + (to[i] - from[i]) * t);
-                }
-                _ => {}
             }
-            let block = ParticleLevel::block_at(p.position);
-            let packed = light_at(block);
-            let (sky_light, block_light) = p.light_coords(
-                partial,
-                u32::from(packed >> 4) * 16,
-                u32::from(packed & 15) * 16,
-            );
-            let light = sky_light | block_light << 8;
-            let c = |v: f32| (v.clamp(0.0, 1.0) * 255.0) as u32;
-            let color = c(alpha) << 24 | c(rgb[2]) << 16 | c(rgb[1]) << 8 | c(rgb[0]);
-            let (du, dv) = (r.u1 - r.u0, r.v1 - r.v0);
-            let (u0, v0, u1, v1) = (
-                r.u0 + du * p.uv[0],
-                r.v0 + dv * p.uv[1],
-                r.u0 + du * p.uv[2],
-                r.v0 + dv * p.uv[3],
-            );
-            for rotation in rotations.into_iter().flatten() {
-                for (n, uv) in [
-                    ((1.0, -1.0), [u1, v1]),
-                    ((1.0, 1.0), [u1, v0]),
-                    ((-1.0, 1.0), [u0, v0]),
-                    ((-1.0, -1.0), [u0, v1]),
-                ] {
-                    let v = center + rotation * FVec3::new(n.0, n.1, 0.0) * size;
-                    out.push(Vertex {
-                        normal: [0; 4],
-                        pos: v.to_array(),
-                        uv,
-                        layer: if layer {
-                            crate::gfx::TRANSLUCENT_PARTICLE_OVERLAY
-                        } else {
-                            u32::from(hdr_tier(p.ty)) << 16
-                        },
-                        color,
-                        light,
+            if let Some(started) = timing {
+                record_particle_timing(started, 1, self.particles.len());
+            }
+            return;
+        }
+        let mut inputs = std::mem::take(&mut self.render_scratch);
+        inputs.clear();
+        for (idx, p) in self.particles.iter().enumerate() {
+            if let Some((_, rect, layer, packed)) = render_input(self, p, light_at) {
+                inputs.push((idx, rect, layer, packed));
+            }
+        }
 
-                        glint_uv: [0.0, 0.0],
-                    });
+        let threads = crate::par::frame_threads(crate::par::threads(), inputs.len(), 256);
+        render_indexed_inputs(
+            &self.particles,
+            &inputs,
+            threads,
+            camera,
+            base,
+            partial,
+            out,
+        );
+        if let Some(started) = timing {
+            record_particle_timing(started, threads, inputs.len());
+        }
+        self.render_scratch = inputs;
+    }
+}
+
+fn particle_timing_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("HORIZON_PARTICLE_TIMING").is_some())
+}
+
+fn record_particle_timing(started: std::time::Instant, threads: usize, particles: usize) {
+    use std::sync::{Mutex, OnceLock};
+    static WINDOW: OnceLock<Mutex<(std::time::Instant, u64, usize, usize, std::time::Duration)>> =
+        OnceLock::new();
+    let window = WINDOW.get_or_init(|| {
+        Mutex::new((
+            std::time::Instant::now(),
+            0,
+            0,
+            0,
+            std::time::Duration::ZERO,
+        ))
+    });
+    let elapsed = started.elapsed();
+    if let Ok(mut window) = window.lock() {
+        window.1 += 1;
+        window.2 = window.2.max(threads);
+        window.3 = window.3.max(particles);
+        window.4 += elapsed;
+        if window.0.elapsed() >= std::time::Duration::from_secs(10) {
+            log::debug!(
+                "Horizon particle render: {} frames, max_particles={}, max_threads={}, avg={:?} in 10s",
+                window.1,
+                window.3,
+                window.2,
+                window.4 / window.1.min(u32::MAX as u64) as u32
+            );
+            *window = (
+                std::time::Instant::now(),
+                0,
+                0,
+                0,
+                std::time::Duration::ZERO,
+            );
+        }
+    }
+}
+
+fn render_input<'a>(
+    engine: &'a ParticleEngine,
+    p: &'a Particle,
+    light_at: &dyn Fn([i32; 3]) -> u8,
+) -> Option<(&'a Particle, Rect, bool, u8)> {
+    if p.no_render {
+        return None;
+    }
+    // SparkParticle.extract: twinkling sparks blink after a third of their life.
+    if let Behaviour::Spark { twinkle: true, .. } = p.behaviour
+        && p.age >= p.lifetime / 3
+        && ((p.age + p.lifetime) / 3) % 2 != 0
+    {
+        return None;
+    }
+    // `SubmitNodeCollection.submitQuadParticleGroup`: the translucent
+    // layer draws after translucent terrain, so a crumb of stained glass
+    // cannot hide the glass behind it (`getLayer`).
+    let (rect, layer) = match &p.sprite {
+        Sprite::Index(i) => (
+            engine.rects.get(*i as usize).copied().flatten(),
+            p.translucent.unwrap_or_else(|| p.ty.translucent_layer()),
+        ),
+        Sprite::Named(name) => match engine.atlas.get(name) {
+            Some(&(rect, translucent)) => (Some(rect), translucent),
+            None => (None, false),
+        },
+    };
+    let r = rect?;
+    if matches!(p.behaviour, Behaviour::Shriek { delay } if delay > 0) {
+        return None;
+    }
+    // The light callback can access the live world and is not Sync.
+    // Query it serially in the same order as the original render loop,
+    // caching results per block position throttled to 20 Hz tick rate.
+    let packed = if p.light == Light::FullBright {
+        0xF0
+    } else {
+        let block = ParticleLevel::block_at(p.position);
+        engine
+            .light_cache
+            .light_at(engine.tick_count, block, light_at)
+    };
+    Some((p, r, layer, packed))
+}
+
+fn render_slice<'a, T: Copy + Sync>(
+    inputs: &[T],
+    unpack: impl Fn(T) -> (&'a Particle, Rect, bool, u8) + Sync,
+    threads: usize,
+    camera: DVec3,
+    base: Quat,
+    partial: f32,
+    out: &mut Vec<Vertex>,
+) {
+    out.reserve(inputs.len() * 4);
+    if threads == 1 {
+        for &item in inputs {
+            let (p, r, layer, packed) = unpack(item);
+            render_particle(p, r, layer, packed, camera, base, partial, out);
+        }
+    } else {
+        crate::par::map_batches_with(
+            threads,
+            inputs.chunks(64),
+            crate::par::MAX_PAR_THREADS,
+            |chunk| {
+                let mut vertices = Vec::with_capacity(chunk.len() * 4);
+                for &item in chunk.iter() {
+                    let (p, r, layer, packed) = unpack(item);
+                    render_particle(p, r, layer, packed, camera, base, partial, &mut vertices);
                 }
+                vertices
+            },
+            |vertices| out.extend(vertices),
+        );
+    }
+}
+
+fn render_indexed_inputs(
+    particles: &[Particle],
+    inputs: &[(usize, Rect, bool, u8)],
+    threads: usize,
+    camera: DVec3,
+    base: Quat,
+    partial: f32,
+    out: &mut Vec<Vertex>,
+) {
+    render_slice(
+        inputs,
+        |(idx, r, layer, packed)| (&particles[idx], r, layer, packed),
+        threads,
+        camera,
+        base,
+        partial,
+        out,
+    );
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn render_inputs(
+    inputs: &[(&Particle, Rect, bool, u8)],
+    threads: usize,
+    camera: DVec3,
+    base: Quat,
+    partial: f32,
+    out: &mut Vec<Vertex>,
+) {
+    render_slice(inputs, |item| item, threads, camera, base, partial, out);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_particle(
+    p: &Particle,
+    r: Rect,
+    layer: bool,
+    packed: u8,
+    camera: DVec3,
+    base: Quat,
+    partial: f32,
+    out: &mut Vec<Vertex>,
+) {
+    let a = f64::from(partial);
+    let pos = DVec3::new(
+        p.previous[0] + (p.position[0] - p.previous[0]) * a,
+        p.previous[1] + (p.position[1] - p.previous[1]) * a,
+        p.previous[2] + (p.position[2] - p.previous[2]) * a,
+    ) - camera;
+    let center = pos.as_vec3();
+    let rotation = if p.roll != 0.0 {
+        base * Quat::from_rotation_z(p.o_roll + (p.roll - p.o_roll) * partial)
+    } else {
+        base
+    };
+    let size = p.quad_size(partial);
+    let mut alpha = p.rgba[3];
+    // OverlayParticle.extract: the flash fades as it pulses.
+    if p.ty == ParticleType::Flash {
+        alpha = 0.6 - (p.age as f32 + partial - 1.0) * 0.25 * 0.5;
+    }
+    if let Behaviour::FlyTowards { alpha: la, .. } = p.behaviour {
+        alpha = lifetime_alpha(la, p.age, p.lifetime, partial);
+    }
+    let mut rotations = [Some(rotation), None];
+    let mut rgb = [p.rgba[0], p.rgba[1], p.rgba[2]];
+    match p.behaviour {
+        // ShriekParticle.extract: two tilted quads, fading out.
+        Behaviour::Shriek { .. } => {
+            alpha = 1.0 - ((p.age as f32 + partial) / p.lifetime as f32).clamp(0.0, 1.0);
+            rotations = [
+                Some(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_3)),
+                Some(Quat::from_euler(
+                    glam::EulerRot::YXZ,
+                    -std::f32::consts::PI,
+                    std::f32::consts::FRAC_PI_3,
+                    0.0,
+                )),
+            ];
+        }
+        // VibrationSignalParticle.extract: two quads along the flight.
+        Behaviour::Vibration {
+            rot,
+            rot_o,
+            pitch,
+            pitch_o,
+            ..
+        } => {
+            let sway = ((p.age as f32 + partial - std::f32::consts::TAU) * 0.05).sin() * 2.0;
+            let lerped_rot = rot_o + (rot - rot_o) * partial;
+            let lerped_pitch = pitch_o + (pitch - pitch_o) * partial + std::f32::consts::FRAC_PI_2;
+            rotations = [
+                Some(
+                    Quat::from_rotation_y(lerped_rot)
+                        * Quat::from_rotation_x(-lerped_pitch)
+                        * Quat::from_rotation_y(sway),
+                ),
+                Some(
+                    Quat::from_rotation_y(-std::f32::consts::PI + lerped_rot)
+                        * Quat::from_rotation_x(lerped_pitch)
+                        * Quat::from_rotation_y(sway),
+                ),
+            ];
+        }
+        // DustColorTransitionParticle.lerpColors.
+        Behaviour::Transition { from, to } => {
+            let t = (p.age as f32 + partial) / (p.lifetime as f32 + 1.0);
+            rgb = std::array::from_fn(|i| from[i] + (to[i] - from[i]) * t);
+        }
+        _ => {}
+    }
+    let (sky_light, block_light) = p.light_coords(
+        partial,
+        u32::from(packed >> 4) * 16,
+        u32::from(packed & 15) * 16,
+    );
+    let light = sky_light | block_light << 8;
+    let c = |v: f32| (v.clamp(0.0, 1.0) * 255.0) as u32;
+    let color = c(alpha) << 24 | c(rgb[2]) << 16 | c(rgb[1]) << 8 | c(rgb[0]);
+    let (du, dv) = (r.u1 - r.u0, r.v1 - r.v0);
+    let (u0, v0, u1, v1) = (
+        r.u0 + du * p.uv[0],
+        r.v0 + dv * p.uv[1],
+        r.u0 + du * p.uv[2],
+        r.v0 + dv * p.uv[3],
+    );
+    if p.behaviour == Behaviour::CbcSpark {
+        let delta = (DVec3::from_array(p.position) - DVec3::from_array(p.previous)).as_vec3();
+        let (x, y, forward) = cbc::impact::spark_axes(delta);
+        let end = center + forward * delta.length().min(1.0);
+        for axis in [x, y] {
+            let edge = axis * (1.0 / 16.0);
+            for pos in [center - edge, end - edge, end + edge, center + edge] {
+                out.push(Vertex {
+                    pos: pos.to_array(),
+                    uv: [r.u0, r.v0],
+                    layer: 0,
+                    color,
+                    light,
+                    normal: [0, 127, 0, 127],
+                    glint_uv: [0.0; 2],
+                });
             }
+        }
+        return;
+    }
+    if let Behaviour::CbcShard { yaw, pitch, .. } = p.behaviour {
+        let [mu0, mv0, mu1, mv1] = p.uv;
+        if mu0 == mu1 || mv0 == mv1 {
+            return;
+        }
+        let rotation = cbc::impact::shard_rotation(p, yaw, pitch);
+        let encode = |v: f32| (v * 65535.0).round() as u32;
+        let normal = (rotation * FVec3::NEG_Z)
+            .to_array()
+            .map(|v| (v * 127.0).round() as i8);
+        for (corner, uv) in [
+            (FVec3::new(1.0, -1.0, 0.0), [mu1, mv1]),
+            (FVec3::new(1.0, 1.0, 0.0), [mu1, mv0]),
+            (FVec3::new(-1.0, 1.0, 0.0), [mu0, mv0]),
+            (FVec3::new(-1.0, -1.0, 0.0), [mu0, mv1]),
+        ] {
+            out.push(Vertex {
+                pos: (center + rotation * corner * size).to_array(),
+                uv,
+                layer: crate::gfx::CBC_SHARD_OVERLAY | encode(r.u1) << 16,
+                color,
+                light: light | encode(r.v1) << 16,
+                normal: [normal[0], normal[1], normal[2], -127],
+                glint_uv: [r.u0, r.v0],
+            });
+        }
+        return;
+    }
+    for rotation in rotations.into_iter().flatten() {
+        for (n, uv) in [
+            ((1.0, -1.0), [u1, v1]),
+            ((1.0, 1.0), [u1, v0]),
+            ((-1.0, 1.0), [u0, v0]),
+            ((-1.0, -1.0), [u0, v1]),
+        ] {
+            let v = center + rotation * FVec3::new(n.0, n.1, 0.0) * size;
+            out.push(Vertex {
+                normal: [0; 4],
+                pos: v.to_array(),
+                uv,
+                layer: if layer {
+                    crate::gfx::TRANSLUCENT_PARTICLE_OVERLAY
+                } else {
+                    u32::from(hdr_tier(p.ty)) << 16
+                },
+                color,
+                light,
+
+                glint_uv: [0.0, 0.0],
+            });
         }
     }
 }
@@ -4176,6 +4680,153 @@ const CREEPER: [[f64; 2]; 12] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn render_preserves_light_lookup_order_and_geometry_for_worker_counts() {
+        let mut engine = ParticleEngine::new(Path::new(""), &HashMap::new(), &HashSet::new());
+        engine.rects.push(Some(Rect {
+            u0: 0.0,
+            v0: 0.0,
+            u1: 1.0,
+            v1: 1.0,
+            w: 16,
+            h: 16,
+        }));
+        let mut random = LegacyRandom::new(7);
+        for i in 0..260 {
+            let mut p = Particle::moving(
+                &mut random,
+                ParticleType::Poof,
+                [i as f64 * 0.01, 2.0, -1.0],
+                [0.0; 3],
+            );
+            p.sprite = Sprite::Index(0);
+            match i {
+                0 => p.no_render = true,
+                1 => {
+                    p.behaviour = Behaviour::Spark {
+                        fade: None,
+                        trail: false,
+                        twinkle: true,
+                    };
+                    p.age = 11;
+                    p.lifetime = 30;
+                }
+                2 => p.sprite = Sprite::Index(1),
+                3 => p.behaviour = Behaviour::Shriek { delay: 1 },
+                _ => {}
+            }
+            engine.particles.push(p);
+        }
+
+        let mut expected_lookups: Vec<_> = Vec::new();
+        for p in &engine.particles[4..] {
+            let b = ParticleLevel::block_at(p.position);
+            if !expected_lookups.contains(&b) {
+                expected_lookups.push(b);
+            }
+        }
+        let lookups = std::cell::RefCell::new(Vec::new());
+        let mut public = Vec::new();
+        engine.render(
+            DVec3::ZERO,
+            0.0,
+            0.0,
+            0.5,
+            &|block| {
+                lookups.borrow_mut().push(block);
+                0xF0
+            },
+            &mut public,
+        );
+        assert_eq!(*lookups.borrow(), expected_lookups);
+
+        engine.clear_light_cache();
+        let baseline_lookups = std::cell::RefCell::new(Vec::new());
+        let inputs: Vec<_> = engine
+            .particles
+            .iter()
+            .filter_map(|p| {
+                render_input(&engine, p, &|block| {
+                    baseline_lookups.borrow_mut().push(block);
+                    0xF0
+                })
+            })
+            .collect();
+        assert_eq!(*baseline_lookups.borrow(), expected_lookups);
+        assert_eq!(inputs.len(), 256);
+        assert_eq!(crate::par::frame_threads(6, 255, 256), 1);
+        assert_eq!(crate::par::frame_threads(6, 256, 256), 6);
+        let camera = DVec3::ZERO;
+        let base = Quat::from_rotation_y(std::f32::consts::PI - 0.0f32.to_radians())
+            * Quat::from_rotation_x(-0.0f32.to_radians());
+        let mut serial = Vec::new();
+        render_inputs(&inputs, 1, camera, base, 0.5, &mut serial);
+        assert_eq!(
+            bytemuck::cast_slice::<Vertex, u8>(&public),
+            bytemuck::cast_slice::<Vertex, u8>(&serial),
+        );
+        for threads in [2, 6] {
+            let mut parallel = Vec::new();
+            render_inputs(&inputs, threads, camera, base, 0.5, &mut parallel);
+            assert_eq!(
+                bytemuck::cast_slice::<Vertex, u8>(&serial),
+                bytemuck::cast_slice::<Vertex, u8>(&parallel),
+                "particle geometry changed with {threads} workers"
+            );
+        }
+        // Second call reuses `engine.render_scratch` and `engine.light_cache`, emits identical vertices with 0 lookups.
+        let lookups_second = std::cell::RefCell::new(Vec::new());
+        let mut public_second = Vec::new();
+        engine.render(
+            DVec3::ZERO,
+            0.0,
+            0.0,
+            0.5,
+            &|block| {
+                lookups_second.borrow_mut().push(block);
+                0xF0
+            },
+            &mut public_second,
+        );
+        assert_eq!(
+            bytemuck::cast_slice::<Vertex, u8>(&public),
+            bytemuck::cast_slice::<Vertex, u8>(&public_second),
+        );
+        assert_eq!(lookups_second.borrow().len(), 0);
+    }
+
+    #[test]
+    fn particle_light_cache_throttles_to_tick_and_deduplicates_cells() {
+        let cache = ParticleLightCache::new();
+        let samples = std::cell::Cell::new(0usize);
+        let sample = |b: [i32; 3]| {
+            samples.set(samples.get() + 1);
+            ((b[0] + b[1] + b[2]) & 0xFF) as u8
+        };
+
+        // Tick 10: multiple queries in same block cell only sample once.
+        assert_eq!(cache.light_at(10, [1, 2, 3], sample), 6);
+        assert_eq!(cache.light_at(10, [1, 2, 3], sample), 6);
+        assert_eq!(cache.light_at(10, [1, 2, 3], sample), 6);
+        assert_eq!(samples.get(), 1);
+        assert_eq!(cache.len(), 1);
+
+        // Different cell in same tick samples for that cell.
+        assert_eq!(cache.light_at(10, [4, 5, 6], sample), 15);
+        assert_eq!(samples.get(), 2);
+        assert_eq!(cache.len(), 2);
+
+        // Sub-frame in same tick reuses cache.
+        assert_eq!(cache.light_at(10, [1, 2, 3], sample), 6);
+        assert_eq!(cache.light_at(10, [4, 5, 6], sample), 15);
+        assert_eq!(samples.get(), 2);
+
+        // Next 20 Hz tick (11): invalidates and resamples cleanly.
+        assert_eq!(cache.light_at(11, [1, 2, 3], sample), 6);
+        assert_eq!(samples.get(), 3);
+        assert_eq!(cache.len(), 1);
+    }
 
     #[test]
     fn egg_teleport_unpacks_offsets_and_preserves_seeded_draw_order() {

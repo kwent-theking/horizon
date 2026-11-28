@@ -2,8 +2,9 @@
 //! (`Biome.getGrassColor`/`getFoliageColor`/..., `BlockTintSources`).
 use crate::Result;
 use horizon_core::{noise::SimplexNoise, position::BlockPos, random::LegacyRandom};
+use horizon_world::content_view;
 use serde_json::Value;
-use std::{collections::HashMap, fs, path::Path};
+use std::{collections::HashMap, path::Path};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GrassModifier {
@@ -146,7 +147,7 @@ fn color(v: &Value) -> Option<u32> {
 }
 fn colormap(root: &Path, name: &str) -> Result<Vec<u32>> {
     let path = root.join(format!("assets/minecraft/textures/colormap/{name}.png"));
-    let mut decoder = png::Decoder::new(std::io::BufReader::new(fs::File::open(path)?));
+    let mut decoder = png::Decoder::new(content_view::open(&path)?);
     decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
     let mut reader = decoder.read_info()?;
     let mut bytes = vec![0; reader.output_buffer_size().ok_or("colormap too large")?];
@@ -172,8 +173,8 @@ impl Biomes {
         let foliage = colormap(root, "foliage")?;
         let dry = colormap(root, "dry_foliage")?;
         let mut list = Vec::new();
-        let mut names: Vec<_> = fs::read_dir(root.join("data/minecraft/worldgen/biome"))?
-            .filter_map(|e| e.ok())
+        let mut names: Vec<_> = content_view::read_dir(root.join("data/minecraft/worldgen/biome"))?
+            .into_iter()
             .map(|e| e.path())
             .filter(|p| p.extension().is_some_and(|e| e == "json"))
             .collect();
@@ -185,7 +186,7 @@ impl Biomes {
                     .and_then(|s| s.to_str())
                     .ok_or("bad biome")?
             );
-            let v: Value = serde_json::from_slice(&fs::read(&path)?)?;
+            let v: Value = serde_json::from_slice(&content_view::read(&path)?)?;
             let effects = &v["effects"];
             let attributes = &v["attributes"];
             let temperature = v["temperature"].as_f64().unwrap_or(0.5) as f32;

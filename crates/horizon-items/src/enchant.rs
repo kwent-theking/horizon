@@ -14,7 +14,7 @@ use std::{
 };
 
 /// `Enchantment.Cost`: base + per_level_above_first * (level - 1).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Cost {
     pub base: i32,
     pub per_level: i32,
@@ -51,7 +51,7 @@ pub struct Enchantment {
     pub effects: Value,
 }
 /// Item components the enchanting, anvil and smithing rules read.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct ItemProps {
     /// `minecraft:enchantable.value`.
     pub enchantable: u32,
@@ -144,8 +144,154 @@ pub fn level_name(level: u32) -> String {
         .map_or_else(|| level.to_string(), |s| (*s).to_owned())
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct EnchantmentSnapshot {
+    id: String,
+    description: String,
+    description_key: String,
+    max_level: u32,
+    weight: u32,
+    anvil_cost: u32,
+    min_cost: Cost,
+    max_cost: Cost,
+    supported: Vec<String>,
+    primary: Option<Vec<String>>,
+    exclusive: Vec<String>,
+    slots: Vec<String>,
+    effects_json: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct EnchantmentsSnapshot {
+    list: Vec<EnchantmentSnapshot>,
+    tags: Vec<(String, Vec<String>)>,
+    entity_tags: Vec<(String, Vec<String>)>,
+    damage_tags: Vec<(String, Vec<String>)>,
+    props: Vec<(String, ItemProps)>,
+    lang: HashMap<String, String>,
+}
+
+impl EnchantmentsSnapshot {
+    fn capture(e: &Enchantments) -> Option<Self> {
+        let mut list = Vec::with_capacity(e.list.len());
+        for item in &e.list {
+            let mut exclusive: Vec<String> = item.exclusive.iter().map(|s| s.to_string()).collect();
+            exclusive.sort();
+            list.push(EnchantmentSnapshot {
+                id: item.id.to_string(),
+                description: item.description.clone(),
+                description_key: item.description_key.clone(),
+                max_level: item.max_level,
+                weight: item.weight,
+                anvil_cost: item.anvil_cost,
+                min_cost: item.min_cost,
+                max_cost: item.max_cost,
+                supported: item.supported.clone(),
+                primary: item.primary.clone(),
+                exclusive,
+                slots: item.slots.clone(),
+                effects_json: serde_json::to_string(&item.effects).ok()?,
+            });
+        }
+        let tags = e
+            .tags
+            .iter()
+            .map(|(k, v)| (k.clone(), v.iter().map(|s| s.to_string()).collect()))
+            .collect();
+        let map_sets = |m: &HashMap<String, HashSet<String>>| -> Vec<(String, Vec<String>)> {
+            m.iter()
+                .map(|(k, v)| (k.clone(), v.iter().cloned().collect()))
+                .collect()
+        };
+        let props = e
+            .props
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect();
+        Some(Self {
+            list,
+            tags,
+            entity_tags: map_sets(&e.entity_tags),
+            damage_tags: map_sets(&e.damage_tags),
+            props,
+            lang: e.lang.clone(),
+        })
+    }
+
+    fn restore(self) -> Option<Enchantments> {
+        let mut list = Vec::with_capacity(self.list.len());
+        let mut index = HashMap::with_capacity(self.list.len());
+        for rec in self.list {
+            let id: Arc<str> = Arc::from(rec.id.as_str());
+            let effects: Value = serde_json::from_str(&rec.effects_json).ok()?;
+            index.insert(Arc::clone(&id), list.len());
+            list.push(Enchantment {
+                id,
+                description: rec.description,
+                description_key: rec.description_key,
+                max_level: rec.max_level,
+                weight: rec.weight,
+                anvil_cost: rec.anvil_cost,
+                min_cost: rec.min_cost,
+                max_cost: rec.max_cost,
+                supported: rec.supported,
+                primary: rec.primary,
+                exclusive: rec
+                    .exclusive
+                    .into_iter()
+                    .map(|s| Arc::from(s.as_str()))
+                    .collect(),
+                slots: rec.slots,
+                effects,
+            });
+        }
+        let tags = self
+            .tags
+            .into_iter()
+            .map(|(k, v)| (k, v.into_iter().map(|s| Arc::from(s.as_str())).collect()))
+            .collect();
+        let to_sets = |v: Vec<(String, Vec<String>)>| -> HashMap<String, HashSet<String>> {
+            v.into_iter()
+                .map(|(k, vals)| (k, vals.into_iter().collect()))
+                .collect()
+        };
+        let props = self
+            .props
+            .into_iter()
+            .map(|(k, v)| (Arc::from(k.as_str()), v))
+            .collect();
+        Some(Enchantments {
+            list,
+            index,
+            tags,
+            entity_tags: to_sets(self.entity_tags),
+            damage_tags: to_sets(self.damage_tags),
+            props,
+            lang: self.lang,
+        })
+    }
+}
+
 impl Enchantments {
     pub fn load(root: &Path) -> Self {
+        let cache = horizon_world::resource_cache::Cache::for_tree(root, "enchantments-v1", &[]);
+        if let Some(restored) = cache
+            .as_ref()
+            .and_then(|c| c.read_value::<EnchantmentsSnapshot>())
+            .and_then(EnchantmentsSnapshot::restore)
+        {
+            return restored;
+        }
+        let loaded = Self::load_uncached(root);
+        if let Some(cache) = cache.as_ref()
+            && let Some(snapshot) = EnchantmentsSnapshot::capture(&loaded)
+        {
+            let _ = cache.write_value(&snapshot);
+        }
+        loaded
+    }
+
+    fn load_uncached(root: &Path) -> Self {
         let data = root.join("data/minecraft");
         let raw_tags = read_tag_dir(&data.join("tags/enchantment"));
         let tags: HashMap<String, Vec<Arc<str>>> = raw_tags

@@ -249,8 +249,7 @@ impl Game<'_> {
             if sprites[index].is_none() {
                 sprites[index] = self
                     .pack
-                    .layer_names
-                    .get(&face.layer)
+                    .layer_name(face.layer)
                     .and_then(|name| self.gui.atlas.sprites.get(name).copied());
             }
         }

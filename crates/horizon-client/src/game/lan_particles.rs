@@ -25,6 +25,17 @@ fn rgb(c: [f32; 4]) -> [f32; 3] {
     [c[0], c[1], c[2]]
 }
 
+/// Whether this is the first time `name` is reported.
+fn first_report(name: &str) -> bool {
+    static SEEN: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+        std::sync::Mutex::new(None);
+    let mut seen = SEEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    seen.get_or_insert_with(Default::default)
+        .insert(name.to_owned())
+}
+
 /// `ServerLevel.sendParticles` of one soul particle moving by `velocity`
 /// (Soul Speed's `spawn_particles`): sent to the players within 32 blocks.
 pub(super) fn send_soul_particle(host: &super::lan::LanHost, at: [f64; 3], velocity: [f64; 3]) {
@@ -228,6 +239,22 @@ impl Game<'_> {
         Some(Particle { id, data })
     }
 
+    /// A content mod's particle: its own sprites when its definition has any,
+    /// else a vanilla stand-in; each unknown type is logged once.
+    fn modded_particle(&self, name: &str) -> ParticleOptions {
+        if self.particles.has_modded(name) {
+            return ParticleOptions::modded(name);
+        }
+        let ty = horizon_client::particle_defs::fallback_type(name);
+        if first_report(name) {
+            log::warn!(
+                "Horizon: particle {name} has no sprite definition, drawn as {}",
+                ty.name()
+            );
+        }
+        ParticleOptions::simple(ty)
+    }
+
     /// The options a server's particle stands for (None for a type or data
     /// this client doesn't draw).
     pub(super) fn received_particle(
@@ -235,6 +262,12 @@ impl Game<'_> {
         p: &Particle,
         at: [f64; 3],
     ) -> Option<ParticleOptions> {
+        if let Some(options) = cbc_particle(p) {
+            return Some(options);
+        }
+        if let Some(name) = horizon_protocol::translation::modded_particle_name(p.id) {
+            return Some(self.modded_particle(&name));
+        }
         let name = self
             .remote
             .as_ref()?
@@ -242,7 +275,9 @@ impl Game<'_> {
             .get("minecraft:particle_type")?
             .name(p.id)?
             .to_owned();
-        let ty = ParticleType::from_name(&name)?;
+        let Some(ty) = ParticleType::from_name(&name) else {
+            return Some(self.modded_particle(&name));
+        };
         Some(match &p.data {
             None => ParticleOptions::simple(ty),
             Some(ParticleData::State(s)) => {
@@ -554,4 +589,25 @@ impl Game<'_> {
             }
         }
     }
+}
+
+/// Create Big Cannons particles recognized by the 1.21.1 translator.
+fn cbc_particle(p: &Particle) -> Option<ParticleOptions> {
+    use horizon_client::particles::CbcParticle;
+    use horizon_protocol::entity_data::{
+        CBC_AUTOCANNON_PLUME, CBC_BIG_CANNON_PLUME, CBC_DROP_MORTAR_PLUME,
+    };
+    if p.id == horizon_protocol::entity_data::CBC_BREECH_SMOKE {
+        return Some(ParticleOptions::cbc(CbcParticle::QuickFiringBreechSmoke));
+    }
+    let Some(ParticleData::CannonPlume { size, power, .. }) = p.data else {
+        return None;
+    };
+    let particle = match p.id {
+        CBC_BIG_CANNON_PLUME => CbcParticle::BigCannonPlume { size, power },
+        CBC_AUTOCANNON_PLUME => CbcParticle::AutocannonPlume { scale: size },
+        CBC_DROP_MORTAR_PLUME => CbcParticle::DropMortarPlume { scale: size },
+        _ => return None,
+    };
+    Some(ParticleOptions::cbc(particle))
 }

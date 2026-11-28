@@ -12,6 +12,7 @@ use horizon_client::{
     screen_draw::Measure,
     text::{ClickEvent, Style, Text},
 };
+use horizon_world::content_view;
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -170,13 +171,29 @@ fn ids_under(root: &Path, extension: &str) -> Vec<String> {
 /// The templates of every namespace folder under `root` (vanilla's and the
 /// content mods'), as `namespace:path`, sorted.
 fn templates_under(root: &Path) -> Vec<String> {
-    let Ok(namespaces) = std::fs::read_dir(root) else {
+    let Ok(namespaces) = content_view::read_dir(root) else {
         return Vec::new();
     };
     let mut out: Vec<String> = namespaces
-        .flatten()
-        .filter(|e| e.path().is_dir())
+        .into_iter()
+        .filter(content_view::DirEntry::is_dir)
         .flat_map(|e| ids_in(&e.path(), "nbt", &e.file_name().to_string_lossy()))
+        .collect();
+    out.sort();
+    out
+}
+
+/// The IDs of JSON entries directly under a Minecraft registry directory.
+fn flat_ids(root: &Path) -> Vec<String> {
+    let mut out: Vec<String> = content_view::read_dir(root)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| {
+            e.file_name()
+                .to_str()?
+                .strip_suffix(".json")
+                .map(|n| format!("minecraft:{n}"))
+        })
         .collect();
     out.sort();
     out
@@ -187,16 +204,12 @@ fn ids_in(root: &Path, extension: &str, namespace: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_owned()];
     while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
+        let Ok(entries) = content_view::read_dir(&dir) else {
             continue;
         };
-        for e in entries.flatten() {
+        for e in entries {
             let path = e.path();
-            // The listing's own type, without another look at each file; a
-            // link is followed, as `Path::is_dir` does.
-            let is_dir = e
-                .file_type()
-                .is_ok_and(|t| t.is_dir() || (t.is_symlink() && path.is_dir()));
+            let is_dir = e.is_dir();
             if is_dir {
                 stack.push(path);
             } else if path.extension().and_then(|x| x.to_str()) == Some(extension)
@@ -368,21 +381,7 @@ impl Game<'_> {
         }
         types.sort();
         reg.entity_types = types;
-        let list = |dir: &str| -> Vec<String> {
-            let mut out: Vec<String> = std::fs::read_dir(root.join(dir))
-                .into_iter()
-                .flatten()
-                .flatten()
-                .filter_map(|e| {
-                    e.file_name()
-                        .to_str()?
-                        .strip_suffix(".json")
-                        .map(|n| format!("minecraft:{n}"))
-                })
-                .collect();
-            out.sort();
-            out
-        };
+        let list = |dir: &str| flat_ids(&root.join(dir));
         // The mob effect registry: every effect `/effect` and the
         // `mob_effect` resource arguments accept.
         reg.effects = horizon_client::brewing::EFFECTS
@@ -1343,5 +1342,54 @@ mod tests {
         std::fs::write(recipe.join("c.json"), "{}").unwrap();
         assert!(Arc::ptr_eq(&first, &resource_ids(&root)));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resource_ids_include_archive_only_entries() {
+        use std::fs;
+
+        let scratch =
+            std::env::temp_dir().join(format!("horizon-archive-ids-{}", std::process::id()));
+        let root = scratch.join("root");
+        let templates = root.join("worldgen/structure/minecraft");
+        fs::create_dir_all(&templates).unwrap();
+        fs::write(templates.join("disk.nbt"), []).unwrap();
+
+        let archive = scratch.join("mod.hmod");
+        fs::write(&archive, []).unwrap();
+        let mut index = content_view::Index::default();
+        let archive_id = index.add_archive(&archive).unwrap();
+        for path in [
+            "data/minecraft/loot_table/chests/archived.json",
+            "data/minecraft/worldgen/biome/archived.json",
+            "data/minecraft/worldgen/structure/archived.json",
+            "worldgen/structure/mod/nested/archived.nbt",
+        ] {
+            index.insert(
+                path,
+                content_view::Stored {
+                    archive: archive_id,
+                    offset: 0,
+                    compressed: 0,
+                    size: 0,
+                    crc32: 0,
+                    deflated: false,
+                },
+            );
+        }
+        index.mount(&root, &[archive]).unwrap();
+
+        let ids = resource_ids(&root);
+        assert_eq!(ids.loot_tables, ["minecraft:chests/archived"]);
+        assert_eq!(ids.templates, ["minecraft:disk", "mod:nested/archived"]);
+        for registry in ["biome", "structure"] {
+            assert_eq!(
+                flat_ids(&root.join("data/minecraft/worldgen").join(registry)),
+                ["minecraft:archived"],
+            );
+        }
+
+        content_view::unmount(&root);
+        fs::remove_dir_all(scratch).unwrap();
     }
 }

@@ -5,7 +5,7 @@
 //! (`ItemEnv`) and the special renderers' registries to the game.
 use super::{Dim, Game};
 use horizon_assets::item_model::{
-    Components, DisplayContext, GlobalPos, ItemEnv, LevelState, OwnerState, StackView,
+    DisplayContext, GlobalPos, ItemEnv, LevelState, OwnerState, StackComponents, StackView,
 };
 use horizon_client::{
     block_entity_render::{diffuse_lights, vertex_light},
@@ -36,7 +36,11 @@ impl ItemEnv for Env<'_, '_> {
             .item_renderer
             .grass_color(temperature, downfall)
     }
-    fn bundle_fullness(&self, _stack: &StackView, components: &Components) -> f32 {
+    fn bundle_fullness_from_view(
+        &self,
+        _stack: &StackView,
+        components: &StackComponents<'_>,
+    ) -> f32 {
         // `BundleContents.weight`: count / max stack size, summed.
         let Some(items) = components
             .get("minecraft:bundle_contents")
@@ -50,8 +54,7 @@ impl ItemEnv for Env<'_, '_> {
             let id = item["id"].as_str().unwrap_or("");
             let count = item["count"].as_i64().unwrap_or(1) as f64;
             let max = prototypes
-                .get(id)
-                .and_then(|c| c.get("minecraft:max_stack_size"))
+                .get(id, "minecraft:max_stack_size")
                 .and_then(Value::as_i64)
                 .unwrap_or(1) as f64;
             total += count / max;
@@ -167,18 +170,17 @@ pub(super) fn owner_at(position: [f64; 3], yaw: f32, entity_type: &str) -> Owner
 }
 /// `UseDuration` of a stack (`Item.getUseDuration`): 72000 for drawn items
 /// and for `blocks_attacks` items (shields), the consume time for food.
-fn use_duration(components: &Components) -> i32 {
-    if let Some(c) = components.get("minecraft:consumable") {
+fn use_duration<'a>(component: impl Fn(&str) -> Option<&'a Value>) -> i32 {
+    if let Some(c) = component("minecraft:consumable") {
         let seconds = c["consume_seconds"].as_f64().unwrap_or(1.6);
         return (seconds * 20.0) as i32;
     }
-    if components.get("minecraft:blocks_attacks").is_some()
-        || components.get("minecraft:kinetic_weapon").is_some()
+    if component("minecraft:blocks_attacks").is_some()
+        || component("minecraft:kinetic_weapon").is_some()
     {
         return 72_000;
     }
-    let item_model = components
-        .get("minecraft:item_model")
+    let item_model = component("minecraft:item_model")
         .and_then(Value::as_str)
         .unwrap_or("");
     match item_model {
@@ -265,7 +267,8 @@ impl Game<'_> {
             && self.stack_in(slot) == Some(stack)
         {
             let view = item_render::stack_view(stack);
-            let duration = use_duration(&self.pack.item_renderer.models.components(&view));
+            let models = &self.pack.item_renderer.models;
+            let duration = use_duration(|key| models.component(&view, key));
             owner.using_this_item = true;
             owner.use_duration = duration;
             owner.use_item_remaining_ticks = duration - ticks as i32;
@@ -450,12 +453,8 @@ impl Game<'_> {
             );
             let seed = i64::from(self.pack.item_renderer.item_id(&item.stack.item))
                 + i64::from(item.stack.damage);
-            for copy in item_render::cluster_poses(
-                &state,
-                pose,
-                item_render::rendered_amount(item.stack.count),
-                seed,
-            ) {
+            let amount = cluster_count_lod(pos.length_squared(), item.stack.count);
+            for copy in item_render::cluster_poses(&state, pose, amount, seed) {
                 self.submit_item_world(&state, copy, vertex_light(packed), out);
             }
             if self.entity_glowing(item.id) {
@@ -468,10 +467,28 @@ impl Game<'_> {
     }
 }
 
+#[inline]
+pub(crate) fn cluster_count_lod(distance_squared: f64, count: u32) -> u32 {
+    if distance_squared > 24.0 * 24.0 {
+        1
+    } else {
+        item_render::rendered_amount(count)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn distant_item_stacks_use_single_item_lod() {
+        assert_eq!(cluster_count_lod(10.0 * 10.0, 64), 5);
+        assert_eq!(cluster_count_lod(24.0 * 24.0, 64), 5);
+        assert_eq!(cluster_count_lod(25.0 * 25.0, 64), 1);
+        assert_eq!(cluster_count_lod(50.0 * 50.0, 64), 1);
+        assert_eq!(cluster_count_lod(50.0 * 50.0, 1), 1);
+    }
 
     #[test]
     fn civil_dates_follow_the_gregorian_calendar() {
@@ -482,24 +499,26 @@ mod tests {
 
     #[test]
     fn a_shield_is_used_for_the_vanilla_s_time() {
+        use horizon_assets::item_model::Components;
+
         // Item.getUseDuration: an item with `blocks_attacks` (a shield) is
         // used for 72000 ticks, so its use animation (the arm held up)
         // runs instead of ending at once (#2289).
         let mut shield = Components::new();
         shield.insert("minecraft:blocks_attacks".into(), json!({}));
-        assert_eq!(use_duration(&shield), 72_000);
+        assert_eq!(use_duration(|key| shield.get(key)), 72_000);
         // Food is used for as long as it takes to eat it.
         let mut food = Components::new();
         food.insert(
             "minecraft:consumable".into(),
             json!({"consume_seconds": 1.6}),
         );
-        assert_eq!(use_duration(&food), 32);
+        assert_eq!(use_duration(|key| food.get(key)), 32);
         // The bow keeps its own use time.
         let mut bow = Components::new();
         bow.insert("minecraft:item_model".into(), json!("minecraft:bow"));
-        assert_eq!(use_duration(&bow), 72_000);
+        assert_eq!(use_duration(|key| bow.get(key)), 72_000);
         // Anything else is not used at all.
-        assert_eq!(use_duration(&Components::new()), 0);
+        assert_eq!(use_duration(|_| None), 0);
     }
 }

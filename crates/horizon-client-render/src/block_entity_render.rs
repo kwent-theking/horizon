@@ -666,12 +666,18 @@ const TEXT_OVER_OUTLINE: f32 = 0.05;
 /// test. Here both share one mesh, so the text is lifted a hair towards the
 /// reader instead (a twentieth of a font pixel, invisible) rather than
 /// z-fighting with the outline under it.
-fn draw_text(scene: &Scene, call: &TextCall, out: &mut Vec<Vertex>) {
+pub fn draw_text_call(
+    glyph: &dyn Fn(char) -> (Option<Rect>, f32),
+    call: &TextCall,
+    cull_back_faces: bool,
+    out: &mut Vec<Vertex>,
+) {
+    let normal = if cull_back_faces { CULL_BACK } else { [0; 4] };
     let mut emit = |dx: f32, dy: f32, z: f32, argb: u32| {
         let mut x = call.x + dx;
         let y0 = call.y + dy;
         for ch in call.text.chars() {
-            let (cell, advance) = (scene.glyph)(ch);
+            let (cell, advance) = glyph(ch);
             if let Some(r) = cell {
                 let corners = [(x, y0 + 8.0), (x + 8.0, y0 + 8.0), (x + 8.0, y0), (x, y0)];
                 let uvs = [[r.u0, r.v1], [r.u1, r.v1], [r.u1, r.v0], [r.u0, r.v0]];
@@ -679,7 +685,7 @@ fn draw_text(scene: &Scene, call: &TextCall, out: &mut Vec<Vertex>) {
                     0xFF00_0000 | (argb & 255) << 16 | (argb >> 8 & 255) << 8 | (argb >> 16 & 255);
                 for ((cx, cy), uv) in corners.into_iter().zip(uvs) {
                     out.push(Vertex {
-                        normal: [0; 4],
+                        normal,
                         pos: call
                             .matrix
                             .transform_point3(Vec3::new(cx, cy, z))
@@ -716,6 +722,10 @@ fn draw_text(scene: &Scene, call: &TextCall, out: &mut Vec<Vertex>) {
         0.0
     };
     emit(0.0, 0.0, z, call.color);
+}
+
+fn draw_text(scene: &Scene, call: &TextCall, out: &mut Vec<Vertex>) {
+    draw_text_call(scene.glyph, call, false, out);
 }
 
 /// Block-entity fields the level ticks, at one position (vanilla's own field
@@ -865,33 +875,58 @@ const VIEW_DISTANCE: f64 = 64.0;
 
 impl BlockEntityRenderer {
     pub fn load(root: &Path, registry: &BlockRegistry) -> crate::Result<Self> {
+        Self::load_with_visibility(root, registry, None)
+    }
+
+    pub fn load_with_visibility(
+        root: &Path,
+        registry: &BlockRegistry,
+        visibility: Option<FaceVisibility>,
+    ) -> crate::Result<Self> {
         let all: Value = serde_json::from_slice(&std::fs::read(root.join("entity-models.json"))?)?;
         let models = MODELS
             .iter()
             .filter_map(|(key, layer)| all.get(*layer).map(|v| (*key, ModelPart::parse(v))))
             .collect();
         let mut renderer = Self::new(models, registry);
-        renderer.visibility = Some(Mutex::new(crate::models::load_visibility(root, registry)?));
+        let visibility = match visibility {
+            Some(v) => v,
+            None => crate::models::load_visibility(root, registry)?,
+        };
+        renderer.visibility = Some(Mutex::new(visibility));
         // Sherd items: provides_pottery_pattern -> decorated_pot_pattern asset id.
-        if let Ok(bytes) = std::fs::read(root.join("items.json")) {
-            let items: Value = serde_json::from_slice(&bytes)?;
-            for (item, components) in items.as_object().into_iter().flatten() {
-                let Some(pattern) = components["minecraft:provides_pottery_pattern"].as_str()
-                else {
-                    continue;
-                };
-                let name = pattern.strip_prefix("minecraft:").unwrap_or(pattern);
-                let file = root.join(format!("data/minecraft/decorated_pot_pattern/{name}.json"));
-                let Ok(def) = std::fs::read(file) else {
-                    continue;
-                };
-                let def: Value = serde_json::from_slice(&def)?;
-                if let Some(asset) = def["asset_id"].as_str() {
-                    let asset = asset.strip_prefix("minecraft:").unwrap_or(asset);
-                    renderer
-                        .pot_patterns
-                        .insert(item.clone(), format!("entity/decorated_pot/{asset}"));
+        let pot_cache =
+            horizon_world::resource_cache::Cache::for_tree(root, "pot-patterns-v1", &[]);
+        if let Some(patterns) = pot_cache
+            .as_ref()
+            .and_then(|c| c.read_value::<HashMap<String, String>>())
+        {
+            renderer.pot_patterns = patterns;
+        } else {
+            if let Ok(bytes) = std::fs::read(root.join("items.json")) {
+                let items: Value = serde_json::from_slice(&bytes)?;
+                for (item, components) in items.as_object().into_iter().flatten() {
+                    let Some(pattern) = components["minecraft:provides_pottery_pattern"].as_str()
+                    else {
+                        continue;
+                    };
+                    let name = pattern.strip_prefix("minecraft:").unwrap_or(pattern);
+                    let file =
+                        root.join(format!("data/minecraft/decorated_pot_pattern/{name}.json"));
+                    let Ok(def) = std::fs::read(file) else {
+                        continue;
+                    };
+                    let def: Value = serde_json::from_slice(&def)?;
+                    if let Some(asset) = def["asset_id"].as_str() {
+                        let asset = asset.strip_prefix("minecraft:").unwrap_or(asset);
+                        renderer
+                            .pot_patterns
+                            .insert(item.clone(), format!("entity/decorated_pot/{asset}"));
+                    }
                 }
+            }
+            if let Some(cache) = pot_cache.as_ref() {
+                let _ = cache.write_value(&renderer.pot_patterns);
             }
         }
         Ok(renderer)

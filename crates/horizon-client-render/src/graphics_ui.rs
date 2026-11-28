@@ -2,7 +2,9 @@
 //! they show, in what groups, with what description and cost, and their
 //! input. How they look comes from `graphics_style`.
 use crate::{
-    graphics::{FarDetail, GraphicsApi, Overlay, Pacing, PresentMode, Preset, Upscaling},
+    graphics::{
+        EntityLod, FarDetail, GraphicsApi, Overlay, Pacing, PresentMode, Preset, Upscaling,
+    },
     graphics_style::{Cost, STYLE},
     hud::{HudAtlas, HudBatch},
     settings::{Opt, Settings},
@@ -48,6 +50,10 @@ pub enum H {
     HdrUiBrightness,
     BatteryMode,
     GraphicsApi,
+    ModTextureCap,
+    MaxMipmaps,
+    TextureCompression,
+    EntityLod,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -244,6 +250,26 @@ pub fn rows(level: Level) -> Vec<Row> {
                 Low,
                 "Animates water, lava, fire and other moving textures.",
             ),
+            h(
+                H::ModTextureCap,
+                Saves,
+                "Caps oversized mod block textures (px). Next reload.",
+            ),
+            h(
+                H::MaxMipmaps,
+                Saves,
+                "Limits uploaded mipmap levels per sprite layer. Next reload.",
+            ),
+            h(
+                H::TextureCompression,
+                Saves,
+                "Uses BC1/BC7 on static textures if supported. Next reload.",
+            ),
+            h(
+                H::EntityLod,
+                Saves,
+                "Reduces animation rate and parts on distant mobs.",
+            ),
             Row::Header("Display"),
             fov,
             fps,
@@ -414,6 +440,17 @@ impl H {
             H::Fog => labelled("Fog", on_off(g.fog)),
             H::Weather => labelled("Weather", on_off(g.weather)),
             H::AnimatedTextures => labelled("Animated Textures", on_off(g.animated_textures)),
+            H::ModTextureCap => match g.mod_texture_cap {
+                0 => labelled("Mod Texture Cap", "Uncapped"),
+                n => labelled("Mod Texture Cap", format!("{n} px")),
+            },
+            H::MaxMipmaps => match g.max_mipmap_levels {
+                0 => labelled("Max Mip Levels", "Full"),
+                1 => labelled("Max Mip Levels", "1 level"),
+                n => labelled("Max Mip Levels", format!("{n} levels")),
+            },
+            H::TextureCompression => labelled("Texture Compression", on_off(g.texture_compression)),
+            H::EntityLod => labelled("Entity Anim LOD", g.entity_lod.label()),
             H::PresentMode => labelled("Present Mode", g.present_mode.label()),
             H::Pacing => labelled(
                 "Frame Pacing",
@@ -519,6 +556,14 @@ impl H {
             H::Fog => g.fog = !g.fog,
             H::Weather => g.weather = !g.weather,
             H::AnimatedTextures => g.animated_textures = !g.animated_textures,
+            H::ModTextureCap => {
+                g.mod_texture_cap = step(&[0, 32, 64, 128, 256, 512], g.mod_texture_cap, back)
+            }
+            H::MaxMipmaps => {
+                g.max_mipmap_levels = step(&[0, 1, 2, 3, 4], g.max_mipmap_levels, back)
+            }
+            H::TextureCompression => g.texture_compression = !g.texture_compression,
+            H::EntityLod => g.entity_lod = step(&EntityLod::ALL, g.entity_lod, back),
             H::PresentMode => g.present_mode = step(&PresentMode::ALL, g.present_mode, back),
             // Off, FXAA, TAA.
             H::Antialiasing => {
@@ -594,6 +639,7 @@ impl Item {
             Item::Horizon(H::Fog) => g.fog,
             Item::Horizon(H::Weather) => g.weather,
             Item::Horizon(H::AnimatedTextures) => g.animated_textures,
+            Item::Horizon(H::TextureCompression) => g.texture_compression,
             Item::Horizon(H::Hdr) => g.hdr,
             Item::Horizon(H::BatteryMode) => g.battery,
             Item::Vanilla(Opt::ViewBobbing) => s.view_bobbing,
@@ -683,6 +729,8 @@ pub enum Action {
     ButtonClick,
     Changed,
     SliderDrag,
+    ApplyRecommended,
+    Redetect,
     OpenAdvanced,
     OpenSimple,
     OpenHdr,
@@ -708,6 +756,27 @@ pub struct GraphicsUi {
     /// The list's scroll amount and its held scrollbar (`AbstractScrollArea`).
     scroll: ui::Scroll,
     dragging: Option<Item>,
+    advice_override: Option<crate::graphics::HardwareAdvice>,
+}
+
+const BANNER_HEIGHT: f32 = 34.0;
+
+fn truncate_to_width(atlas: &HudAtlas, text: &str, max_width: f32) -> String {
+    if atlas.font.width(text) <= max_width {
+        return text.to_owned();
+    }
+    let ellipsis = "...";
+    let avail = (max_width - atlas.font.width(ellipsis)).max(0.0);
+    let mut out = String::new();
+    for ch in text.chars() {
+        out.push(ch);
+        if atlas.font.width(&out) > avail {
+            out.pop();
+            break;
+        }
+    }
+    out.push_str(ellipsis);
+    out
 }
 
 impl GraphicsUi {
@@ -715,12 +784,28 @@ impl GraphicsUi {
         self.scroll = ui::Scroll::default();
         self.dragging = None;
     }
+    fn active_advice(&self) -> Option<crate::graphics::HardwareAdvice> {
+        self.advice_override
+            .clone()
+            .or_else(crate::graphics::hardware_advice)
+    }
     /// The scrollbar's column: right of the descriptions.
     fn scrollbar_x(w: f32) -> f32 {
         STYLE.row_x(w) + STYLE.control_width + STYLE.gap + STYLE.text_width(w) + 6.0
     }
+    fn banner_height(&self, level: Level) -> f32 {
+        if matches!(level, Level::Simple | Level::Advanced) && self.active_advice().is_some() {
+            BANNER_HEIGHT
+        } else {
+            0.0
+        }
+    }
+    #[cfg_attr(not(test), allow(dead_code))]
     fn bounds(h: f32) -> (f32, f32) {
         (STYLE.band, h - STYLE.band)
+    }
+    fn bounds_for(&self, level: Level, h: f32) -> (f32, f32) {
+        (STYLE.band + self.banner_height(level), h - STYLE.band)
     }
     fn content_height(level: Level, s: &Settings) -> f32 {
         extra_rows(level, s).iter().fold(4.0, |height, row| {
@@ -740,12 +825,30 @@ impl GraphicsUi {
         h: f32,
     ) -> (Vec<Widget>, Vec<(f32, &'static str)>, f32) {
         let content = Self::content_height(level, s);
-        self.clamp_scroll(h, content);
-        let (top, _) = Self::bounds(h);
+        self.clamp_scroll(level, h, content);
+        let (top, _) = self.bounds_for(level, h);
         let x = STYLE.row_x(w);
         let mut y = top + 4.0 - self.scroll.amount;
         let mut widgets = Vec::new();
         let mut headers = Vec::new();
+        if self.banner_height(level) > 0.0 {
+            let right = x + STYLE.control_width + STYLE.gap + STYLE.text_width(w);
+            let by = STYLE.band + 6.0;
+            widgets.push(Widget {
+                x: (right - 168.0).max(x),
+                y: by,
+                w: 98.0,
+                target: Target::Button(Action::ApplyRecommended),
+                list: false,
+            });
+            widgets.push(Widget {
+                x: (right - 66.0).max(x + 102.0),
+                y: by,
+                w: 66.0,
+                target: Target::Button(Action::Redetect),
+                list: false,
+            });
+        }
         for row in extra_rows(level, s) {
             match row {
                 Row::Header(name) => {
@@ -797,8 +900,8 @@ impl GraphicsUi {
         });
         (widgets, headers, content)
     }
-    fn clamp_scroll(&mut self, h: f32, content: f32) {
-        let (top, bottom) = Self::bounds(h);
+    fn clamp_scroll(&mut self, level: Level, h: f32, content: f32) {
+        let (top, bottom) = self.bounds_for(level, h);
         self.scroll.clamp(top, bottom, content);
     }
     pub fn draw(
@@ -812,10 +915,15 @@ impl GraphicsUi {
     ) {
         let (w, h) = (batch.width, batch.height);
         let (widgets, headers, content) = self.layout(level, s, w, h);
-        let (top, bottom) = Self::bounds(h);
+        let (top, bottom) = self.bounds_for(level, h);
         STYLE.background(batch, atlas, top, bottom, in_world);
         let shown = |y: f32, height: f32| y >= top && y + height <= bottom;
         let x = STYLE.row_x(w);
+        let advice = if self.banner_height(level) > 0.0 {
+            self.active_advice()
+        } else {
+            None
+        };
         for (y, name) in headers {
             if shown(y, STYLE.header_height) {
                 STYLE.header(batch, atlas, &Text::literal(name), x, y);
@@ -830,6 +938,48 @@ impl GraphicsUi {
             .collect();
         let mut index = 0;
         let mut tooltip = None;
+        if let Some(advice) = &advice {
+            let right = x + STYLE.control_width + STYLE.gap + STYLE.text_width(w);
+            let text_w = (right - 174.0 - x).max(60.0);
+            let summary = truncate_to_width(atlas, &advice.summary, text_w);
+            batch.text_styled(
+                atlas,
+                &Text::literal(summary),
+                x,
+                STYLE.band + 4.0,
+                STYLE.description_color,
+                true,
+            );
+            let (second_line, color) = match (&advice.driver_warning, &advice.memory_tip) {
+                (Some(warn), _) => (warn.as_str(), 0xFF55_AAFF),
+                (None, Some(tip)) if advice.reason.is_empty() => (tip.as_str(), 0xFF55_CCFF),
+                (None, Some(_)) => (advice.reason.as_str(), 0xFF88_FF88),
+                (None, None) => (advice.reason.as_str(), 0xFF88_FF88),
+            };
+            let second_line = truncate_to_width(atlas, second_line, text_w);
+            batch.text_styled(
+                atlas,
+                &Text::literal(second_line),
+                x,
+                STYLE.band + 16.0,
+                color,
+                true,
+            );
+            if ui::hovered(cursor, x, STYLE.band, text_w, BANNER_HEIGHT) {
+                let mut full = format!("{}\n{}", advice.summary, advice.reason);
+                if let Some(tip) = &advice.memory_tip
+                    && !advice.reason.contains(tip.as_str())
+                {
+                    full.push('\n');
+                    full.push_str(tip);
+                }
+                if let Some(warn) = &advice.driver_warning {
+                    full.push('\n');
+                    full.push_str(warn);
+                }
+                tooltip = Some(atlas.font.split(&Text::literal(full), 220.0));
+            }
+        }
         for wd in &widgets {
             let hover = ui::hovered(cursor, wd.x, wd.y, wd.w, 20.0)
                 && (!wd.list || (cursor.1 >= top && cursor.1 < bottom));
@@ -876,9 +1026,14 @@ impl GraphicsUi {
                 }
                 Target::Button(action) => {
                     let label = match action {
-                        Action::OpenAdvanced => "Advanced...",
-                        Action::OpenSimple => "Simple...",
-                        _ => "Done",
+                        Action::ApplyRecommended => advice.as_ref().map_or_else(
+                            || "Apply".to_owned(),
+                            |a| format!("Apply {}", a.preset.label()),
+                        ),
+                        Action::Redetect => "Re-detect".to_owned(),
+                        Action::OpenAdvanced => "Advanced...".to_owned(),
+                        Action::OpenSimple => "Simple...".to_owned(),
+                        _ => "Done".to_owned(),
                     };
                     STYLE.button(
                         batch,
@@ -923,7 +1078,7 @@ impl GraphicsUi {
         right: bool,
     ) -> Vec<Action> {
         let (widgets, _, content) = self.layout(level, s, w, h);
-        let (top, bottom) = Self::bounds(h);
+        let (top, bottom) = self.bounds_for(level, h);
         if drag {
             // AbstractScrollArea.mouseDragged: the held scrollbar follows the pointer.
             if self.scroll.held() {
@@ -958,6 +1113,21 @@ impl GraphicsUi {
                 continue;
             }
             return match wd.target {
+                Target::Button(Action::ApplyRecommended) => {
+                    if let Some(advice) = self.active_advice() {
+                        crate::graphics::apply_preset(advice.preset, s);
+                        return vec![Action::ButtonClick, Action::Changed];
+                    }
+                    vec![Action::ButtonClick]
+                }
+                Target::Button(Action::Redetect) => {
+                    if let Some(fresh) = crate::graphics::redetect_hardware()
+                        && self.advice_override.is_some()
+                    {
+                        self.advice_override = Some(fresh);
+                    }
+                    vec![Action::ButtonClick, Action::Redetect]
+                }
                 Target::Button(action) => vec![Action::ButtonClick, action],
                 // A disabled control does nothing: no sound, no preset change.
                 Target::Item(item) if item.blocked(s).is_some() => Vec::new(),
@@ -985,7 +1155,7 @@ impl GraphicsUi {
     }
     pub fn scroll(&mut self, level: Level, s: &Settings, h: f32, amount: f32) {
         let content = Self::content_height(level, s);
-        let (top, bottom) = Self::bounds(h);
+        let (top, bottom) = self.bounds_for(level, h);
         self.scroll.clamp(top, bottom, content);
         self.scroll.wheel(amount, 18.0, top, bottom, content);
     }
@@ -1265,16 +1435,92 @@ mod tests {
     fn presets_set_vanilla_and_horizon_options() {
         let mut s = Settings::default();
         Item::Horizon(H::Preset).cycle(&mut s, false, [854, 480]);
-        assert_eq!(s.horizon.preset, Preset::Performance);
-        assert_eq!(s.render_distance, 8);
+        assert_eq!(s.horizon.preset, Preset::Potato);
+        assert_eq!(s.render_distance, 6);
         assert_eq!(s.clouds, "false");
+        Item::Horizon(H::Preset).cycle(&mut s, false, [854, 480]);
+        assert_eq!(s.horizon.preset, Preset::Low);
+        assert_eq!(s.render_distance, 8);
+        assert_eq!(s.horizon.mod_texture_cap, 64);
         // Any quality change leaves the preset.
         Item::Vanilla(Opt::Clouds).cycle(&mut s, false, [854, 480]);
+        assert_eq!(s.horizon.preset, Preset::Custom);
+        Item::Horizon(H::Preset).cycle(&mut s, false, [854, 480]);
+        Item::Horizon(H::EntityLod).cycle(&mut s, false, [854, 480]);
         assert_eq!(s.horizon.preset, Preset::Custom);
         // Display preferences keep it.
         Item::Horizon(H::Preset).cycle(&mut s, true, [854, 480]);
         Item::Vanilla(Opt::Vsync).cycle(&mut s, false, [854, 480]);
         assert_eq!(s.horizon.preset, Preset::Ultra);
+    }
+
+    #[test]
+    fn hardware_banner_applies_recommended_preset_only_on_click() {
+        let advice = crate::graphics::recommend_preset(&crate::graphics::HardwareProfile {
+            cpu_name: Some("Test CPU".into()),
+            cpu_cores: Some(4),
+            cpu_threads: Some(8),
+            ram_mb: Some(8192),
+            memory_kind: horizon_telemetry::system::MemoryKind::Unknown,
+            memory_channels: 0,
+            single_channel: false,
+            gpu_name: "AMD Radeon RX 580".into(),
+            gpu_vendor: "amd".into(),
+            device_type: wgpu::DeviceType::DiscreteGpu,
+            backend: wgpu::Backend::Vulkan,
+            vram_mb: Some(4096),
+            driver: "AMD".into(),
+            driver_info: "2.0.280".into(),
+            bc_supported: true,
+        });
+        assert_eq!(advice.preset, Preset::Low);
+
+        let mut s = Settings::default();
+        let initial_rd = s.render_distance;
+        let mut ui = GraphicsUi {
+            advice_override: Some(advice),
+            ..Default::default()
+        };
+        let size = (640.0, 400.0);
+        let (widgets, _, _) = ui.layout(Level::Simple, &s, size.0, size.1);
+        assert_eq!(
+            s.render_distance, initial_rd,
+            "recommendation never forces settings"
+        );
+        let apply = widgets
+            .iter()
+            .find(|w| matches!(w.target, Target::Button(Action::ApplyRecommended)))
+            .unwrap();
+        assert_eq!(
+            ui.click(
+                Level::Simple,
+                &mut s,
+                (apply.x + 1.0, apply.y + 1.0),
+                size,
+                [854, 480],
+                false,
+                false
+            ),
+            vec![Action::ButtonClick, Action::Changed]
+        );
+        assert_eq!(s.horizon.preset, Preset::Low);
+        assert_eq!(s.render_distance, 8);
+        let redetect = widgets
+            .iter()
+            .find(|w| matches!(w.target, Target::Button(Action::Redetect)))
+            .unwrap();
+        assert_eq!(
+            ui.click(
+                Level::Simple,
+                &mut s,
+                (redetect.x + 1.0, redetect.y + 1.0),
+                size,
+                [854, 480],
+                false,
+                false
+            ),
+            vec![Action::ButtonClick, Action::Redetect]
+        );
     }
 
     #[test]
@@ -1341,7 +1587,7 @@ mod tests {
             .unwrap();
         let point = (switch.x + 1.0, switch.y + 1.0);
         for enabled in [false, true] {
-            s.horizon.preset = Preset::Balanced;
+            s.horizon.preset = Preset::Medium;
             assert_eq!(
                 ui.click(
                     Level::Advanced,

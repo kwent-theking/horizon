@@ -1,6 +1,6 @@
 //! The part of `facts.json` the block registry reads, deserialized as it
 //! streams: each row's state (its fifth column) and the defaults.
-use crate::chunk::BlockState;
+use crate::chunk::{BlockProperties, BlockState};
 use serde::{
     Deserialize, Deserializer,
     de::{self, IgnoredAny, SeqAccess, Visitor},
@@ -60,13 +60,13 @@ impl<'de> Deserialize<'de> for State {
             Full {
                 id: String,
                 #[serde(default)]
-                properties: BTreeMap<String, String>,
+                properties: BlockProperties,
             },
         }
         Ok(State(match Shape::deserialize(deserializer)? {
             Shape::Name(name) => BlockState {
                 name,
-                properties: BTreeMap::new(),
+                properties: BlockProperties::default(),
             },
             Shape::Full { id, properties } => BlockState {
                 name: id,

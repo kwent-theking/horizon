@@ -3,11 +3,7 @@
 //! repository root) and are skipped when those are absent.
 use super::*;
 use crate::chunk::BlockState;
-use std::{
-    collections::{BTreeMap, HashMap},
-    path::PathBuf,
-    sync::OnceLock,
-};
+use std::{collections::HashMap, path::PathBuf, sync::OnceLock};
 
 struct Fixture {
     registry: BlockRegistry,
@@ -122,7 +118,7 @@ impl<'f> World<'f> {
             properties: props
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect::<BTreeMap<_, _>>(),
+                .collect(),
         };
         self.f
             .registry

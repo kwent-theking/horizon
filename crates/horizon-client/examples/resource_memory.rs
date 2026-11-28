@@ -96,11 +96,13 @@ fn main() -> Result<()> {
     let assets = Assets::load(&root)?;
     let render = assets.reload(&root)?;
     step("assets");
+    let (px_len, px_stored) = render.pixel_bytes();
     println!(
-        "  sprites: {} layers of {}px, {:.0} MB of pixels",
+        "  sprites: {} layers of {}px, {:.0} MB of pixels ({:.0} MB CPU backing)",
         render.texture_layers,
         render.sprite_size,
-        render.pixels.len() as f64 / MB
+        px_len as f64 / MB,
+        px_stored as f64 / MB
     );
     // The game decodes gameplay facts once for both tables (BlockFacts::load_pair).
     let (facts, behaviours) = BlockFacts::load_pair(&root, assets.registry)?;

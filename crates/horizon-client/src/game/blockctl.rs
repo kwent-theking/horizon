@@ -2,9 +2,11 @@
 //! `getblock` and `container` (list or put items in a block entity).
 use super::Game;
 use horizon_client::{Result, containers::BlockEntity, items::ItemStack};
-use horizon_world::{chunk::BlockState, registry::BlockStateId};
+use horizon_world::{
+    chunk::{BlockProperties, BlockState},
+    registry::BlockStateId,
+};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
 
 pub(super) const HELP: &[&str] = &[
     "setblock X Y Z BLOCK[props]    set a block with neighbour updates",
@@ -23,7 +25,7 @@ fn parse_state(text: &str) -> Result<BlockState> {
     } else {
         format!("minecraft:{name}")
     };
-    let mut properties = BTreeMap::new();
+    let mut properties = BlockProperties::default();
     for pair in props.split(',').filter(|p| !p.is_empty()) {
         let (k, v) = pair.split_once('=').ok_or("properties are key=value")?;
         properties.insert(k.to_owned(), v.to_owned());

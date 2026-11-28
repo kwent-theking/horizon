@@ -21,8 +21,8 @@ use horizon_world::{
     fluid::{FluidKind, FluidState},
     registry::BlockStateId,
 };
-pub use sides::Sides;
-use std::sync::Arc;
+pub use sides::{Sides, SortScratch};
+use std::{ops::Index, sync::Arc};
 
 /// An entity, item and effect vertex (the entity pipelines), with a face
 /// normal for `entity.wgsl`'s directional light.
@@ -176,10 +176,31 @@ impl SectionMesh {
     pub fn sort_solid(&mut self) {
         self.sides = sides::sort(&mut self.solid);
     }
+    /// [`Self::sort_solid`] reusing worker scratch buffers.
+    pub fn sort_solid_with(&mut self, scratch: &mut sides::SortScratch) {
+        self.sides = sides::sort_with_scratch(&mut self.solid, scratch);
+    }
+    /// Clears emitted geometry while keeping the underlying buffer capacity for reuse.
+    pub fn reset_keeping_capacity(&mut self) {
+        self.solid.clear();
+        self.sides = Sides::default();
+        self.translucent.clear();
+        self.visibility = ALL_VISIBLE;
+        self.block_entities.clear();
+    }
 }
 pub const ALL_VISIBLE: u64 = (1 << 36) - 1;
 /// VisGraph.resolve: flood fill non-opaque cells and connect the faces each region touches.
+#[cfg(test)]
 fn visibility(pad: &Padded, info: &[Info]) -> u64 {
+    visibility_with_scratch(pad, |id| info[id].solid, &mut Vec::new())
+}
+
+fn visibility_with_scratch(
+    pad: &Padded,
+    solid: impl Fn(usize) -> bool,
+    stack: &mut Vec<usize>,
+) -> u64 {
     // Opaque cells are already visited: resolve each state's opacity once,
     // then reuse this map for the flood fill and the uniform-section shortcuts.
     let mut seen = [false; 4096];
@@ -188,7 +209,7 @@ fn visibility(pad: &Padded, info: &[Info]) -> u64 {
         for z in 0..16 {
             let row = pi(0, y, z);
             for x in 0..16 {
-                let opaque = info[pad.blocks[row + x] as usize].solid;
+                let opaque = solid(pad.blocks[row + x] as usize);
                 seen[(y as usize) << 8 | (z as usize) << 4 | x] = opaque;
                 opaque_count += usize::from(opaque);
             }
@@ -201,7 +222,7 @@ fn visibility(pad: &Padded, info: &[Info]) -> u64 {
         return 0;
     }
     let mut result = 0u64;
-    let mut stack = Vec::new();
+    stack.clear();
     for start in 0..4096usize {
         if seen[start] {
             continue;
@@ -272,7 +293,7 @@ fn visibility(pad: &Padded, info: &[Info]) -> u64 {
 mod particle_tests;
 #[cfg(test)]
 mod visibility_tests;
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Tint {
     None,
     Grass,
@@ -289,7 +310,7 @@ enum Tint {
     Stem(u8),
 }
 /// Per-state data the mesher needs on every block, flattened for speed.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct Info {
     /// `isSolidRender`.
     solid: bool,
@@ -298,20 +319,20 @@ struct Info {
     /// `isLightPermeable`: diagonal AO samples are taken through such side blocks.
     permeable: bool,
     /// `getShadeBrightness` (ambient occlusion contribution).
-    shade: f32,
+    shade: u32,
     emission: u8,
     /// `hdr_tier`.
     tier: u8,
     /// `emissiveRendering`: drawn and sampled at full brightness.
     emissive: bool,
     fluid: FluidState,
-    model: bool,
+    model: TerrainModel,
     /// The state has a block entity (candidates for block-entity renderers).
     block_entity: bool,
     tints: [Tint; 2],
     tint_count: u8,
     /// `OffsetType` as (max horizontal, max vertical): vertical 0 for XZ.
-    offset: Option<(f32, f32)>,
+    offset: Option<(u32, u32)>,
     /// `isSolid()` (legacy), for fluid corner heights.
     legacy_solid: bool,
     /// `HalfTransparentBlock`/`LeavesBlock`: water sides show the overlay sprite.
@@ -325,7 +346,56 @@ struct Info {
     face: [u8; 6],
     /// Height from the bottom over which face `d`, flush with the `d` side, covers
     /// the full width (vertical faces: 1 when the whole square is covered).
-    cover: [f32; 6],
+    // Stored as float bits so interning preserves signed zero and every other value.
+    cover: [u32; 6],
+}
+impl Info {
+    fn shade(&self) -> f32 {
+        f32::from_bits(self.shade)
+    }
+
+    fn cover(&self, direction: usize) -> f32 {
+        f32::from_bits(self.cover[direction])
+    }
+}
+
+/// Dense state IDs index a pool of exact meshing records.
+struct StateInfo {
+    rows: Box<[Info]>,
+    indices: Box<[u32]>,
+}
+impl StateInfo {
+    fn from_rows<E>(
+        states: usize,
+        rows: impl IntoIterator<Item = Result<Info, E>>,
+    ) -> Result<Self, E> {
+        let mut by_row = crate::fast_hash::FxHashMap::default();
+        let mut unique = Vec::new();
+        let mut indices = Vec::with_capacity(states);
+        for row in rows {
+            let row = row?;
+            indices.push(*by_row.entry(row).or_insert_with(|| {
+                let id = unique.len() as u32;
+                unique.push(row);
+                id
+            }));
+        }
+        Ok(Self {
+            rows: unique.into(),
+            indices: indices.into(),
+        })
+    }
+
+    fn get(&self, state: usize) -> Option<&Info> {
+        self.indices.get(state).map(|&id| &self.rows[id as usize])
+    }
+}
+impl Index<usize> for StateInfo {
+    type Output = Info;
+
+    fn index(&self, state: usize) -> &Info {
+        &self.rows[self.indices[state] as usize]
+    }
 }
 /// Derived per-state facts, exposed for the section-mesh parity gate.
 #[derive(Clone, Copy, Debug)]
@@ -341,7 +411,7 @@ pub struct MeshFacts {
     pub tint_sources: u8,
 }
 pub struct MeshTables {
-    info: Vec<Info>,
+    info: StateInfo,
     pub visibility: FaceVisibility,
     water_still: u16,
     water_flow: u16,
@@ -349,6 +419,105 @@ pub struct MeshTables {
     lava_still: u16,
     lava_flow: u16,
 }
+/// Create blocks whose entire model is drawn turning by the kinetic renderer,
+/// so the chunk terrain mesher omits their blockstate model completely.
+/// Blocks with static casings (fans, drills, presses, saws, mixers, millstones)
+/// are meshed into chunk terrain normally, and only their partial models are animated.
+pub fn is_kinetic_part(name: &str) -> bool {
+    matches!(
+        name,
+        "create:shaft"
+            | "create:cogwheel"
+            | "create:large_cogwheel"
+            | "create:crushing_wheel"
+            | "create:large_water_wheel"
+            | "create:turntable"
+            | "create:flywheel"
+            | "create:powered_shaft"
+            | "create_enchantment_industry:mechanical_grindstone"
+    ) || is_create_valve_handle(name)
+}
+
+fn is_create_valve_handle(name: &str) -> bool {
+    name.starts_with("create:") && name.ends_with("_valve_handle")
+}
+
+/// Create doors that use the kinetic renderer while their terrain model is hidden.
+pub fn is_create_animated_door(name: &str) -> bool {
+    matches!(
+        name,
+        "create:train_door"
+            | "create:framed_glass_door"
+            | "create:brass_door"
+            | "create:andesite_door"
+            | "create:copper_door"
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum TerrainModel {
+    None,
+    AllChunks,
+    PlotOnly,
+}
+
+impl TerrainModel {
+    fn for_state(name: &str, shape: RenderShape, visible: Option<&str>) -> Self {
+        if shape != RenderShape::Model {
+            Self::None
+        } else if (visible == Some("false") && is_create_animated_door(name))
+            || name == "create_new_age:generator_coil"
+            || is_create_valve_handle(name)
+        {
+            // Keep static models in Sable plots until kinetic geometry uses their poses.
+            Self::PlotOnly
+        } else if is_kinetic_part(name) {
+            Self::None
+        } else {
+            Self::AllChunks
+        }
+    }
+
+    fn draws(self, is_plot: bool) -> bool {
+        self == Self::AllChunks || (is_plot && self == Self::PlotOnly)
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn create_doors_hide_both_terrain_halves_during_animation() {
+    for name in [
+        "create:train_door",
+        "create:framed_glass_door",
+        "create:brass_door",
+        "create:andesite_door",
+        "create:copper_door",
+    ] {
+        let animated = TerrainModel::for_state(name, RenderShape::Model, Some("false"));
+        assert!(!animated.draws(false));
+        assert!(animated.draws(true));
+        assert!(TerrainModel::for_state(name, RenderShape::Model, Some("true")).draws(false));
+        assert!(TerrainModel::for_state(name, RenderShape::Model, None).draws(false));
+    }
+    assert!(
+        TerrainModel::for_state("other_mod:door", RenderShape::Model, Some("false")).draws(false)
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn kinetic_generator_and_valves_keep_plot_fallbacks() {
+    for name in [
+        "create_new_age:generator_coil",
+        "create:copper_valve_handle",
+        "create:lime_valve_handle",
+    ] {
+        let terrain = TerrainModel::for_state(name, RenderShape::Model, None);
+        assert!(!terrain.draws(false));
+        assert!(terrain.draws(true));
+    }
+}
+
 fn stem_color(age: u8) -> u32 {
     let a = u32::from(age);
     (a * 32) << 16 | (255 - a * 8) << 8 | (a * 4)
@@ -383,8 +552,8 @@ impl MeshTables {
                 .ok_or_else(|| format!("missing fluid sprite {name}").into())
         };
         let mut covers = std::collections::HashMap::new();
-        let mut info = Vec::with_capacity(facts.states.len());
-        for (id, s) in facts.states.iter().enumerate() {
+        let row = |id: usize| -> crate::Result<Info> {
+            let s = &facts.states[id];
             let state = assets
                 .registry
                 .state(BlockStateId(id as u32))
@@ -428,7 +597,7 @@ impl MeshTables {
                 "LightBlock",
                 "StructureVoidBlock",
             ];
-            let shade = if overrides.iter().any(|c| s.has_class(c)) {
+            let shade: f32 = if overrides.iter().any(|c| s.has_class(c)) {
                 1.0
             } else if s.has_class("SoulSandBlock") || s.has_class("MudBlock") {
                 0.2
@@ -444,17 +613,17 @@ impl MeshTables {
                     && props.get("sculk_sensor_phase").map(String::as_str) == Some("active"));
             // OffsetType.XZ/XYZ with getMaxHorizontalOffset/getMaxVerticalOffset.
             let offset = s.random_offset.then(|| {
-                let horizontal = if s.has_class("SpeleothemBlock") {
+                let horizontal: f32 = if s.has_class("SpeleothemBlock") {
                     0.125
                 } else {
                     0.25
                 };
-                let vertical = match name {
+                let vertical: f32 = match name {
                     "small_dripleaf" => 0.1,
                     "short_grass" | "fern" | "short_dry_grass" | "tall_dry_grass" => 0.2,
                     _ => 0.0,
                 };
-                (horizontal, vertical)
+                (horizontal.to_bits(), vertical.to_bits())
             });
             let mut face = [0u8; 6];
             let mut cover = [0f32; 6];
@@ -467,16 +636,20 @@ impl MeshTables {
                     .entry((face_id, d as u8))
                     .or_insert_with(|| fluid::coverage(shape, d));
             }
-            info.push(Info {
+            Ok(Info {
                 solid: s.solid_render,
                 full: s.full_collision,
                 permeable: !s.solid_render || s.dampening == 0,
-                shade,
+                shade: shade.to_bits(),
                 emission: s.emission,
                 tier: hdr_tier(name, s.emission),
                 emissive,
                 fluid: FluidState::from_block(state)?,
-                model: s.render_shape == RenderShape::Model,
+                model: TerrainModel::for_state(
+                    &s.name,
+                    s.render_shape,
+                    props.get("visible").map(String::as_str),
+                ),
                 block_entity: s.block_entity,
                 tints,
                 tint_count,
@@ -488,11 +661,11 @@ impl MeshTables {
                 ice: s.has_class("IceBlock"),
                 sturdy: s.sturdy_full,
                 face,
-                cover,
-            });
-        }
+                cover: cover.map(f32::to_bits),
+            })
+        };
         Ok(Self {
-            info,
+            info: StateInfo::from_rows(facts.states.len(), (0..facts.states.len()).map(row))?,
             visibility,
             water_still: layer("minecraft:block/water_still")?,
             water_flow: layer("minecraft:block/water_flow")?,
@@ -504,7 +677,7 @@ impl MeshTables {
     pub fn facts(&self, state: BlockStateId) -> Option<MeshFacts> {
         let i = self.info.get(state.0 as usize)?;
         Some(MeshFacts {
-            shade: i.shade,
+            shade: i.shade(),
             emissive: i.emissive,
             legacy_solid: i.legacy_solid,
             light_permeable: i.permeable,
@@ -553,7 +726,8 @@ impl MeshTables {
         }
         let [x, y, z] = pos;
         let origin = [x >> 4, z >> 4, y & !15];
-        let mut tints = Tints::new(region, biomes, zoom, blend_radius, origin);
+        let mut layers = Default::default();
+        let mut tints = Tints::new(region, biomes, zoom, blend_radius, origin, &mut layers);
         Mesher::tint(info, 0, &mut tints, [x & 15, y & 15, z & 15])
     }
     /// `BlockColors` for each of the state's tint indices at `pos`, as the
@@ -571,7 +745,8 @@ impl MeshTables {
         let sources = self.info.get(state.0 as usize).map(|info| {
             let [x, y, z] = pos;
             let origin = [x >> 4, z >> 4, y & !15];
-            let mut tints = Tints::new(region, biomes, zoom, blend_radius, origin);
+            let mut layers = Default::default();
+            let mut tints = Tints::new(region, biomes, zoom, blend_radius, origin, &mut layers);
             let local = [x & 15, y & 15, z & 15];
             let colors = [0, 1].map(|i| Mesher::tint(info, i, &mut tints, local));
             (colors, i32::from(info.tint_count))
@@ -593,7 +768,7 @@ impl MeshTables {
         &self,
         state: BlockStateId,
         pos: [i32; 3],
-        quad: &horizon_assets::bake::ModelQuad,
+        quad: &crate::models::catalog::BakedQuad,
         light: impl Fn([i32; 3]) -> u8,
     ) -> u32 {
         let own = self.info.get(state.0 as usize);
@@ -614,6 +789,7 @@ impl MeshTables {
 /// `OffsetType.XZ`/`XYZ`: a per-column jitter from `Mth.getSeed(x, 0, z)`.
 fn offset(info: &Info, x: i32, z: i32) -> Option<[f64; 3]> {
     let (horizontal, vertical) = info.offset?;
+    let (horizontal, vertical) = (f32::from_bits(horizontal), f32::from_bits(vertical));
     let seed = position_seed(BlockPos::new(x, 0, z));
     let nibble = |shift: u32| ((seed >> shift) & 15) as f32 / 15.0;
     let h = f64::from(horizontal);
@@ -635,17 +811,22 @@ struct Padded {
     blocks: Vec<u32>,
     light: Vec<u8>,
 }
+impl Default for Padded {
+    fn default() -> Self {
+        Self {
+            blocks: vec![0u32; P * P * P],
+            light: vec![0u8; P * P * P],
+        }
+    }
+}
 impl Padded {
-    fn new(region: &[[Option<&Chunk>; 3]; 3], sy: i32) -> Self {
-        let mut blocks = vec![0u32; P * P * P];
-        let mut light = vec![0u8; P * P * P];
+    fn fill(&mut self, own: &mut [u32; 4096], region: &[[Option<&Chunk>; 3]; 3], sy: i32) {
         let base_y = MIN_Y + sy * 16;
         // The section itself is unpacked in one pass; the border cells of the
         // neighbouring sections are read one by one.
-        let mut own = Box::new([0u32; 4096]);
         let center = region[1][1].map(|c| &c.sections[sy as usize]);
         if let Some(section) = center {
-            section.unpack(&mut own);
+            section.unpack(own);
         }
         for y in -B..16 + B {
             let wy = base_y + y;
@@ -654,21 +835,21 @@ impl Padded {
                     let chunk = region[((z + 16) >> 4) as usize][((x + 16) >> 4) as usize];
                     let i = pi(x, y, z);
                     if let Some(c) = chunk {
-                        blocks[i] =
+                        self.blocks[i] =
                             if (0..16).contains(&x) && (0..16).contains(&y) && (0..16).contains(&z)
                             {
                                 own[(y << 8 | z << 4 | x) as usize]
                             } else {
                                 c.get(x & 15, wy, z & 15)
                             };
-                        light[i] = c.light(x & 15, wy, z & 15);
+                        self.light[i] = c.light(x & 15, wy, z & 15);
                     } else {
-                        light[i] = 0xF0;
+                        self.blocks[i] = 0;
+                        self.light[i] = 0xF0;
                     }
                 }
             }
         }
-        Self { blocks, light }
     }
 }
 /// Set on a terrain vertex's sprite layer when its texture alpha must be ignored.
@@ -733,7 +914,8 @@ struct Tints<'a> {
     plains: u16,
     /// Chunk x, chunk z and the section's lowest block y.
     origin: [i32; 3],
-    layers: [Option<Box<Layer>>; 16],
+    layers: &'a mut [Option<Box<Layer>>; 16],
+    initialized_mask: u16,
 }
 impl<'a> Tints<'a> {
     fn new(
@@ -742,6 +924,7 @@ impl<'a> Tints<'a> {
         zoom: BiomeZoom,
         radius: i32,
         origin: [i32; 3],
+        layers: &'a mut [Option<Box<Layer>>; 16],
     ) -> Self {
         Self {
             region,
@@ -750,19 +933,29 @@ impl<'a> Tints<'a> {
             radius: radius.clamp(0, 7),
             plains: biomes.id("minecraft:plains"),
             origin,
-            layers: Default::default(),
+            layers,
+            initialized_mask: 0,
         }
     }
     /// The blended tint of block `(x, y, z)` (section-local x/z, y in 0..16).
     fn get(&mut self, resolver: Resolver, x: i32, y: i32, z: i32) -> u32 {
         let r = self.radius;
         let dim = (16 + 2 * r) as usize;
+        let bit = 1u16 << y;
         let layer = self.layers[y as usize].get_or_insert_with(|| {
             Box::new(Layer {
                 zoomed: vec![NO_BIOME; dim * dim],
                 colors: [[UNSET; 256]; 4],
             })
         });
+        if self.initialized_mask & bit == 0 {
+            self.initialized_mask |= bit;
+            if layer.zoomed.len() != dim * dim {
+                layer.zoomed.resize(dim * dim, NO_BIOME);
+            }
+            layer.zoomed.fill(NO_BIOME);
+            layer.colors = [[UNSET; 256]; 4];
+        }
         let slot = (z * 16 + x) as usize;
         let cached = layer.colors[resolver as usize][slot];
         if cached != UNSET {
@@ -837,17 +1030,77 @@ pub struct Mesher<'a> {
     /// The `cutoutLeaves` option (fancy graphics); off makes leaves opaque.
     pub cutout_leaves: bool,
 }
+/// Worker-owned scratch storage reused across sections to eliminate per-section heap allocations
+/// and 56 KB zeroing copies on slow-memory hosts.
+pub struct MeshScratch {
+    pad: Padded,
+    own: Box<[u32; 4096]>,
+    vis_stack: Vec<usize>,
+    tint_layers: [Option<Box<Layer>>; 16],
+    pub sides: SortScratch,
+}
+
+impl Default for MeshScratch {
+    fn default() -> Self {
+        Self {
+            pad: Padded::default(),
+            own: Box::new([0u32; 4096]),
+            vis_stack: Vec::new(),
+            tint_layers: Default::default(),
+            sides: SortScratch::default(),
+        }
+    }
+}
+
 impl Mesher<'_> {
     /// `region[dz][dx]` are the chunks around the meshed column (centre 1,1).
     pub fn mesh(&mut self, region: &[[Option<&Chunk>; 3]; 3], sy: i32) -> SectionMesh {
         let mut out = SectionMesh::default();
+        let mut scratch = MeshScratch::default();
+        self.mesh_into(region, sy, &mut scratch, &mut out);
+        out
+    }
+
+    /// Meshes one section into `out`, reusing buffers held in `scratch`.
+    pub fn mesh_into(
+        &mut self,
+        region: &[[Option<&Chunk>; 3]; 3],
+        sy: i32,
+        scratch: &mut MeshScratch,
+        out: &mut SectionMesh,
+    ) {
+        self.mesh_with(region, sy, scratch, out, false);
+    }
+
+    /// Mesh a section from a tracked plot's own column neighborhood.
+    pub fn mesh_plot_into(
+        &mut self,
+        region: &[[Option<&Chunk>; 3]; 3],
+        sy: i32,
+        scratch: &mut MeshScratch,
+        out: &mut SectionMesh,
+    ) {
+        self.mesh_with(region, sy, scratch, out, true);
+    }
+
+    fn mesh_with(
+        &mut self,
+        region: &[[Option<&Chunk>; 3]; 3],
+        sy: i32,
+        scratch: &mut MeshScratch,
+        out: &mut SectionMesh,
+        is_plot: bool,
+    ) {
+        out.reset_keeping_capacity();
         let center = region[1][1].expect("centre chunk");
         let section = &center.sections[sy as usize];
         if section.is_uniform(0) {
-            return out;
+            return;
         }
-        let pad = Padded::new(region, sy);
-        out.visibility = visibility(&pad, &self.tables.info);
+        scratch.pad.fill(&mut scratch.own, region, sy);
+        let pad = &scratch.pad;
+        out.visibility =
+            visibility_with_scratch(pad, |id| self.tables.info[id].solid, &mut scratch.vis_stack);
         let base_y = MIN_Y + sy * 16;
         let mut tints = Tints::new(
             region,
@@ -855,6 +1108,7 @@ impl Mesher<'_> {
             self.zoom,
             self.blend_radius,
             [center.x, center.z, base_y],
+            &mut scratch.tint_layers,
         );
         let info = &self.tables.info;
         let catalog = &self.render.model_catalog;
@@ -882,9 +1136,9 @@ impl Mesher<'_> {
                     if state.fluid.kind() != FluidKind::Empty {
                         let water = tints.get(Resolver::Water, x, y, z);
                         let nether = self.nether_shading;
-                        fluid::tesselate(self.tables, nether, &pad, water, &mut out, [x, y, z]);
+                        fluid::tesselate(self.tables, nether, pad, water, out, [x, y, z]);
                     }
-                    if !state.model {
+                    if !state.model.draws(is_plot) {
                         continue;
                     }
                     let world = BlockPos::new(center.x * 16 + x, base_y + y, center.z * 16 + z);
@@ -927,26 +1181,16 @@ impl Mesher<'_> {
                                 .unwrap_or(true);
                     }
                     for model in &models {
-                        for face in &model.faces {
+                        for face in model.faces.iter() {
                             if face.quad.cull.is_some_and(|d| !visible[d as usize]) {
                                 continue;
                             }
-                            self.face(
-                                &pad,
-                                &mut tints,
-                                &mut out,
-                                [x, y, z],
-                                origin,
-                                face,
-                                ao,
-                                state,
-                            );
+                            self.face(pad, &mut tints, out, [x, y, z], origin, face, ao, state);
                         }
                     }
                 }
             }
         }
-        out
     }
     /// `BlockColors` tint source `index`, or `None` for an untinted (-1) layer.
     fn tint(state: &Info, index: i32, tints: &mut Tints, [x, y, z]: [i32; 3]) -> Option<u32> {

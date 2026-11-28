@@ -2,6 +2,11 @@
 #![forbid(unsafe_code)]
 mod game;
 
+/// Counts live heap bytes so the memory log lines can say what is held, not
+/// only what the allocator has reserved.
+#[global_allocator]
+static ALLOCATOR: horizon_threads::CountingAllocator = horizon_threads::CountingAllocator;
+
 use horizon_client::{crash, logging};
 
 /// The mod API level this game serves, kept in the program for the launcher

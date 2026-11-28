@@ -36,6 +36,7 @@ pub mod finalize;
 pub mod fox;
 pub mod frog;
 pub mod gear;
+pub mod gecko;
 pub mod goals;
 pub mod goat;
 pub mod golem;
@@ -48,6 +49,7 @@ pub mod keyframes;
 pub mod leash;
 pub mod living;
 pub mod llama;
+pub mod modded;
 pub mod monster_brain;
 pub mod nautilus;
 pub mod nav;
@@ -100,7 +102,12 @@ use horizon_core::{
 };
 use horizon_world::block_collision::BlockCollisionRegistry;
 use serde_json::Value;
-use std::{collections::HashMap, fs, path::Path, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    path::Path,
+    sync::Arc,
+};
 
 #[derive(Clone, Debug)]
 pub struct Polygon {
@@ -406,12 +413,19 @@ pub struct MobTypes {
 }
 impl MobTypes {
     pub fn load(root: &Path) -> crate::Result<Self> {
+        let item_tags = crate::items::load_tags(root, "item").unwrap_or_default();
+        Self::load_with_item_tags(root, &item_tags)
+    }
+
+    pub fn load_with_item_tags(
+        root: &Path,
+        item_tags: &HashMap<String, HashSet<String>>,
+    ) -> crate::Result<Self> {
         let bytes = fs::read(root.join("entity-types.json"))?;
         let types: Value = serde_json::from_slice(&bytes)?;
         let exact = exact_attributes(&bytes);
         let models: Value = serde_json::from_slice(&fs::read(root.join("entity-models.json"))?)?;
-        let item_tags = crate::items::load_tags(root, "item").unwrap_or_default();
-        sulfur_cube::load_archetype_items(&item_tags);
+        sulfur_cube::load_archetype_items(item_tags);
         let tag = |name: &str| -> Arc<[String]> {
             let mut v: Vec<String> = item_tags
                 .get(&format!("minecraft:{name}"))

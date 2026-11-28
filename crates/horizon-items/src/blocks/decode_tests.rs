@@ -1,6 +1,80 @@
 use super::*;
 
 #[test]
+fn streamed_states_match_the_eager_decoder_for_replacements_and_defaults() -> crate::Result<()> {
+    for input in [
+        "null",
+        "[]",
+        "{}",
+        r#"{"states":null}"#,
+        r#"{"states":{}}"#,
+        r#"{"states":[]}"#,
+        r#"{"states":[null,[],{"id":2,"id":7,"sound":false}]}"#,
+        r#"{"states":[{"id":1}],"states":[{"id":2}]}"#,
+        r#"{"states":[{"id":1}],"states":false}"#,
+        r#"{"states":false,"states":[]}"#,
+    ] {
+        let eager: Gameplay<'_> = serde_json::from_str(input)?;
+        let expected = eager
+            .states
+            .0
+            .map(|rows| rows.iter().map(|row| row.id).collect::<Vec<_>>());
+        let mut actual = None;
+        stream(input.as_bytes(), |event| match event {
+            Row::Reset => actual = None,
+            Row::Array => actual = Some(Vec::new()),
+            Row::Entry(raw) => {
+                let entry: Entry<'_> = serde_json::from_str(raw.get()).unwrap();
+                actual.as_mut().unwrap().push(entry.id);
+            }
+        })?;
+        assert_eq!(actual, expected, "{input}");
+    }
+    Ok(())
+}
+
+#[test]
+fn streaming_delivers_rows_before_reading_the_rest_of_the_document() -> crate::Result<()> {
+    use std::{cell::Cell, io::Read, rc::Rc};
+    struct Chunked<'a> {
+        bytes: &'a [u8],
+        read: Rc<Cell<usize>>,
+    }
+    impl Read for Chunked<'_> {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            let count = out.len().min(self.bytes.len()).min(3);
+            out[..count].copy_from_slice(&self.bytes[..count]);
+            self.bytes = &self.bytes[count..];
+            self.read.set(self.read.get() + count);
+            Ok(count)
+        }
+    }
+    let input = format!(
+        r#"{{"states":[{{"id":0}},{{"id":1,"outline":[{}]}}]}}"#,
+        "[0,0,0,1,1,1],".repeat(100) + "[]"
+    );
+    let read = Rc::new(Cell::new(0));
+    let reader = Chunked {
+        bytes: input.as_bytes(),
+        read: read.clone(),
+    };
+    let mut rows = 0;
+    stream(reader, |event| {
+        if let Row::Entry(raw) = event {
+            let row: Entry<'_> = serde_json::from_str(raw.get()).unwrap();
+            assert_eq!(row.id, Some(rows));
+            if rows == 0 {
+                assert!(read.get() < input.len() / 2);
+            }
+            rows += 1;
+        }
+    })?;
+    assert_eq!(rows, 2);
+    assert_eq!(read.get(), input.len());
+    Ok(())
+}
+
+#[test]
 fn shape_identity_and_geometry_match_the_value_loader() -> crate::Result<()> {
     let inputs = [
         "[]",
@@ -23,8 +97,6 @@ fn shape_identity_and_geometry_match_the_value_loader() -> crate::Result<()> {
         .iter()
         .map(|s| serde_json::from_str::<Value>(s))
         .collect::<Result<Vec<_>, _>>()?;
-    // Value equality merges signed zero; the legacy string keys do not.
-    let keys: Vec<_> = values.iter().map(Value::to_string).collect();
     let mut shapes = Shapes::default();
     let actual = inputs
         .iter()
@@ -34,43 +106,39 @@ fn shape_identity_and_geometry_match_the_value_loader() -> crate::Result<()> {
             })
         })
         .collect::<crate::Result<Vec<_>>>()?;
-    for (i, value) in values.iter().enumerate() {
-        let expected: Vec<[f64; 6]> = value
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|b| {
-                let b = b.as_array()?;
-                Some(std::array::from_fn(|i| {
-                    b.get(i).and_then(Value::as_f64).unwrap_or(0.0)
-                }))
-            })
-            .collect();
+    let geometry_bits =
+        |boxes: &[[f64; 6]]| -> Vec<_> { boxes.iter().map(|row| row.map(f64::to_bits)).collect() };
+    let expected: Vec<Vec<[u64; 6]>> = values
+        .iter()
+        .map(|value| {
+            value
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|b| {
+                    let b = b.as_array()?;
+                    Some(std::array::from_fn(|i| {
+                        b.get(i).and_then(Value::as_f64).unwrap_or(0.0).to_bits()
+                    }))
+                })
+                .collect()
+        })
+        .collect();
+    for (i, shape) in actual.iter().enumerate() {
         // Bit comparisons include negative zero.
-        assert_eq!(
-            actual[i]
-                .iter()
-                .flatten()
-                .map(|v| v.to_bits())
-                .collect::<Vec<_>>(),
-            expected
-                .iter()
-                .flatten()
-                .map(|v| v.to_bits())
-                .collect::<Vec<_>>()
-        );
-        for j in 0..values.len() {
+        assert_eq!(geometry_bits(shape), expected[i]);
+        for (j, other) in actual.iter().enumerate() {
             assert_eq!(
-                Arc::ptr_eq(&actual[i], &actual[j]),
-                keys[i] == keys[j],
+                Arc::ptr_eq(shape, other),
+                expected[i] == expected[j],
                 "{i}, {j}"
             );
         }
     }
     for input in ["null", "false", "7", "{}", "\"shape\""] {
         let raw = serde_json::from_str(input)?;
-        let a = shapes.intern(Some(raw), || vec![[7.0; 6]])?;
-        let b = shapes.intern(Some(raw), || vec![[7.0; 6]])?;
+        let a = shapes.intern(Some(raw), || Arc::from([[7.0; 6]]))?;
+        let b = shapes.intern(Some(raw), || Arc::from([[7.0; 6]]))?;
         assert_eq!(&*a, &[[7.0; 6]]);
         assert!(!Arc::ptr_eq(&a, &b)); // Fallbacks were never interned.
     }

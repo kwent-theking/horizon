@@ -1,0 +1,121 @@
+name: Create and Big Cannons PNG review
+on:
+  push:
+    branches: [ci/proto-b]
+jobs:
+  fixture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev pkg-config mesa-vulkan-drivers libvulkan1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Fetch official Create and Big Cannons releases
+        shell: bash
+        run: |
+          curl --fail --location --retry 4 --max-time 180 \
+            'https://cdn.modrinth.com/data/LNytGWDc/versions/UjX6dr61/create-1.21.1-6.0.10.jar' \
+            --output "$RUNNER_TEMP/create-6.0.10.jar"
+          curl --fail --location --retry 4 --max-time 180 \
+            'https://cdn.modrinth.com/data/GWp4jCJj/versions/bOiDu0LS/createbigcannons-5.11.7%2Bmc.1.21.1.jar' \
+            --output "$RUNNER_TEMP/createbigcannons-5.11.7.jar"
+          printf '%s  %s\n' '11cc8fc049d2f67f6548c7abfada6b82a3adb5c7ca410a742de04bbca76e03862c518721b88d806f6e6d768a4d68531fdb903a85859b25d1484d550cc7bafd4b' "$RUNNER_TEMP/create-6.0.10.jar" | sha512sum --check
+          printf '%s  %s\n' '24f414dfbb973a0f4d9c9b2aa059edc7bed4d23b4f39eb1f7d23a1d6b437e3b5d64cca6e4b85ff7eb2815743fa711d54ad652bffe96d1eb1234544716006440d' "$RUNNER_TEMP/createbigcannons-5.11.7.jar" | sha512sum --check
+          addon() {
+            curl --fail --location --retry 4 --max-time 180 "$1" --output "$RUNNER_TEMP/$2"
+            printf '%s  %s\n' "$3" "$RUNNER_TEMP/$2" | sha512sum --check
+          }
+          addon 'https://cdn.modrinth.com/data/ResbpANg/versions/tivxiPTo/createoreexcavation-1.21-1.6.8.jar' createoreexcavation.jar \
+            844ae32ff0d22f4d3c83db3bae2f6edc0f74cd1a530f900bf18829838d5a354b1e439e52688416130d9fd9a52c3310458bbdbc7458f4c1c1d8ffb088ae802d32
+          addon 'https://cdn.modrinth.com/data/FTeXqI9v/versions/IwtuwMZy/create-new-age-1.2.0%2Bneoforge-mc1.21.1.jar' create-new-age.jar \
+            5075c6482b800af7044b594ad694855e7d56f386cb0354967eafe99d77e84b4e26ee7f880d287672d24d84ea8086fd074b7695e46632f32f215b31ce859ada72
+          addon 'https://cdn.modrinth.com/data/kU1G12Nn/versions/hsjVajlP/createaddition-1.7.2.jar' createaddition.jar \
+            f3a3ddb5600189da818fc71ea659d17f0d1097c5ad664433eed400b3ecc67d0f9305b348e5b7c5fd872d7a6e51330c7158b3181e77192c576c205a74dd0298ff
+          addon 'https://cdn.modrinth.com/data/JWGBpFUP/versions/L6VSDdC4/create-enchantment-industry-2.5.4b.jar' cei.jar \
+            c3d8511f5eec5a4ec7240f69cf6952038d72d4e32b48a0ace7b10d729a4073c1181e6dbcb2f1a1841480e5fc7bc7da3833b8ed4793dd0c3cc057eb8ac488eb3d
+          addon 'https://cdn.modrinth.com/data/oWaK0Q19/versions/44pLdPGg/create-aeronautics-bundled-1.21.1-1.3.2.jar' aeronautics.jar dc7e8e1148fa442243889ba29412207137e1bb86206e6c92bc0a589f1374a466e93de22bdbf14f753984d86c29308fbbdc0f14a4b9618b14c0ac1666a36b46f5
+          python3 - <<'PY'
+          import hashlib, json, os, urllib.request
+          manifest = json.load(urllib.request.urlopen("https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"))
+          version = next(v for v in manifest["versions"] if v["id"] == "1.21.1")
+          client = json.load(urllib.request.urlopen(version["url"]))["downloads"]["client"]
+          data = urllib.request.urlopen(client["url"]).read()
+          assert hashlib.sha1(data).hexdigest() == client["sha1"], "client jar sha1 mismatch"
+          open(os.path.join(os.environ["RUNNER_TEMP"], "minecraft-1.21.1-client.jar"), "wb").write(data)
+          PY
+      - name: Render the fixtures
+        shell: bash
+        env:
+          CARGO_TERM_COLOR: never
+          HORIZON_CREATE_FIXTURE_JAR: ${{ runner.temp }}/create-6.0.10.jar
+          HORIZON_CBC_FIXTURE_JAR: ${{ runner.temp }}/createbigcannons-5.11.7.jar
+          HORIZON_CREATE_FIXTURE_PNG: ${{ runner.temp }}/create.png
+          HORIZON_CREATE_FIXTURE_VANILLA_JAR: ${{ runner.temp }}/minecraft-1.21.1-client.jar
+          HORIZON_CREATE_BATCHES_PNG: ${{ runner.temp }}/create-batches.png
+          HORIZON_CONTRAPTION_FIXTURE_PNG: ${{ runner.temp }}/contraptions.png
+          HORIZON_CBC_FIRE_FIXTURE_PNG: ${{ runner.temp }}/cannon-fire.png
+          HORIZON_CBC_AUTOCANNON_FIXTURE_PNG: ${{ runner.temp }}/autocannon.png
+          HORIZON_ORE_EXCAVATION_FIXTURE_JAR: ${{ runner.temp }}/createoreexcavation.jar
+          HORIZON_NEW_AGE_FIXTURE_JAR: ${{ runner.temp }}/create-new-age.jar
+          HORIZON_ADDITIONS_FIXTURE_JAR: ${{ runner.temp }}/createaddition.jar
+          HORIZON_CEI_FIXTURE_JAR: ${{ runner.temp }}/cei.jar
+          HORIZON_EXTRA_ADDONS_FIXTURE_PNG: ${{ runner.temp }}/extra-addons.png
+          HORIZON_AERONAUTICS_FIXTURE_JAR: ${{ runner.temp }}/aeronautics.jar
+          HORIZON_AERONAUTICS_FIXTURE_PNG: ${{ runner.temp }}/aeronautics.png
+          XDG_RUNTIME_DIR: ${{ runner.temp }}
+        run: |
+          set +e
+          status=0
+          for test in game::kinetics::scene_test::create_fixture_public_assets \
+                      game::kinetics::scene_test::create_batches_fixture_public_assets \
+                      game::create_contraption::scene_test::contraption_fixture_public_assets \
+                      game::create_contraption::scene_test::cannon_fire_fixture_public_assets \
+                      game::create_contraption::scene_test::autocannon_recoil_fixture_public_assets \
+                      game::kinetics::scene_test::extra_addons_fixture_public_assets \n                      game::kinetics::scene_test::aeronautics_parts_fixture_public_assets; do
+            cargo test -p horizon-client --bin horizon-client "$test" -- --ignored --exact --nocapture || status=1
+          done
+          cat > "$RUNNER_TEMP/recipient.cert.pem" <<'PEM'
+          -----BEGIN CERTIFICATE-----
+          MIIDLTCCAhWgAwIBAgIUJRvXthRf9jkxaXBqXtKrQTkpyXkwDQYJKoZIhvcNAQEL
+          BQAwJjEkMCIGA1UEAwwbSG9yaXpvbiBQTkcgcmV2aWV3IGRlbGl2ZXJ5MB4XDTI2
+          MTEyNjE2MzkyM1oXDTI2MTEyODE2MzkyM1owJjEkMCIGA1UEAwwbSG9yaXpvbiBQ
+          TkcgcmV2aWV3IGRlbGl2ZXJ5MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKC
+          AQEAlw8FZQFGVIXc9x0AIN+kicn8k3t9PFAqbSjXu0UcP40Ag9kQLeEhn+0gTSOX
+          esN1OflWklVQ+ZGvncY7dzdyg+xLybPoN0eWn6TJQzspmBLzHU/46Kx97b5U/7Az
+          WbXws5bMDaPcC92PIRdxGI0B128Yi0q/ZVWxjk5wBoMA3YEEulp9e7x0qDH/e1YV
+          iTCUlq4f8uq39QpjOiE2Sl9ApnLMk1u617GLJPPyD/CS+5PytSzhCYLd5DkUAo62
+          Eo4HNq2EaaQwqVN93ILen7U8Bkc5bMBgo+feMGaBARqxRihA3l92D/qo22qc6/me
+          8raQ/KgLQqaR+wNfCQ+OYfFpEwIDAQABo1MwUTAdBgNVHQ4EFgQUCEudGuNk3Jnr
+          PTc+CA0kXprkd1IwHwYDVR0jBBgwFoAUCEudGuNk3JnrPTc+CA0kXprkd1IwDwYD
+          VR0TAQH/BAUwAwEB/zANBgkqhkiG9w0BAQsFAAOCAQEAkGqh/a7kS0KN0OuPVegO
+          G74OBKK5I/0gmcUv8HU7nmTI0mcTM5S3buGWbFQuz4szw0IHW0wUJI9WzGbdFHg2
+          d1W97tNKYWhyPxkP5zGV032J2ZxP6FgDdxLyCevCR7HxeWrN415As0OjEthCvAVF
+          IZhePyTVVklq8k796rOOsRtf2Zzla4RKJgnib7HsS/wyWKF+N9s/O8y01R8pN3TI
+          IIwENCKflFEh56D3Gpg7A69irRK1zbndKPK6/n+lRHm9PE/7E2FkL018jb9QKStd
+          4Utsvcv4kMuoGJi85mJkFmPRWGy7eN1D2m3I+zAXPwwKrIUbCvd16F4TFYJoXS5/
+          Cg==
+          -----END CERTIFICATE-----
+          PEM
+          mkdir -p "$RUNNER_TEMP/out"
+          for png in create create-batches contraptions cannon-fire autocannon extra-addons aeronautics; do
+            if [ -s "$RUNNER_TEMP/$png.png" ]; then
+              sha256sum "$RUNNER_TEMP/$png.png"
+              openssl cms -encrypt -aes-256-gcm -binary -in "$RUNNER_TEMP/$png.png" \
+                -outform DER -out "$RUNNER_TEMP/out/$png.png.der" "$RUNNER_TEMP/recipient.cert.pem"
+            else
+              echo "missing $png.png"
+            fi
+          done
+          exit $status
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: png-review-encrypted
+          path: ${{ runner.temp }}/out/
+          if-no-files-found: error
+          retention-days: 1

@@ -1867,10 +1867,7 @@ impl OptionsUi {
                             tr("horizon.mods.settings"),
                             Act::ModSettings(i),
                         );
-                        Row::Buttons(
-                            if dead { inactive(toggle) } else { toggle },
-                            Some(settings),
-                        )
+                        Row::Buttons(if dead { inactive(toggle) } else { toggle }, Some(settings))
                     } else {
                         let widget = button(0.0, 0.0, 310.0, label, Act::ToggleMod(i));
                         Row::Buttons(if dead { inactive(widget) } else { widget }, None)
@@ -2344,29 +2341,29 @@ impl OptionsUi {
                                 },
                                 list: false,
                             });
-                             y += padding + 18.0;
-                         }
-                         Row::Count(text) => {
-                             let label = text.with_style(&Style {
-                                 bold: Some(true),
-                                 underlined: Some(true),
-                                 ..Style::default()
-                             });
-                             out.push(Widget {
-                                 x: 0.0,
-                                 y: y + 6.0,
-                                 w,
-                                 h: 9.0,
-                                 kind: WKind::Text {
-                                     text: label,
-                                     color: u32::MAX,
-                                     centered: true,
-                                 },
-                                 list: false,
-                             });
-                             y += 18.0;
-                         }
-                         Row::Note(text) => {
+                            y += padding + 18.0;
+                        }
+                        Row::Count(text) => {
+                            let label = text.with_style(&Style {
+                                bold: Some(true),
+                                underlined: Some(true),
+                                ..Style::default()
+                            });
+                            out.push(Widget {
+                                x: 0.0,
+                                y: y + 6.0,
+                                w,
+                                h: 9.0,
+                                kind: WKind::Text {
+                                    text: label,
+                                    color: u32::MAX,
+                                    centered: true,
+                                },
+                                list: false,
+                            });
+                            y += 18.0;
+                        }
+                        Row::Note(text) => {
                             out.push(Widget {
                                 x: 0.0,
                                 y: y + 4.0,
@@ -2743,6 +2740,7 @@ impl OptionsUi {
                     Action::ButtonClick => events.push(Event::ButtonClick),
                     Action::Changed => events.push(Event::Changed),
                     Action::SliderDrag => events.push(Event::SliderDrag),
+                    Action::ApplyRecommended | Action::Redetect => {}
                     Action::OpenAdvanced => self.push(Page::GraphicsAdvanced),
                     Action::OpenHdr => self.push(Page::GraphicsHdr),
                     Action::OpenSimple => {
@@ -3656,7 +3654,7 @@ mod tests {
             })
             .collect();
         assert_eq!(rows.len(), 3);
-                // ModMenu-style interaction: the first click only selects, the
+        // ModMenu-style interaction: the first click only selects, the
         // second click on the same row toggles. Rows beyond the first are
         // dev/invalid, so their first click merely selects, too.
         for (i, row) in rows.iter().enumerate() {
@@ -3686,7 +3684,16 @@ mod tests {
         }
         // The first row is selected by the loop above: this click toggles.
         let row = rows[0];
-        let events = ui.click(&mut s, &atlas, row.x + 1.0, row.y + 1.0, size, [480, 240], false, false);
+        let events = ui.click(
+            &mut s,
+            &atlas,
+            row.x + 1.0,
+            row.y + 1.0,
+            size,
+            [480, 240],
+            false,
+            false,
+        );
         assert!(events.contains(&Event::Changed));
         assert!(events.contains(&Event::ButtonClick));
         assert!(s.mods.is_on(0));

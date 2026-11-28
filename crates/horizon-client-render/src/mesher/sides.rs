@@ -131,14 +131,29 @@ fn bucket(quad: &[TerrainVertex; 4]) -> usize {
     OTHER
 }
 
+/// Reusable scratch buffers for [`sort_with_scratch`] to avoid per-section heap allocations.
+#[derive(Default)]
+pub struct SortScratch {
+    buckets: Vec<u8>,
+    sorted: Vec<[TerrainVertex; 4]>,
+}
+
 /// Reorders `solid`'s quads by bucket, keeping their order inside each.
 pub fn sort(solid: &mut Vec<TerrainVertex>) -> Sides {
+    sort_with_scratch(solid, &mut SortScratch::default())
+}
+
+/// [`sort`] using caller-owned scratch storage so the worker avoids allocating per section.
+pub fn sort_with_scratch(solid: &mut Vec<TerrainVertex>, scratch: &mut SortScratch) -> Sides {
     let (quads, rest) = solid.as_chunks::<4>();
     debug_assert!(rest.is_empty(), "solid vertices come in quads");
-    let buckets: Vec<u8> = quads.iter().map(|q| bucket(q) as u8).collect();
+    scratch.buckets.clear();
+    scratch
+        .buckets
+        .extend(quads.iter().map(|q| bucket(q) as u8));
     let mut counts = [0u32; 7];
     let mut planes = [0f32; 7];
-    for (quad, &b) in quads.iter().zip(&buckets) {
+    for (quad, &b) in quads.iter().zip(&scratch.buckets) {
         let b = usize::from(b);
         if let Bucket::Side(axis, positive) = BUCKETS[b] {
             let p = quad[0].pos[axis];
@@ -158,13 +173,15 @@ pub fn sort(solid: &mut Vec<TerrainVertex>) -> Sides {
     }
     if counts.iter().filter(|&&c| c > 0).count() > 1 {
         let mut next: [u32; 7] = std::array::from_fn(|b| ends[b] - counts[b]);
-        let mut sorted = vec![quads[0]; quads.len()];
-        for (quad, &b) in quads.iter().zip(&buckets) {
+        scratch.sorted.clear();
+        scratch.sorted.resize(quads.len(), quads[0]);
+        for (quad, &b) in quads.iter().zip(&scratch.buckets) {
             let slot = &mut next[usize::from(b)];
-            sorted[*slot as usize] = *quad;
+            scratch.sorted[*slot as usize] = *quad;
             *slot += 1;
         }
-        *solid = sorted.into_flattened();
+        let (dst, _) = solid.as_chunks_mut::<4>();
+        dst.copy_from_slice(&scratch.sorted);
     }
     Sides { ends, planes }
 }
@@ -341,6 +358,41 @@ mod tests {
         assert_eq!(
             solid.iter().map(|v| v.layer).collect::<Vec<_>>(),
             before.iter().map(|v| v.layer).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn sort_with_scratch_matches_fresh_sort_across_multiple_sections() {
+        let mut scratch = SortScratch::default();
+        let make_mixed = |offset: f32| {
+            let mut v = cube([offset, 0.0, 0.0], 1);
+            v.extend(cube([offset + 1.0, 2.0, 3.0], 2));
+            v
+        };
+
+        let mut fresh_a = make_mixed(0.0);
+        let mut reused_a = fresh_a.clone();
+        let cap_before = reused_a.capacity();
+        assert_eq!(
+            sort(&mut fresh_a),
+            sort_with_scratch(&mut reused_a, &mut scratch)
+        );
+        assert_eq!(
+            bytemuck::cast_slice::<TerrainVertex, u8>(&fresh_a),
+            bytemuck::cast_slice::<TerrainVertex, u8>(&reused_a),
+        );
+        assert!(reused_a.capacity() >= cap_before);
+
+        // Smaller follow-up section shrinks logical length while preserving capacity and parity.
+        let mut fresh_b = cube([4.0, 1.0, 2.0], 3);
+        let mut reused_b = fresh_b.clone();
+        assert_eq!(
+            sort(&mut fresh_b),
+            sort_with_scratch(&mut reused_b, &mut scratch)
+        );
+        assert_eq!(
+            bytemuck::cast_slice::<TerrainVertex, u8>(&fresh_b),
+            bytemuck::cast_slice::<TerrainVertex, u8>(&reused_b),
         );
     }
 }

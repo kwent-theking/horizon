@@ -9,7 +9,11 @@ use super::Vertex;
 /// `RenderPipelines.ENTITY_SHADOW`), translucent-layer particles (15, drawn
 /// after translucent terrain: `SubmitNodeCollection.submitQuadParticleGroup`)
 /// and translucent item quads (32, drawn without depth writes).
-const MATERIALS: usize = 9;
+const MATERIALS: usize = 10;
+/// CBC's full-bright, additive `RenderType.eyes` overlays.
+pub const CBC_EYES_OVERLAY: u32 = 37;
+/// RGB displacement masks on block textures, used by CBC's splinters.
+pub(crate) const CBC_SHARD_OVERLAY: u32 = 38;
 /// The overlay of depth-only quads that hide water (`RenderTypes.waterMask`).
 pub const WATER_MASK_OVERLAY: u32 = 13;
 /// The overlay of energy swirl quads (`RenderTypes.energySwirl`: the charged creeper's and the
@@ -31,15 +35,17 @@ pub const TEXT_POLYGON_OFFSET_OVERLAY: u32 = 35;
 
 /// The material of a quad by its overlay (`MATERIALS` order).
 fn material(layer: u32) -> usize {
-    match layer {
+    match layer & 0xffff {
+        CBC_SHARD_OVERLAY => 8,
         TEXT_POLYGON_OFFSET_OVERLAY => 1,
         11 => 2,
         12 => 3,
         WATER_MASK_OVERLAY => 4,
         ENERGY_SWIRL_OVERLAY => 5,
         SHADOW_OVERLAY => 6,
-        TRANSLUCENT_PARTICLE_OVERLAY => 7,
-        TRANSLUCENT_ITEM_OVERLAY | TRANSLUCENT_GLINT_ITEM_OVERLAY => 8,
+        CBC_EYES_OVERLAY => 7,
+        TRANSLUCENT_PARTICLE_OVERLAY => 8,
+        TRANSLUCENT_ITEM_OVERLAY | TRANSLUCENT_GLINT_ITEM_OVERLAY => 9,
         _ => 0,
     }
 }
@@ -107,10 +113,11 @@ mod tests {
     ) -> (Vec<Vertex>, [u32; MATERIALS]) {
         let mut combined = Vec::with_capacity(entities.len() + additive.len() + hand.len());
         let mut counts = [0; MATERIALS];
-        for (i, layer) in [0, 35, 11, 12, 13, 34, 14, 15].into_iter().enumerate() {
+        for (i, layer) in [0, 35, 11, 12, 13, 34, 14, 37, 15].into_iter().enumerate() {
             for quad in entities.as_chunks::<4>().0 {
                 let material = match quad[0].layer {
                     35 => 35,
+                    37 => 37,
                     11 => 11,
                     12 => 12,
                     13 => 13,
@@ -136,7 +143,7 @@ mod tests {
                 pos: [index as f32, 2.0, 3.0],
                 uv: [index as f32, 5.0],
                 layer: if mixed {
-                    [7, 11, 14, 35, 12, 4, 13, 15, 0][index / 4 % 9]
+                    [7, 11, 14, 35, 12, 4, 13, 15, 37, 0][index / 4 % 10]
                 } else {
                     0
                 },

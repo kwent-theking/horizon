@@ -6,6 +6,7 @@
 //! unless the equipment asset's `trim_overrides` pick another texture or
 //! palette (iron armour with an iron trim uses `trim/iron_darker`).
 use horizon_assets::palette::apply_palette;
+use horizon_world::content_view;
 use serde_json::Value;
 use std::{collections::HashMap, fs, path::Path};
 
@@ -176,7 +177,7 @@ impl TrimTexture {
         let Some(palette) = &self.palette else {
             return Some((w, h, pixels));
         };
-        let base = fs::read(path.with_extension("png.mcmeta"))
+        let base = content_view::read(path.with_extension("png.mcmeta"))
             .ok()
             .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
             .and_then(|m| {
@@ -218,23 +219,28 @@ fn argb(rgba: &[u8]) -> Vec<u32> {
 /// slots), at least vanilla's 64x32.
 pub fn slot_size(root: &Path) -> (u32, u32) {
     let mut size = (64, 32);
-    let Ok(namespaces) = fs::read_dir(root.join("assets")) else {
+    let Ok(namespaces) = content_view::read_dir(root.join("assets")) else {
         return size;
     };
-    for ns in namespaces.flatten() {
-        let Ok(layers) = fs::read_dir(ns.path().join("textures/trims/entity")) else {
+    let mut paths = Vec::new();
+    for ns in namespaces {
+        let Ok(layers) = content_view::read_dir(ns.path().join("textures/trims/entity")) else {
             continue;
         };
-        for layer in layers.flatten() {
-            for f in fs::read_dir(layer.path()).into_iter().flatten().flatten() {
+        for layer in layers {
+            for f in content_view::read_dir(layer.path()).into_iter().flatten() {
                 let path = f.path();
-                if path.extension().is_some_and(|e| e == "png")
-                    && let Some((w, h)) = png_size(&path)
-                {
-                    size = (size.0.max(w.min(512)), size.1.max(h.min(512)));
+                if path.extension().is_some_and(|e| e == "png") {
+                    paths.push(path);
                 }
             }
         }
+    }
+    for (w, h) in crate::par::par_map(&paths, |p| png_size(p))
+        .into_iter()
+        .flatten()
+    {
+        size = (size.0.max(w.min(512)), size.1.max(h.min(512)));
     }
     size
 }
@@ -243,7 +249,7 @@ pub fn slot_size(root: &Path) -> (u32, u32) {
 fn png_size(path: &Path) -> Option<(u32, u32)> {
     use std::io::Read;
     let mut head = [0u8; 24];
-    fs::File::open(path).ok()?.read_exact(&mut head).ok()?;
+    content_view::open(path).ok()?.read_exact(&mut head).ok()?;
     let be = |i: usize| u32::from_be_bytes(head[i..i + 4].try_into().unwrap());
     (&head[12..16] == b"IHDR").then(|| (be(16), be(20)))
 }
@@ -350,5 +356,35 @@ mod tests {
         }
         assert!(opaque > 0);
         assert_eq!(slot_size(&root), (64, 32));
+    }
+
+    #[test]
+    fn slot_size_picks_largest_capped_trim_across_namespaces() {
+        let root = std::env::temp_dir().join(format!(
+            "horizon-trim-slot-size-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let write_ihdr = |rel: &str, w: u32, h: u32| {
+            let path = root.join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let mut head = [0u8; 24];
+            head[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+            head[12..16].copy_from_slice(b"IHDR");
+            head[16..20].copy_from_slice(&w.to_be_bytes());
+            head[20..24].copy_from_slice(&h.to_be_bytes());
+            fs::write(path, head).unwrap();
+        };
+        write_ihdr("assets/minecraft/textures/trims/entity/humanoid/a.png", 64, 32);
+        write_ihdr("assets/moda/textures/trims/entity/humanoid/b.png", 128, 64);
+        write_ihdr("assets/modb/textures/trims/entity/leggings/c.png", 1024, 256);
+        let corrupt = root.join("assets/modb/textures/trims/entity/leggings/bad.png");
+        fs::write(corrupt, b"not-a-png").unwrap();
+
+        assert_eq!(slot_size(&root), (512, 256));
+        let _ = fs::remove_dir_all(&root);
     }
 }

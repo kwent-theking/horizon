@@ -105,16 +105,7 @@ impl<'r> MovementProperties<'r> {
     }
     /// Bind again when tags reload; existing bindings retain their old snapshot.
     pub fn bind(&self, tags: &MovementTags) -> io::Result<BoundMovementProperties> {
-        for name in tags
-            .fences
-            .iter()
-            .chain(&tags.walls)
-            .chain(&tags.suppresses_bounce)
-        {
-            if self.registry.default_state(name).is_none() {
-                return Err(invalid("unknown movement tag member"));
-            }
-        }
+        // Tag members of mods that are not installed match no state: skip them.
         let states = (0..self.registry.len())
             .map(|id| {
                 let name = &self.registry.state(BlockStateId(id as u32)).unwrap().name;

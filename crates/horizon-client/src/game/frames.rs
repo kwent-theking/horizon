@@ -10,6 +10,7 @@ use horizon_core::{
     position::BlockPos,
     random::RandomSource,
 };
+use horizon_world::content_view;
 use std::sync::Arc;
 
 /// A baked frame model: (corners in block units, unit UVs, sprite) per quad.
@@ -24,7 +25,7 @@ pub(super) fn bake_frame(root: &std::path::Path, name: &str) -> FrameModel {
             continue;
         };
         let Ok(text) =
-            std::fs::read_to_string(root.join(format!("assets/{ns}/models/{path}.json")))
+            content_view::read_to_string(root.join(format!("assets/{ns}/models/{path}.json")))
         else {
             continue;
         };

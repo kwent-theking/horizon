@@ -1,6 +1,6 @@
 //! Random teleport consumable: candidate draws, bounds and success effects.
 use horizon_core::{geometry::Vec3, position::BlockPos, random::RandomSource};
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub struct TeleportConsume {
     pub diameter: f32,
     pub directional_particles: bool,
