@@ -181,6 +181,8 @@ impl Remote {
         {
             self.destroying = None;
         }
+        self.wheel = Default::default();
+        self.wheel_server = None;
         self.sublevels.clear_level();
         for id in self.entity_decks.keys() {
             self.lerps.remove(id);

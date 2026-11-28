@@ -295,11 +295,17 @@ impl Game<'_> {
                 i32::from(info.y),
                 z * 16 + i32::from(info.packed_xz as u8 & 15),
             ];
-            (pos, (info.kind, info.tag.clone()))
+            (pos, (info.kind, &info.tag))
         });
         let Some(remote) = self.remote.as_mut() else {
             return;
         };
+        if is_backing && remote.wheel_enabled {
+            for (pos, (kind, tag)) in tags.clone() {
+                remote.observe_wheel(pos, kind, tag);
+            }
+        }
+        let tags = tags.map(|(pos, (kind, tag))| (pos, (kind, tag.clone())));
         let Some(chunk) = remote.sublevels.route_column(chunk, tags) else {
             return;
         };

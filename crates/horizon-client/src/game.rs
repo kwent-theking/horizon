@@ -14639,7 +14639,9 @@ impl ApplicationHandler for Game<'_> {
             && let DeviceEvent::MouseMotion { delta: (x, y) } = event
         {
             // MouseHandler.onMove with the pointer grabbed; applied once per frame.
-            self.mouse.on_move(0.0, 0.0, x, y, true, true);
+            if !self.steering_wheel_motion(x) {
+                self.mouse.on_move(0.0, 0.0, x, y, true, true);
+            }
             self.last_input = Instant::now();
         }
     }

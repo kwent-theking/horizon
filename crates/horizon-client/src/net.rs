@@ -52,6 +52,7 @@ impl EventSender for std::sync::mpsc::SyncSender<Event> {
 /// connection (`TransferState`), so a proxy's backend switch keeps them.
 pub type Cookies = Arc<Mutex<HashMap<String, Vec<u8>>>>;
 
+pub const STEERING_WHEEL_CHANNEL: &str = "simulated:steering_wheel_update";
 const TUNNEL_FLAP_CHANNEL: &str = "create:tunnel_flap";
 pub const ADVANCED_ENTITY_SPAWN_CHANNEL: &str = "neoforge:advanced_add_entity";
 pub const CONTRAPTION_STALL_CHANNEL: &str = "create:contraption_stall";
@@ -154,6 +155,7 @@ pub enum Event {
     ModSync(usize),
     /// NeoForge advertised Sable's clientbound play channels.
     SableNegotiated,
+    SteeringWheelSupport(bool),
     Sable(Box<crate::sable::Packet>),
     SableEntity(Box<play::Clientbound>, bool),
     /// A decoded player-animation payload (Iron's Spells, Better Combat).
@@ -1326,6 +1328,7 @@ fn configure(
 ) -> Result<Dynamic, String> {
     let mut registries = Dynamic::default();
     let mut sable_negotiated = false;
+    let mut wheel_channel = false;
     let reply = |p: cfg::Serverbound| -> Result<(), String> {
         let mut body = p.encode();
         match writer.lock().unwrap().as_mut() {
@@ -1450,6 +1453,7 @@ fn configure(
                         if flow_present != 0 {
                             let _ = buf_ext::read_varint_at(q, &mut pos);
                         }
+                        wheel_channel |= q.get(pos).is_some() && id == STEERING_WHEEL_CHANNEL;
                         if q.get(pos).is_some()
                             && version == "1"
                             && crate::sable::is_clientbound(&id)
@@ -1681,6 +1685,9 @@ fn configure(
                     );
                 }
                 configuring.store(false, Ordering::Relaxed);
+                if probed == Some(767) {
+                    let _ = send.send(Event::SteeringWheelSupport(sable_negotiated && wheel_channel));
+                }
                 if sable_negotiated {
                     let _ = send.send(Event::SableNegotiated);
                 }

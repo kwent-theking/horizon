@@ -7,6 +7,7 @@
 //! client predicts its own movement; the server stays authoritative for
 //! everything else.
 mod sable_motion;
+mod steering_wheel;
 
 use super::create_contraption::burst;
 use super::remote_chunks::{ChunkDecoder, ChunkFormat, Next};
@@ -164,6 +165,9 @@ pub(super) struct Remote {
     /// RU: суб-уровни Sable (движущиеся группы чанков).
     pub(super) sublevels: horizon_client::sublevel::SubLevelManager,
     sable_dimension: Option<String>,
+    pub(super) wheel_enabled: bool,
+    wheel: steering_wheel::Input,
+    wheel_server: Option<([i32; 3], bool)>,
     deck_rider: horizon_client::sublevel::DeckRider,
     deck_freeze: Option<(u128, glam::DVec3, u16)>,
     deck_correction: Option<(glam::DVec3, u16)>,
@@ -635,6 +639,9 @@ impl Game<'_> {
             decoder: ChunkDecoder::new(),
             sublevels: Default::default(),
             sable_dimension: None,
+            wheel_enabled: false,
+            wheel: Default::default(),
+            wheel_server: None,
             deck_rider: Default::default(),
             deck_freeze: None,
             deck_correction: None,
@@ -1213,6 +1220,11 @@ impl Game<'_> {
                         remote.modsync_blocks = count;
                     }
                 }
+                Event::SteeringWheelSupport(enabled) => {
+                    if let Some(r) = self.remote.as_mut() {
+                        r.wheel_enabled = enabled;
+                    }
+                }
                 Event::SableNegotiated => {
                     if let Some(remote) = &mut self.remote {
                         remote.sublevels.enable();
@@ -1572,12 +1584,14 @@ impl Game<'_> {
     /// packet's type, loads the tag (`loadWithComponents`); an empty tag
     /// changes nothing.
     pub(super) fn remote_block_entity_data(&mut self, pos: [i32; 3], kind: i32, tag: &Tag) {
-        if let Some(r) = self.remote.as_mut()
-            && r.sublevels.is_backing_column(pos[0] >> 4, pos[2] >> 4)
-        {
-            r.sublevels.set_block_entity(pos, kind, tag);
-            return;
+        if let Some(r) = self.remote.as_mut() {
+            r.observe_wheel(pos, kind, tag);
+            if r.sublevels.is_backing_column(pos[0] >> 4, pos[2] >> 4) {
+                r.sublevels.set_block_entity(pos, kind, tag);
+                return;
+            }
         }
+
         let key = (pos[0], pos[1], pos[2]);
         let Some(name) = self
             .remote
@@ -1586,8 +1600,10 @@ impl Game<'_> {
         else {
             return;
         };
-        // A decorated pot is no block entity here: its tag is kept with the chunk.
-        if name == "minecraft:decorated_pot" {
+        // Keep raw tags for block entities without a local simulation.
+        if name == "minecraft:decorated_pot"
+            || (name == steering_wheel::BLOCK && self.remote.as_ref().is_some_and(|r| r.wheel_enabled))
+        {
             if let Tag::Compound(fields) = tag
                 && !fields.is_empty()
             {
@@ -1597,6 +1613,9 @@ impl Game<'_> {
                     full.insert(k.into(), Tag::Int(v));
                 }
                 super::spill::put_saved_entity(&mut self.world, pos, Tag::Compound(full));
+                if name == steering_wheel::BLOCK {
+                    return;
+                }
                 // The section is drawn again with the pot's sherds.
                 let state = self.world.block(pos[0], pos[1], pos[2]);
                 let _ = self.world.set(pos[0], pos[1], pos[2], state);
@@ -5968,7 +5987,7 @@ impl Game<'_> {
     fn remote_use(&mut self) {
         // Minecraft.startUseItem returns before resetting rightClickDelay
         // while a survival block break is active.
-        if self.remote.as_ref().is_some_and(|r| r.destroying.is_some()) {
+        if self.remote.as_ref().is_some_and(|r| r.destroying.is_some() || r.wheel.drag.is_some()) {
             return;
         }
         self.use_delay = 4;
@@ -6132,6 +6151,15 @@ impl Game<'_> {
                 .as_ref()
                 .is_some_and(|s| &*s.item == "minecraft:armor_stand")
                 && self.armor_stand_spawn(&hit).is_some();
+            let wheel = (hand == Hand::Main && !spectator && held.is_none()
+                && !(self.keys.contains(&KeyCode::ShiftLeft) && self.offhand.is_some()))
+                .then(|| self.steering_wheel_at(hit.pos))
+                .flatten();
+            if wheel.is_some() && !self.remote.as_ref().unwrap().wheel.clicked {
+                // A held use key repeats ordinary block interactions. A wheel
+                // drag starts once per press, even if its target was lost.
+                return true;
+            }
             let seq = self.next_sequence();
             self.send(S::UseItemOn(hit.use_packet(hand_id(hand), seq)));
             // MultiPlayerGameMode.performUseItemOn: a spectator's use predicts
@@ -6145,6 +6173,11 @@ impl Game<'_> {
             // places nothing (BlockItem.place is where the sound comes from).
             if let Some(r) = self.remote.as_mut() {
                 r.use_target = Some(hit.pos);
+            }
+            if let Some(facing) = wheel {
+                self.start_steering_wheel(hit.pos, facing);
+                self.with_hand(hand, Game::swing_arm);
+                return true;
             }
             if shelf_reacts {
                 return true;
@@ -6820,6 +6853,11 @@ impl Game<'_> {
                 Some(Button::Attack)
             }
             MouseButton::Right => {
+                if pressed {
+                    self.remote.as_mut().unwrap().wheel.clicked = true;
+                } else {
+                    self.stop_steering_wheel();
+                }
                 self.toggles
                     .button(3, pressed, false, self.settings.toggle_use);
                 self.right = self.toggles.is_down(3);
@@ -6850,6 +6888,7 @@ impl Game<'_> {
         let mut input = std::mem::take(&mut r.input);
         let stop = std::mem::take(&mut r.stop_mining);
         let ready = r.loaded_sent && self.screen == Screen::Playing && self.sleeping.is_none();
+        self.steering_wheel_motion(0.0);
         if stop || !ready {
             self.stop_remote_mining();
         }
@@ -6903,6 +6942,7 @@ impl Game<'_> {
             self.clicks.miss_time -= 1;
         }
         if let Some(r) = self.remote.as_mut() {
+            r.wheel.clicked = false;
             r.input = input;
         }
     }
