@@ -89,22 +89,74 @@ impl Game<'_> {
             .enumerate()
             .map(|(i, m)| (m.id, i))
             .collect();
+        // Plot-resident mod seats can have no model or vanilla vehicle type.
+        if self
+            .remote
+            .as_ref()
+            .is_some_and(|r| !r.sublevels.is_empty())
+        {
+            let seats: Vec<_> = self
+                .mobs
+                .iter()
+                .enumerate()
+                .filter_map(|(i, m)| {
+                    let vehicle = m.extra.mount?;
+                    if index.contains_key(&vehicle) || self.boats.iter().any(|b| b.id == vehicle) {
+                        return None;
+                    }
+                    let (previous, current) = self.plot_vehicle_seat(vehicle)?;
+                    let origins = [previous, current];
+                    let offset = if let Some(c) = self.cushions.iter().find(|c| c.id == vehicle) {
+                        c.seat().subtract(c.position)
+                    } else if self.carts.iter().any(|c| c.id == vehicle) {
+                        Vec3::new(0.0, super::minecarts::SEAT, 0.0)
+                    } else {
+                        Vec3::ZERO
+                    };
+                    let seats = origins.map(|at| at.add_vector(offset));
+                    let [previous, current] =
+                        self.plot_passenger_feet(vehicle, seats, origins, m.eye_height());
+                    Some((i, previous, current))
+                })
+                .collect();
+            for (i, previous, current) in seats {
+                let mob = &mut self.mobs[i];
+                mob.previous = previous;
+                mob.position = current;
+                mob.velocity = Vec3::ZERO;
+                mob.fall_distance = 0.0;
+                mob.on_ground = false;
+            }
+        }
         // Riders of riders settle over a few passes.
         for _ in 0..3 {
             for i in 0..self.mobs.len() {
                 let Some(v) = self.mobs[i].extra.mount else {
                     continue;
                 };
+                if self.waiting_for_plot_vehicle(v) {
+                    continue;
+                }
                 let Some(&j) = index.get(&v) else { continue };
                 let vehicle = &self.mobs[j];
                 let attach = riders::passenger_attachment(vehicle);
                 let (pos, prev) = (vehicle.position, vehicle.previous);
                 let (yaw, prev_yaw) = (vehicle.yaw, vehicle.previous_yaw);
                 let (body, prev_body) = (vehicle.body_yaw, vehicle.previous_body_yaw);
+                let rider = &self.mobs[i];
+                let offset = riders::vehicle_attachment(rider);
+                let seats = [
+                    riders::seat(attach, offset, prev, prev_yaw),
+                    riders::seat(attach, offset, pos, yaw),
+                ];
+                let [previous, current] = if self.remote.is_some() {
+                    self.plot_passenger_feet(v, seats, [prev, pos], rider.eye_height())
+                } else {
+                    seats
+                };
                 let m = &mut self.mobs[i];
-                let offset = riders::vehicle_attachment(m);
-                m.position = riders::seat(attach, offset, pos, yaw);
-                m.previous = riders::seat(attach, offset, prev, prev_yaw);
+                m.position = current;
+                m.previous = previous;
                 m.velocity = Vec3::ZERO;
                 m.fall_distance = 0.0;
                 m.on_ground = false;

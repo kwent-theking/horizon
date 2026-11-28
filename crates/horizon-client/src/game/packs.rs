@@ -2,6 +2,7 @@
 //! full resource reload after a change, while playing.
 use super::{
     Game, PackResources, Resources, UiResources, build_renderer, prepare_renderer_textures,
+    render_options,
 };
 use horizon_client::{
     assets::Assets,
@@ -173,6 +174,8 @@ impl Game<'_> {
             &self.pack.context,
             self.settings.force_unicode,
             self.settings.japanese_glyphs,
+            self.settings.horizon.mod_texture_cap,
+            self.settings.horizon.max_mipmap_levels,
             &super::Progress::new(),
         )
     }
@@ -181,7 +184,7 @@ impl Game<'_> {
     pub(super) fn apply_staged_pack(&mut self, staged: StagedPack) -> horizon_client::Result<()> {
         let StagedPack {
             root,
-            gui,
+            mut gui,
             pack,
             textures,
         } = staged;
@@ -197,10 +200,12 @@ impl Game<'_> {
                     window,
                     self.options.offscreen,
                     &pack,
-                    &gui,
+                    &mut gui,
                     self.renderer.as_ref(),
                     Some(textures),
                     self.settings.horizon.api,
+                    render_options(&self.settings.horizon),
+                    false,
                 )
             })
             .transpose()
@@ -280,13 +285,15 @@ pub(super) fn stage_pack(
     context: &WorkerContext,
     force_unicode: bool,
     japanese: bool,
+    mod_texture_cap: u32,
+    max_mipmap_levels: u32,
     progress: &super::Progress,
 ) -> horizon_client::Result<StagedPack> {
     let root = startup_root(vanilla_root, selected, server)?;
     let root = super::mods::content_root(&root, mods_enabled, dev_mods);
     progress.set(1);
-    let render = Arc::new(assets.reload(&root)?);
-    let mut atlas = HudAtlas::build_over(&root, vanilla_root)?;
+    let render = Arc::new(assets.reload_with_cap(&root, mod_texture_cap)?);
+    let mut atlas = HudAtlas::build_over_with_cap(&root, vanilla_root, mod_texture_cap)?;
     atlas.font.uniform = force_unicode;
     atlas.font.japanese = japanese;
     let gui = UiResources {
@@ -301,8 +308,9 @@ pub(super) fn stage_pack(
         res.facts(),
         context.biomes.clone(),
         context.light.clone(),
+        res.threads(),
     )?;
-    let textures = prepare_renderer_textures(&pack);
+    let textures = prepare_renderer_textures(&root, &pack, max_mipmap_levels);
     progress.set(3);
     Ok(StagedPack {
         root,

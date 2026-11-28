@@ -3,6 +3,9 @@
 //! Java's no-context BlockState.getCollisionShape uses its cache when present.
 //! The overload taking CollisionContext always calls block behavior instead.
 //! This module covers the cached branch only; uncached states remain explicit.
+mod oracle;
+pub use oracle::{OracleShapes, OutlineGeometry};
+
 use crate::{
     DATA_VERSION,
     chunk::BlockSection,
@@ -29,6 +32,7 @@ pub struct CachedCollisionRegistry<'r> {
     state_shapes: Vec<i32>,
     grid_count: usize,
     canonical_identities: bool,
+    oracle: OracleShapes,
 }
 impl<'r> CachedCollisionRegistry<'r> {
     pub fn registry(&self) -> &'r BlockRegistry {
@@ -190,7 +194,16 @@ impl<'r> CachedCollisionRegistry<'r> {
             state_shapes: state_shapes.clone(),
             grid_count: grids.len(),
             canonical_identities,
+            oracle: OracleShapes::default(),
         })
+    }
+    pub fn with_oracle_shapes(mut self, oracle: OracleShapes) -> Self {
+        self.oracle = oracle;
+        self
+    }
+
+    pub(crate) fn oracle(&self) -> &OracleShapes {
+        &self.oracle
     }
     /// Older exports omit native canonical identities. Such imports retain their
     /// local alias graph but cannot support identity-dependent world iteration.
@@ -213,6 +226,9 @@ impl<'r> CachedCollisionRegistry<'r> {
             .state_shapes
             .get(state.0 as usize)
             .ok_or_else(|| invalid("collision state outside registry"))?;
+        if let Some(shape) = self.oracle.collision(state, 0) {
+            return Ok(Some(shape));
+        }
         Ok(if id < 0 {
             None
         } else {

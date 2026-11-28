@@ -1267,7 +1267,7 @@ impl Game<'_> {
         state: BlockStateId,
         seed: i64,
         m: glam::Mat4,
-        light: impl Fn(&horizon_assets::bake::ModelQuad) -> u32,
+        light: impl Fn(&horizon_client::models::catalog::BakedQuad) -> u32,
         diffuse: bool,
         tint: impl Fn(i32) -> Option<u32>,
         out: &mut Vec<Vertex>,
@@ -1276,11 +1276,10 @@ impl Game<'_> {
             return;
         };
         for (_, model) in &models {
-            for face in &model.faces {
+            for face in model.faces.iter() {
                 let Some(s) = self
                     .pack
-                    .layer_names
-                    .get(&face.layer)
+                    .layer_name(face.layer)
                     .and_then(|n| self.gui.atlas.sprites.get(n))
                 else {
                     continue;
@@ -1384,6 +1383,10 @@ impl Game<'_> {
                 c.previous.y + (c.position.y - c.previous.y) * alpha,
                 c.previous.z + (c.position.z - c.previous.z) * alpha,
             );
+            let deck = self.plot_object_pose(c.id, alpha);
+            let ([x, y, z], ship) = deck.map_or(([x, y, z], glam::Quat::IDENTITY), |(at, q)| {
+                (at.to_array(), q)
+            });
             // LevelExtractor.isEntityVisible: the cart the player rides always draws.
             if self.riding != Some(c.id) {
                 let d = glam::DVec3::new(c.position.x, c.position.y, c.position.z) - camera;
@@ -1412,7 +1415,9 @@ impl Game<'_> {
                 c.previous_yaw + ((c.yaw - c.previous_yaw + 180.0).rem_euclid(360.0) - 180.0) * a;
             let mut pitch = 0.0f32;
             let mut offset = glam::DVec3::ZERO;
-            if let Some(on) = self.rail_pos(x, y, z) {
+            if deck.is_none()
+                && let Some(on) = self.rail_pos(x, y, z)
+            {
                 let front = self.rail_pos_offs(x, y, z, 0.3).unwrap_or(on);
                 let back = self.rail_pos_offs(x, y, z, -0.3).unwrap_or(on);
                 offset = glam::DVec3::new(on[0] - x, (front[1] + back[1]) / 2.0 - y, on[2] - z);
@@ -1432,8 +1437,9 @@ impl Game<'_> {
                 .wrapping_add(seed.wrapping_mul(98_761));
             let jitter = |shift: i64| (((seed >> shift & 7) as f32 + 0.5) / 8.0 - 0.5) * 0.004;
             let p = glam::DVec3::new(x, y, z) + offset - camera;
-            let mut base = glam::Mat4::from_translation(
-                p.as_vec3() + glam::Vec3::new(jitter(16), jitter(20) + 0.375, jitter(24)),
+            let mut base = glam::Mat4::from_rotation_translation(
+                ship,
+                p.as_vec3() + ship * glam::Vec3::new(jitter(16), jitter(20) + 0.375, jitter(24)),
             ) * glam::Mat4::from_rotation_y((180.0 - yaw).to_radians())
                 * glam::Mat4::from_rotation_z((-pitch).to_radians());
             let hurt = c.hurt_time as f32 - a;

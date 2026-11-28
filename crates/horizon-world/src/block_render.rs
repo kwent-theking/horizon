@@ -7,10 +7,11 @@ use crate::{
     fluid::{FluidKind, FluidState},
     registry::BlockStateId,
 };
-use horizon_core::geometry::{Direction, ShapeOp, VoxelShape};
+use horizon_core::geometry::{Direction, ShapeError, ShapeOp, VoxelShape};
 use std::{
     collections::{BTreeMap, HashMap},
     io,
+    sync::Arc,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,7 +32,7 @@ pub struct RenderDefinition {
 #[derive(Clone, Copy)]
 struct State {
     block: BlockStateId,
-    faces: [u32; 6],
+    face_set: u32,
     definition: RenderDefinition,
     connections: u8,
     connection_properties: u8,
@@ -41,20 +42,82 @@ struct State {
 /// is deduplicated by the imported immutable shape, not copied for every state.
 #[derive(Clone)]
 pub struct FaceVisibility {
-    states: Vec<State>,
-    faces: Vec<VoxelShape>,
+    states: Arc<[State]>,
+    face_sets: Arc<[[u32; 6]]>,
+    faces: Arc<[VoxelShape]>,
     cache: HashMap<(u32, u32), bool>,
+}
+struct FacePool {
+    faces: Vec<VoxelShape>,
+    by_grid: HashMap<u64, u32>,
+    hasher: std::hash::RandomState,
+}
+impl FacePool {
+    fn new() -> Self {
+        Self {
+            faces: vec![VoxelShape::empty(), VoxelShape::block()],
+            by_grid: HashMap::new(),
+            hasher: std::hash::RandomState::new(),
+        }
+    }
+
+    fn push(&mut self, mut face: VoxelShape) -> u32 {
+        use std::{
+            collections::hash_map::Entry,
+            hash::{BuildHasher, Hasher},
+        };
+        let id = self.faces.len() as u32;
+        let mut hasher = self.hasher.build_hasher();
+        face.hash_grid(&mut hasher);
+        let mut hash = hasher.finish();
+        loop {
+            match self.by_grid.entry(hash) {
+                Entry::Occupied(entry) => {
+                    if face.share_grid(&self.faces[*entry.get() as usize]) {
+                        break;
+                    }
+                    hash = hash.wrapping_add(1);
+                }
+                Entry::Vacant(entry) => {
+                    entry.insert(id);
+                    break;
+                }
+            }
+        }
+        self.faces.push(face);
+        id
+    }
 }
 impl FaceVisibility {
     pub fn new(
         occlusion: &CachedCollisionRegistry<'_>,
         definitions: &BTreeMap<String, RenderDefinition>,
     ) -> io::Result<Self> {
+        Self::build(occlusion, definitions, VoxelShape::face_shape)
+    }
+
+    /// Take the freshly loaded occlusion table and keep only its projected faces.
+    pub fn from_owned_occlusion(
+        occlusion: CachedCollisionRegistry<'_>,
+        definitions: &BTreeMap<String, RenderDefinition>,
+    ) -> io::Result<Self> {
+        // `build` projects each source shape once. Avoid retaining a second set
+        // of projections through the face cache of a face that aliases its source.
+        Self::build(&occlusion, definitions, VoxelShape::project_face)
+    }
+
+    fn build(
+        occlusion: &CachedCollisionRegistry<'_>,
+        definitions: &BTreeMap<String, RenderDefinition>,
+        project: fn(&VoxelShape, Direction) -> Result<VoxelShape, ShapeError>,
+    ) -> io::Result<Self> {
         let registry = occlusion.registry();
         let mut states = Vec::with_capacity(registry.len());
         // IDs 0 and 1 represent the canonical empty/full face singletons used
         // by BlockState.initCache; other empty-like shapes retain their identity.
-        let mut faces = vec![VoxelShape::empty(), VoxelShape::block()];
+        let mut pool = FacePool::new();
+        let mut face_sets = vec![[0; 6]];
+        let mut by_set = HashMap::from([([0; 6], 0u32)]);
         let mut shape_faces = HashMap::new();
         for id in 0..registry.len() {
             let id = BlockStateId(id as u32);
@@ -67,33 +130,34 @@ impl FaceVisibility {
             let shape = occlusion
                 .cached_shape(id)?
                 .ok_or_else(|| invalid("missing occlusion geometry"))?;
-            let face_ids = if !definition.can_occlude || shape.is_empty() {
-                [0; 6]
-            } else if let Some(ids) = shape_faces.get(&std::ptr::from_ref(shape)) {
-                *ids
+            let face_set = if !definition.can_occlude || shape.is_empty() {
+                0
+            } else if let Some(set) = shape_faces.get(&std::ptr::from_ref(shape)) {
+                *set
             } else {
                 let mut ids = [1; 6];
                 if shape
-                    .join_is_not_empty(&faces[1], ShapeOp::XOR)
+                    .join_is_not_empty(&pool.faces[1], ShapeOp::XOR)
                     .map_err(|e| invalid(e.to_string()))?
                 {
                     for direction in Direction::ALL {
-                        let face = shape
-                            .face_shape(direction)
-                            .map_err(|e| invalid(e.to_string()))?;
-                        ids[direction as usize] = if face.same_identity(&faces[0]) {
+                        let face = project(shape, direction).map_err(|e| invalid(e.to_string()))?;
+                        ids[direction as usize] = if face.same_identity(&pool.faces[0]) {
                             0
-                        } else if face.same_identity(&faces[1]) {
+                        } else if face.same_identity(&pool.faces[1]) {
                             1
                         } else {
-                            let id = faces.len() as u32;
-                            faces.push(face);
-                            id
+                            pool.push(face)
                         };
                     }
                 }
-                shape_faces.insert(std::ptr::from_ref(shape), ids);
-                ids
+                let set = *by_set.entry(ids).or_insert_with(|| {
+                    let set = face_sets.len() as u32;
+                    face_sets.push(ids);
+                    set
+                });
+                shape_faces.insert(std::ptr::from_ref(shape), set);
+                set
             };
             let mut connections = 0;
             let mut connection_properties = 0;
@@ -119,7 +183,7 @@ impl FaceVisibility {
                 block: registry
                     .default_state(&state.name)
                     .ok_or_else(|| invalid("missing render block identity"))?,
-                faces: face_ids,
+                face_set,
                 definition,
                 connections,
                 connection_properties,
@@ -127,8 +191,9 @@ impl FaceVisibility {
             });
         }
         Ok(Self {
-            states,
-            faces,
+            states: states.into(),
+            face_sets: face_sets.into(),
+            faces: pool.faces.into(),
             cache: HashMap::new(),
         })
     }
@@ -164,7 +229,8 @@ impl FaceVisibility {
         state: BlockStateId,
         direction: Direction,
     ) -> Option<(u32, &VoxelShape)> {
-        let id = self.states.get(state.0 as usize)?.faces[direction as usize];
+        let set = self.states.get(state.0 as usize)?.face_set;
+        let id = self.face_sets[set as usize][direction as usize];
         Some((id, &self.faces[id as usize]))
     }
     pub fn skip_rendering(
@@ -190,11 +256,11 @@ impl FaceVisibility {
     ) -> io::Result<bool> {
         let a = self.state(state)?;
         let b = self.state(neighbor)?;
-        let neighbor_face = b.faces[direction.opposite() as usize];
+        let neighbor_face = self.face_sets[b.face_set as usize][direction.opposite() as usize];
         if neighbor_face == 1 || Self::skips(a, b, direction, cutout_leaves) {
             return Ok(false);
         }
-        let own_face = a.faces[direction as usize];
+        let own_face = self.face_sets[a.face_set as usize][direction as usize];
         if neighbor_face == 0 || own_face == 0 {
             return Ok(true);
         }
@@ -212,5 +278,52 @@ impl FaceVisibility {
         }
         self.cache.insert(key, visible);
         Ok(visible)
+    }
+}
+
+#[cfg(test)]
+mod sharing_tests {
+    use super::*;
+
+    #[test]
+    fn noncanonical_face_grids_share_allocations_and_keep_their_identity() {
+        let mut pool = FacePool::new();
+        let a = VoxelShape::from_cube([2, 1, 1], &[true, false]).unwrap();
+        let b = VoxelShape::from_cube([2, 1, 1], &[true, false]).unwrap();
+        let c = VoxelShape::from_cube([2, 1, 1], &[false, true]).unwrap();
+        assert!(!std::ptr::eq(a.boxes(), b.boxes()));
+        let original = [a, b, c];
+        for (i, face) in original.iter().enumerate() {
+            assert_eq!(pool.push(face.clone()), (i + 2) as u32);
+        }
+        let pooled = &pool.faces[2..];
+        assert!(std::ptr::eq(pooled[0].boxes(), pooled[1].boxes()));
+        assert!(!std::ptr::eq(pooled[0].boxes(), pooled[2].boxes()));
+        for (i, a) in pooled.iter().enumerate() {
+            assert!(a.same_identity(&original[i]));
+            for (j, b) in pooled.iter().enumerate() {
+                assert_eq!(a.same_identity(b), original[i].same_identity(&original[j]));
+                assert_eq!(
+                    a.join_is_not_empty(b, ShapeOp::ONLY_FIRST),
+                    original[i].join_is_not_empty(&original[j], ShapeOp::ONLY_FIRST),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn clones_share_geometry_but_keep_independent_pair_caches() {
+        let a = FaceVisibility {
+            states: Vec::new().into(),
+            face_sets: Arc::new([]),
+            faces: vec![VoxelShape::empty(), VoxelShape::block()].into(),
+            cache: HashMap::from([((0, 1), false)]),
+        };
+        let mut b = a.clone();
+        assert!(Arc::ptr_eq(&a.states, &b.states));
+        assert!(Arc::ptr_eq(&a.faces, &b.faces));
+        assert!(Arc::ptr_eq(&a.face_sets, &b.face_sets));
+        b.cache.insert((1, 0), true);
+        assert!(!a.cache.contains_key(&(1, 0)));
     }
 }

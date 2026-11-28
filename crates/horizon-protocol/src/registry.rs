@@ -94,20 +94,24 @@ pub struct Dynamic {
     pub registries: HashMap<String, Vec<(String, Option<Tag>)>>,
     /// The `minecraft:dialog` tags the server sent: each tag's entries by id.
     pub dialog_tags: HashMap<String, Vec<i32>>,
+    /// Block tags by the server's block registry id, when synchronized.
+    pub block_tags: Option<HashMap<String, Vec<i32>>>,
 }
 impl Dynamic {
-    /// The dialog tags of a `ClientboundUpdateTagsPacket`.
+    /// Retain the synchronized tags used by client-side features.
     pub fn add_tags(&mut self, packet: &UpdateTags) {
-        for r in packet
-            .registries
-            .iter()
-            .filter(|r| r.registry == "minecraft:dialog")
-        {
-            self.dialog_tags = r
-                .tags
-                .iter()
-                .map(|t| (t.name.clone(), t.ids.clone()))
-                .collect();
+        for r in &packet.registries {
+            let tags = || {
+                r.tags
+                    .iter()
+                    .map(|t| (t.name.clone(), t.ids.clone()))
+                    .collect()
+            };
+            match r.registry.as_str() {
+                "minecraft:dialog" => self.dialog_tags = tags(),
+                "minecraft:block" => self.block_tags = Some(tags()),
+                _ => {}
+            }
         }
     }
     pub fn add(&mut self, packet: RegistryData) {

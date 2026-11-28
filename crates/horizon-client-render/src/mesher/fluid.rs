@@ -3,7 +3,8 @@
 //! beside glass and leaves, back faces, cardinal shading and max(self, above)
 //! light.
 use super::{
-    Info, MeshTables, Padded, SectionMesh, TerrainVertex, lighting, pack_coords, pack_rgb, pi,
+    Info, MeshTables, Padded, SectionMesh, StateInfo, TerrainVertex, lighting, pack_coords,
+    pack_rgb, pi,
 };
 use horizon_core::{
     geometry::{Axis, Direction, VoxelShape, trig},
@@ -88,10 +89,10 @@ fn occluded_by(direction: Direction, height: f32, state: &Info) -> bool {
         1 => direction != Direction::Up || height == 1.0,
         _ => match direction {
             Direction::Up => {
-                f64::from(height) >= 1.0 - 1e-7 && state.cover[Direction::Down as usize] >= 1.0
+                f64::from(height) >= 1.0 - 1e-7 && state.cover(Direction::Down as usize) >= 1.0
             }
-            Direction::Down => state.cover[Direction::Up as usize] >= 1.0,
-            _ => f64::from(height) <= f64::from(state.cover[opposite]) + 1e-7,
+            Direction::Down => state.cover(Direction::Up as usize) >= 1.0,
+            _ => f64::from(height) <= f64::from(state.cover(opposite)) + 1e-7,
         },
     }
 }
@@ -100,7 +101,7 @@ fn occluded_by_self(state: &Info, direction: Direction) -> bool {
     match state.face[direction as usize] {
         0 => false,
         1 => true,
-        _ => state.cover[direction as usize] >= 1.0,
+        _ => state.cover(direction as usize) >= 1.0,
     }
 }
 /// `Mth.atan2`: the client's table-driven arctangent.
@@ -156,7 +157,7 @@ fn atan2(mut y: f64, mut x: f64) -> f64 {
 /// The padded section as `FlowingFluid.getFlow` sees it (section-relative positions).
 struct FlowView<'a> {
     pad: &'a Padded,
-    info: &'a [Info],
+    info: &'a StateInfo,
 }
 impl FlowView<'_> {
     fn id(&self, p: BlockPos) -> u32 {

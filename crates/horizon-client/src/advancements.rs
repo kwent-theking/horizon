@@ -2,6 +2,7 @@
 //! progress (`PlayerAdvancements`) and the predicates criteria test
 //! (`EntityPredicate`, `ItemPredicate`, `LocationPredicate`, the loot
 //! conditions advancements use).
+use horizon_world::content_view;
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -69,17 +70,17 @@ impl Tree {
     /// Loads `<data>/<namespace>/advancement/**/*.json`.
     pub fn load(data: &Path) -> Tree {
         let mut tree = Tree::default();
-        let Ok(namespaces) = std::fs::read_dir(data) else {
+        let Ok(namespaces) = content_view::read_dir(data) else {
             return tree;
         };
         let mut files = Vec::new();
-        for ns in namespaces.flatten() {
+        for ns in namespaces {
             let root = ns.path().join("advancement");
             collect(&root, &root, &ns.file_name().to_string_lossy(), &mut files);
         }
         files.sort();
         for (id, path) in files {
-            let Ok(text) = std::fs::read_to_string(&path) else {
+            let Ok(text) = content_view::read_to_string(&path) else {
                 continue;
             };
             let Ok(v) = serde_json::from_str::<Value>(&text) else {
@@ -203,12 +204,12 @@ impl InventoryIndex {
     }
 }
 fn collect(root: &Path, dir: &Path, ns: &str, out: &mut Vec<(String, std::path::PathBuf)>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
+    let Ok(entries) = content_view::read_dir(dir) else {
         return;
     };
-    for e in entries.flatten() {
+    for e in entries {
         let p = e.path();
-        if p.is_dir() {
+        if e.is_dir() {
             collect(root, &p, ns, out);
         } else if p.extension().is_some_and(|x| x == "json") {
             let rel = p.strip_prefix(root).unwrap_or(&p).with_extension("");

@@ -136,6 +136,27 @@ pub fn draw_progress(batch: &mut HudBatch, atlas: &HudAtlas, line: &str, progres
     batch.fill(atlas, left, top, done, 2.0, opaque(0x00FF00));
 }
 
+/// The start still loading behind the title screen: its step and a thin bar
+/// along the bottom middle, clear of the buttons and the corner texts.
+pub fn draw_progress_strip(batch: &mut HudBatch, atlas: &HudAtlas, line: &str, progress: f32) {
+    let x_center = (batch.width as i32) / 2;
+    let bar_top = batch.height as f32 - 6.0;
+    let text = Text::literal(line);
+    let tw = atlas.font.width_text(&text) as i32;
+    batch.text_styled(
+        atlas,
+        &text,
+        (x_center - tw / 2) as f32,
+        bar_top - 11.0,
+        u32::MAX,
+        true,
+    );
+    let left = (x_center - 100) as f32;
+    batch.fill(atlas, left, bar_top, 200.0, 2.0, opaque(0));
+    let done = (progress.clamp(0.0, 1.0) * 200.0).round();
+    batch.fill(atlas, left, bar_top, done, 2.0, opaque(0x00FF00));
+}
+
 /// `ConnectScreen`'s Cancel button corner on a GUI `w` x `h`:
 /// (width / 2 - 100, height / 4 + 120 + 12), 200 x 20.
 pub fn connect_cancel(w: f32, h: f32) -> (f32, f32) {

@@ -3,6 +3,11 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+mod heap;
+mod memory;
+pub use heap::{CountingAllocator, heap_peak, live_heap, reset_heap_peak};
+pub use memory::{PeakMemory, ProcessMemory, available_memory, peak_memory, process_memory};
+
 /// Ask the OS to run the calling thread ahead of the process's other
 /// threads, as vanilla's `MinecraftServer.spin` does for its server thread
 /// (`Thread.setPriority(8)` when there are more than four processors), so
@@ -197,8 +202,8 @@ pub fn catch_stop_signals() {}
 
 /// Give back to the OS the memory the allocator holds free, after something
 /// large was dropped: glibc keeps freed pages in the arena of the thread that
-/// allocated them, and macOS in its zones until memory runs short. Nothing
-/// elsewhere.
+/// allocated them, macOS in its zones until memory runs short, and Windows'
+/// process heap keeps them committed. Nothing elsewhere.
 pub fn release_free_memory() {
     release();
 }
@@ -224,11 +229,36 @@ fn release() {
     }
 }
 
-#[cfg(not(any(all(target_os = "linux", target_env = "gnu"), target_vendor = "apple")))]
+#[cfg(windows)]
+fn release() {
+    use windows_sys::Win32::System::Memory::{GetProcessHeap, HeapCompact};
+    // SAFETY: the process heap lives as long as the process; compacting only
+    // coalesces and decommits its free blocks, no live allocation moves.
+    unsafe {
+        let heap = GetProcessHeap();
+        if !heap.is_null() {
+            HeapCompact(heap, 0);
+        }
+    }
+}
+
+#[cfg(not(any(
+    all(target_os = "linux", target_env = "gnu"),
+    target_vendor = "apple",
+    windows
+)))]
 fn release() {}
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn releasing_free_memory_after_a_large_drop_keeps_live_data() {
+        let live = vec![7u8; 1 << 20];
+        drop(vec![1u8; 64 << 20]);
+        super::release_free_memory();
+        assert!(live.iter().all(|&b| b == 7));
+    }
+
     /// The hint holds on the platforms that take it.
     #[test]
     fn favouring_a_thread_takes_where_the_os_allows_it() {

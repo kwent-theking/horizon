@@ -25,8 +25,8 @@ use horizon_accounts::{default_http, AcctError};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const DEFAULT_GAME: &str = r"C:\Users\kwent\horizon-release\horizon-client.exe";
-const DEFAULT_RESOURCES: &str = r"C:\Users\kwent\horizon-rust\.local\horizon-client\26.3";
+const DEFAULT_GAME: &str = r"C:\Users\kwent\horizon\horizon-release\horizon-client.exe";
+const DEFAULT_RESOURCES: &str = r"C:\Users\kwent\horizon\horizon-rust\.local\horizon-client\26.3";
 
 fn now() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)

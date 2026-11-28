@@ -1,14 +1,17 @@
 //! Decoded block sprites kept on disk between launches (M-11): reading and
 //! decoding ~1300 small PNGs is most of `Sprites::load`. One file per resource
-//! root, valid only while the `textures` trees still have the same paths,
-//! sizes and modification times and the format version is the same; anything
-//! else (missing, corrupt, stale, unwritable) means the normal decoding path.
+//! root, keyed by texture paths, disk metadata, archive entry identities and
+//! the cache format version. A missing, corrupt or stale cache means the
+//! normal decoding path.
 use crate::mipmap::Strategy;
+use horizon_world::content_view;
 use std::{
     collections::HashMap,
     fs,
     hash::{DefaultHasher, Hash, Hasher},
+    io::{self, BufWriter, Write},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 const MAGIC: &[u8; 4] = b"HSPR";
@@ -20,7 +23,7 @@ const FILE: &str = "horizon-sprites.cache";
 #[derive(Clone)]
 pub(crate) struct Decoded {
     pub side: u32,
-    pub frames: Vec<Vec<u8>>,
+    pub frames: Arc<Vec<Vec<u8>>>,
     /// The `.mcmeta` `animation` value, as text.
     pub animation: Option<String>,
     pub strategy: Strategy,
@@ -37,30 +40,38 @@ pub(crate) struct SpriteCache {
     dirty: bool,
 }
 
-/// Paths, sizes and modification times of every file under `assets/*/textures`,
-/// summed so the directory order does not matter.
+/// Hash the texture files and sidecars together so changing either invalidates
+/// the cache. Sum the hashes to make the order of directory listings irrelevant.
 fn fingerprint(root: &Path) -> Option<u64> {
-    fn walk(dir: &Path, base: &Path, sum: &mut u64) -> Option<()> {
-        for entry in fs::read_dir(dir).ok()? {
-            let entry = entry.ok()?;
-            let meta = entry.metadata().ok()?;
-            if meta.is_dir() {
-                walk(&entry.path(), base, sum)?;
+    fn walk(dir: &Path, base: &Path, sum: &mut u64, depth: usize) -> Option<()> {
+        if depth > 64 {
+            return None;
+        }
+        for entry in content_view::read_dir(dir).ok()? {
+            let path = entry.path();
+            if entry.is_dir() {
+                walk(&path, base, sum, depth + 1)?;
                 continue;
             }
             let mut hasher = DefaultHasher::new();
-            entry.path().strip_prefix(base).ok()?.hash(&mut hasher);
-            meta.len().hash(&mut hasher);
-            meta.modified().ok()?.hash(&mut hasher);
+            path.strip_prefix(base).ok()?.hash(&mut hasher);
+            if let Some(identity) = entry.served() {
+                "archive".hash(&mut hasher);
+                identity.hash(&mut hasher);
+            } else {
+                let (len, modified) = entry.disk()?;
+                len.hash(&mut hasher);
+                modified?.hash(&mut hasher);
+            }
             *sum = sum.wrapping_add(hasher.finish());
         }
         Some(())
     }
     let mut sum = 0;
-    for namespace in fs::read_dir(root.join("assets")).ok()? {
-        let textures = namespace.ok()?.path().join("textures");
-        if textures.is_dir() {
-            walk(&textures, root, &mut sum)?;
+    for namespace in content_view::read_dir(root.join("assets")).ok()? {
+        let textures = namespace.path().join("textures");
+        if content_view::is_dir(&textures) {
+            walk(&textures, root, &mut sum, 0)?;
         }
     }
     Some(sum)
@@ -99,40 +110,51 @@ impl SpriteCache {
         let temporary = self
             .path
             .with_extension(format!("{}.tmp", std::process::id()));
-        if fs::write(&temporary, serialize(self.fingerprint, &self.entries)).is_ok()
-            && fs::rename(&temporary, &self.path).is_err()
-        {
+        let written = (|| -> io::Result<()> {
+            let mut file = BufWriter::new(fs::File::create(&temporary)?);
+            write_cache(&mut file, self.fingerprint, &self.entries)?;
+            file.flush()
+        })();
+        if written.is_err() || fs::rename(&temporary, &self.path).is_err() {
             let _ = fs::remove_file(&temporary);
         }
     }
 }
 
+fn write_cache(
+    out: &mut impl Write,
+    fingerprint: u64,
+    entries: &HashMap<String, Decoded>,
+) -> io::Result<()> {
+    out.write_all(MAGIC)?;
+    out.write_all(&VERSION.to_le_bytes())?;
+    out.write_all(&fingerprint.to_le_bytes())?;
+    out.write_all(&(entries.len() as u32).to_le_bytes())?;
+    for (name, d) in entries {
+        put_bytes(out, name.as_bytes())?;
+        out.write_all(&d.side.to_le_bytes())?;
+        out.write_all(&(d.frames.len() as u32).to_le_bytes())?;
+        for frame in d.frames.iter() {
+            put_bytes(out, frame)?;
+        }
+        put_bytes(out, d.animation.as_deref().unwrap_or("").as_bytes())?;
+        out.write_all(&[u8::from(d.animation.is_some()), d.strategy as u8])?;
+        out.write_all(&d.alpha_cutoff_bias.to_bits().to_le_bytes())?;
+        out.write_all(&[u8::from(d.has_transparent)
+            | u8::from(d.opaque) << 1
+            | u8::from(d.translucent) << 2])?;
+    }
+    Ok(())
+}
+#[cfg(test)]
 fn serialize(fingerprint: u64, entries: &HashMap<String, Decoded>) -> Vec<u8> {
     let mut out = Vec::new();
-    out.extend_from_slice(MAGIC);
-    out.extend_from_slice(&VERSION.to_le_bytes());
-    out.extend_from_slice(&fingerprint.to_le_bytes());
-    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-    for (name, d) in entries {
-        put_bytes(&mut out, name.as_bytes());
-        out.extend_from_slice(&d.side.to_le_bytes());
-        out.extend_from_slice(&(d.frames.len() as u32).to_le_bytes());
-        for frame in &d.frames {
-            put_bytes(&mut out, frame);
-        }
-        put_bytes(&mut out, d.animation.as_deref().unwrap_or("").as_bytes());
-        out.push(u8::from(d.animation.is_some()));
-        out.push(d.strategy as u8);
-        out.extend_from_slice(&d.alpha_cutoff_bias.to_bits().to_le_bytes());
-        out.push(
-            u8::from(d.has_transparent) | u8::from(d.opaque) << 1 | u8::from(d.translucent) << 2,
-        );
-    }
+    write_cache(&mut out, fingerprint, entries).unwrap();
     out
 }
-fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
-    out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-    out.extend_from_slice(bytes);
+fn put_bytes(out: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
+    out.write_all(&(bytes.len() as u32).to_le_bytes())?;
+    out.write_all(bytes)
 }
 
 struct Reader<'a>(&'a [u8]);
@@ -188,7 +210,7 @@ fn parse(bytes: &[u8], fingerprint: u64) -> Option<HashMap<String, Decoded>> {
             name,
             Decoded {
                 side,
-                frames,
+                frames: Arc::new(frames),
                 animation: has_animation.then_some(animation),
                 strategy,
                 alpha_cutoff_bias,
@@ -208,7 +230,7 @@ mod tests {
     fn sample(blue: u8, animation: Option<&str>) -> Decoded {
         Decoded {
             side: 2,
-            frames: vec![vec![blue; 16], vec![blue + 1; 16]],
+            frames: Arc::new(vec![vec![blue; 16], vec![blue + 1; 16]]),
             animation: animation.map(str::to_owned),
             strategy: Strategy::Cutout,
             alpha_cutoff_bias: 0.25,

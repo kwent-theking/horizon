@@ -9,6 +9,7 @@ use horizon_world::nbt::Tag;
 use std::sync::Arc;
 
 mod skip;
+pub(crate) mod v767;
 
 /// minecraft:data_component_type registry ids (26.3).
 pub mod component {

@@ -103,15 +103,20 @@ impl Game<'_> {
     /// `vehicle` now. The local player gets in or out; mobs and other
     /// players sit where the server keeps them.
     pub(super) fn remote_set_passengers(&mut self, vehicle: i32, passengers: &[i32]) {
-        let Some(me) = self.remote.as_ref().map(|r| r.entity_id) else {
+        let Some(remote) = self.remote.as_mut() else {
             return;
         };
+        let me = remote.entity_id;
         let vehicle_id = vehicle as u32;
         for m in &mut self.mobs {
             if m.extra.mount == Some(vehicle_id) && !passengers.contains(&(m.id as i32)) {
                 m.extra.mount = None;
                 m.extra.passenger = false;
+                remote.retire_passenger_deck(m.id as i32);
             } else if passengers.contains(&(m.id as i32)) {
+                if m.extra.mount != Some(vehicle_id) {
+                    remote.retire_passenger_deck(m.id as i32);
+                }
                 m.extra.mount = Some(vehicle_id);
                 m.extra.passenger = true;
             }
@@ -126,6 +131,7 @@ impl Game<'_> {
         if passengers.contains(&me) {
             if self.riding != Some(vehicle_id) {
                 self.riding = Some(vehicle_id);
+                self.sync_ride_view();
                 if let Some(p) = self.player.as_mut() {
                     p.velocity = Vec3::ZERO;
                     p.fall_distance = 0.0;
@@ -134,6 +140,7 @@ impl Game<'_> {
         } else if self.riding == Some(vehicle_id) {
             // The server takes the player out, then teleports it.
             self.riding = None;
+            self.sync_ride_view();
             // HappyGhast.removePassenger: a still timeout of 10 (the server's
             // STAYS_STILL confirms it), and the rider lands on top of the ghast
             // (`place_ghast_under`).
@@ -154,6 +161,14 @@ impl Game<'_> {
         let Some(id) = self.riding else {
             return false;
         };
+        if self.waiting_for_plot_vehicle(id) {
+            if let Some(p) = self.player.as_mut() {
+                self.previous_position = p.position;
+                p.velocity = Vec3::ZERO;
+                p.fall_distance = 0.0;
+            }
+            return true;
+        }
         if let Some(i) = self.mobs.iter().position(|m| m.id == id) {
             // An animal moves on the server with the rider's input
             // (PlayerInput); here the jump bar charges for the HUD and the
@@ -170,7 +185,13 @@ impl Game<'_> {
             // It steers with the input `LocalPlayer.rideTick` latched on the
             // previous tick, so the paddle packet describes the motion the
             // server is sent; this tick's keys are latched after it ticked.
-            let mut b = self.tick_boat(self.boats[i].clone(), true);
+            let mut b = self.boats[i].clone();
+            if self.resident_deck(id).is_some() {
+                // Its authoritative motion arrives in plot coordinates.
+                b.delta_rotation = 0.0;
+            } else {
+                b = self.tick_boat(b, true);
+            }
             b.input = [keys.left, keys.right, keys.forward, keys.backward];
             // positionRider: the seat turns with the boat; clampRotation.
             self.yaw += b.delta_rotation;
@@ -185,6 +206,20 @@ impl Game<'_> {
                 c.position
                     .add_vector(Vec3::new(0.0, super::minecarts::SEAT, 0.0))
             })
+        };
+        let seat = if let Some((_, origin)) = self.plot_vehicle_seat(id)
+            && let Some(p) = self.player.as_ref()
+        {
+            Some(
+                self.plot_passenger_feet(
+                    id,
+                    [seat.unwrap_or(origin); 2],
+                    [origin; 2],
+                    f64::from(p.dimensions.eye_height),
+                )[1],
+            )
+        } else {
+            seat
         };
         if let Some(p) = self.player.as_mut() {
             self.previous_position = p.position;
@@ -206,9 +241,16 @@ impl Game<'_> {
         else {
             return Vec::new();
         };
+        if self.waiting_for_plot_vehicle(b.id) {
+            return Vec::new();
+        }
+        let world = b.position.components();
+        let position = self.resident_deck(b.id).map_or(world, |deck| {
+            deck.logical_pose().to_plot(world.into()).to_array()
+        });
         vec![
             S::MoveVehicle(play::MoveVehicleRequest {
-                position: [b.position.x, b.position.y, b.position.z],
+                position,
                 yaw: b.yaw,
                 pitch: 0.0,
                 on_ground: b.on_ground,
@@ -223,12 +265,18 @@ impl Game<'_> {
     /// `ClientPacketListener.handleMoveVehicle`: the server put the boat the
     /// player drives back.
     pub(super) fn remote_move_vehicle(&mut self, position: [f64; 3], yaw: f32) {
-        let Some(b) = self
-            .riding
-            .and_then(|id| self.boats.iter_mut().find(|b| b.id == id))
-        else {
+        let Some(id) = self.riding else {
             return;
         };
+        let Some(index) = self.boats.iter().position(|b| b.id == id) else {
+            return;
+        };
+        let Some(position) = self.correct_plot_vehicle(id, position) else {
+            self.sync_ride_view();
+            return;
+        };
+        self.sync_ride_view();
+        let b = &mut self.boats[index];
         let at = Vec3::new(position[0], position[1], position[2]);
         b.previous = at;
         b.position = at;

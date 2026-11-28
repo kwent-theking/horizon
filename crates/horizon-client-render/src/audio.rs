@@ -39,6 +39,63 @@ struct Channel {
     looping: bool,
     at: [f32; 3],
     relative: bool,
+    /// `AL_AIR_ABSORPTION_FACTOR`, and the direct path's high shelf it drives.
+    air_absorption: f32,
+    high_shelf: Biquad,
+}
+/// OpenAL Soft's `AirAbsorbGainHF`: -0.05 dB per metre at the reference frequency.
+const AIR_ABSORB_GAIN_HF: f32 = 0.99426;
+/// OpenAL Soft's `LowPassFreqRef`, the direct path filter's HF reference (Hz).
+const LOW_PASS_FREQ_REF: f32 = 5000.0;
+/// OpenAL Soft's `BiquadFilter` (transposed direct form II) with the
+/// coefficients of `setParamsFromSlope(HighShelf, f0norm, gain, 1)`.
+#[derive(Clone, Copy, Default)]
+struct Biquad {
+    z1: f32,
+    z2: f32,
+}
+impl Biquad {
+    /// `[b0, b1, b2, a1, a2]` of the high shelf at `f0norm` (f0 / rate).
+    fn high_shelf(f0norm: f32, gain: f32) -> [f32; 5] {
+        let gain = gain.max(0.001);
+        // rcpQFromSlope(gain, 1).
+        let rcp_q = ((gain + 1.0 / gain) * (1.0 / 1.0 - 1.0) + 2.0).sqrt();
+        let gain = gain.max(0.000_01);
+        let w0 = std::f32::consts::PI * 2.0 * f0norm;
+        let (sin_w0, cos_w0) = w0.sin_cos();
+        let alpha = sin_w0 / 2.0 * rcp_q;
+        let sqrtgain_alpha_2 = 2.0 * gain.sqrt() * alpha;
+        let b = [
+            gain * ((gain + 1.0) + (gain - 1.0) * cos_w0 + sqrtgain_alpha_2),
+            -2.0 * gain * ((gain - 1.0) + (gain + 1.0) * cos_w0),
+            gain * ((gain + 1.0) + (gain - 1.0) * cos_w0 - sqrtgain_alpha_2),
+        ];
+        let a = [
+            (gain + 1.0) - (gain - 1.0) * cos_w0 + sqrtgain_alpha_2,
+            2.0 * ((gain - 1.0) - (gain + 1.0) * cos_w0),
+            (gain + 1.0) - (gain - 1.0) * cos_w0 - sqrtgain_alpha_2,
+        ];
+        [
+            b[0] / a[0],
+            b[1] / a[0],
+            b[2] / a[0],
+            a[1] / a[0],
+            a[2] / a[0],
+        ]
+    }
+    fn process(&mut self, [b0, b1, b2, a1, a2]: [f32; 5], input: f32) -> f32 {
+        let output = input * b0 + self.z1;
+        self.z1 = input * b1 - output * a1 + self.z2;
+        self.z2 = input * b2 - output * a2;
+        output
+    }
+}
+/// OpenAL Soft's distance-based air absorption (`CalcAttnSourceParams`):
+/// the direct path's HF gain at `distance` (reference distance 0, rolloff 1,
+/// one metre per unit), or `None` when it stays 1.
+fn air_absorption_gain_hf(factor: f32, distance: f32) -> Option<f32> {
+    let absorb = distance * factor;
+    (distance > 0.0 && absorb > f32::EPSILON).then(|| AIR_ABSORB_GAIN_HF.powf(absorb))
 }
 #[derive(Default)]
 struct Mixer {
@@ -166,13 +223,41 @@ pub struct Audio {
     /// any), with or without an audio device, as `heard`.
     pub stopped: std::collections::BTreeMap<String, u32>,
 }
+struct ArchivedAudio(horizon_world::content_view::ArchiveStream);
+
+impl std::io::Read for ArchivedAudio {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        std::io::Read::read(&mut self.0, buf)
+    }
+}
+
+impl std::io::Seek for ArchivedAudio {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        std::io::Seek::seek(&mut self.0, pos)
+    }
+}
+
+impl symphonia::core::io::MediaSource for ArchivedAudio {
+    fn is_seekable(&self) -> bool {
+        true
+    }
+
+    fn byte_len(&self) -> Option<u64> {
+        Some(self.0.byte_len())
+    }
+}
+
 fn decode(path: &Path) -> Option<(Vec<f32>, u32)> {
     use symphonia::core::{
         audio::SampleBuffer, codecs::DecoderOptions, formats::FormatOptions, io::MediaSourceStream,
         meta::MetadataOptions, probe::Hint,
     };
-    let file = fs::File::open(path).ok()?;
-    let stream = MediaSourceStream::new(Box::new(file), Default::default());
+    let source: Box<dyn symphonia::core::io::MediaSource> =
+        match horizon_world::content_view::open_archive_stream(path) {
+            Some(entry) => Box::new(ArchivedAudio(entry.ok()?)),
+            None => Box::new(fs::File::open(path).ok()?),
+        };
+    let stream = MediaSourceStream::new(source, Default::default());
     let mut hint = Hint::new();
     hint.with_extension("ogg");
     let probed = symphonia::default::get_probe()
@@ -233,6 +318,8 @@ impl Backend for MixerBackend {
                 looping: false,
                 at: [0.0; 3],
                 relative: false,
+                air_absorption: 0.0,
+                high_shelf: Biquad::default(),
             },
         );
         Some(id)
@@ -259,6 +346,9 @@ impl Backend for MixerBackend {
     }
     fn set_relative(&mut self, channel: ChannelId, relative: bool) {
         self.with(channel, |c| c.relative = relative);
+    }
+    fn set_air_absorption(&mut self, channel: ChannelId, factor: f32) {
+        self.with(channel, |c| c.air_absorption = factor);
     }
     /// `getCompleteBuffer` (cached, else decoded on the decoder thread) or
     /// `getStream` (decoded on a thread of its own), then attach and
@@ -402,7 +492,7 @@ fn mix(mixer: &mut Mixer, data: &mut [f32], channels: usize, rate: u32) {
     ];
     let dot = |a: [f64; 3], b: [f64; 3]| (a[0] * b[0] + a[1] * b[1] + a[2] * b[2]) as f32;
     // Gains and pans per source for this buffer.
-    let mut voices: Vec<(ChannelId, [f32; 3], f64)> = Vec::new();
+    let mut voices: Vec<(ChannelId, [f32; 3], f64, Option<[f32; 5]>)> = Vec::new();
     for (id, c) in &mixer.channels {
         let Some((_, source_rate)) = &c.samples else {
             continue;
@@ -429,9 +519,12 @@ fn mix(mixer: &mut Mixer, data: &mut [f32], channels: usize, rate: u32) {
         }
         .map(|pan| gain * pan);
         let step = f64::from(*source_rate) / f64::from(rate) * f64::from(c.pitch.max(0.0));
-        voices.push((*id, [left, right, gain], step));
+        let shelf = air_absorption_gain_hf(c.air_absorption, distance)
+            .filter(|gain_hf| *gain_hf != 1.0)
+            .map(|gain_hf| Biquad::high_shelf(LOW_PASS_FREQ_REF / rate as f32, gain_hf));
+        voices.push((*id, [left, right, gain], step, shelf));
     }
-    for (id, [left, right, gain], step) in voices {
+    for (id, [left, right, gain], step, shelf) in voices {
         let Some(c) = mixer.channels.get_mut(&id) else {
             continue;
         };
@@ -450,7 +543,10 @@ fn mix(mixer: &mut Mixer, data: &mut [f32], channels: usize, rate: u32) {
                 }
             }
             let t = (c.position - i as f64) as f32;
-            let s = samples[i] * (1.0 - t) + samples[i + 1] * t;
+            let mut s = samples[i] * (1.0 - t) + samples[i + 1] * t;
+            if let Some(coefficients) = shelf {
+                s = c.high_shelf.process(coefficients, s);
+            }
             if channels >= 2 {
                 frame[0] += s * left;
                 frame[1] += s * right;
@@ -855,6 +951,59 @@ impl Audio {
         };
         self.play_instance(instance, false);
     }
+    /// `SoundManager.playDelayed(new SimpleSoundInstance(event, source,
+    /// volume, pitch, random, x, y, z), delay)` with a mod's air absorption
+    /// factor on its source (Create Big Cannons' blast sounds).
+    #[allow(clippy::too_many_arguments)]
+    pub fn play_delayed_at(
+        &mut self,
+        event: &str,
+        source: usize,
+        at: [f64; 3],
+        volume: f32,
+        pitch: f32,
+        seed: i64,
+        delay: i32,
+        air_absorption: f32,
+    ) {
+        *self.heard.entry(event.to_owned()).or_default() += 1;
+        self.sync_volumes();
+        let event = crate::sound_events::normalize(event);
+        let mut instance =
+            SoundInstance::at(&event, source, volume, pitch, LegacyRandom::new(seed), at);
+        instance.air_absorption = air_absorption;
+        let id = self.engine.add(instance, false);
+        self.engine.play_delayed(id, delay);
+    }
+    /// A CBC impact's local sound. Custom hit sounds pass level.random directly;
+    /// fallback sound events use a new random seeded by ClientLevel.playLocalSound.
+    #[allow(clippy::too_many_arguments)]
+    pub fn play_cbc_hit(
+        &mut self,
+        source: usize,
+        event: &str,
+        at: [f64; 3],
+        volume: f32,
+        pitch: f32,
+        level_random: &mut LegacyRandom,
+        share_random: bool,
+    ) {
+        *self.heard.entry(event.to_owned()).or_default() += 1;
+        let event = crate::sound_events::normalize(event);
+        let random = if share_random {
+            level_random.clone()
+        } else {
+            LegacyRandom::new(level_random.next_long())
+        };
+        let instance = SoundInstance::at(&event, source, volume, pitch, random, at);
+        let (id, _) = self.play_instance(instance, share_random);
+        if share_random {
+            if let Some(instance) = self.engine.instance(id) {
+                *level_random = instance.random.clone();
+            }
+            self.engine.release(id);
+        }
+    }
     /// Play a sound on a given `SoundSource` index (`/playsound`).
     pub fn play_on(
         &mut self,
@@ -992,6 +1141,50 @@ mod tests {
         audio.stop_all();
     }
 
+    #[test]
+    fn air_absorption_shelves_high_frequencies_as_openal_soft() {
+        // No absorption at the listener or without a factor.
+        assert_eq!(air_absorption_gain_hf(2.0, 0.0), None);
+        assert_eq!(air_absorption_gain_hf(0.0, 50.0), None);
+        let gain = air_absorption_gain_hf(2.0, 100.0).unwrap();
+        assert!((gain - 0.99426f32.powf(200.0)).abs() < 1e-6);
+        // Unity at DC; the shelf's square at Nyquist (OpenAL Soft's HighShelf).
+        let [b0, b1, b2, a1, a2] = Biquad::high_shelf(5000.0 / 48_000.0, gain);
+        assert!(((b0 + b1 + b2) / (1.0 + a1 + a2) - 1.0).abs() < 1e-4);
+        assert!(((b0 - b1 + b2) / (1.0 - a1 + a2) - gain * gain).abs() < 1e-3);
+        // A far blast loses its top end, a near one keeps it.
+        let nyquist: Vec<f32> = (0..4096)
+            .map(|i| if i % 2 == 0 { 1.0 } else { -1.0 })
+            .collect();
+        let peak = |distance: f32| {
+            let mut mixer = Mixer::default();
+            let mut c = channel(nyquist.clone(), Some(1000.0), [0.0, 0.0, distance], false);
+            c.air_absorption = 2.0;
+            mixer.channels.insert(1, c);
+            let mut out = vec![0.0; 2048];
+            mix(&mut mixer, &mut out, 1, 48_000);
+            out[1024..].iter().fold(0.0f32, |m, s| m.max(s.abs())) / (1.0 - distance / 1000.0)
+        };
+        assert!(peak(1.0) > 0.95, "{}", peak(1.0));
+        assert!(peak(400.0) < 0.05, "{}", peak(400.0));
+    }
+
+    #[test]
+    fn delayed_sounds_wait_in_the_queue() {
+        let mut audio = Audio::silent(Path::new("/nonexistent/horizon-test-assets"));
+        audio.play_delayed_at(
+            "createbigcannons:fire_autocannon",
+            4,
+            [0.0, 64.0, 0.0],
+            2.0,
+            1.0,
+            7,
+            12,
+            2.0,
+        );
+        assert_eq!(audio.engine.census()["queued"], 1);
+    }
+
     fn channel(samples: Vec<f32>, linear: Option<f32>, at: [f32; 3], looping: bool) -> Channel {
         Channel {
             samples: Some((Arc::new(samples), 48_000)),
@@ -1003,6 +1196,8 @@ mod tests {
             looping,
             at,
             relative: false,
+            air_absorption: 0.0,
+            high_shelf: Biquad::default(),
         }
     }
 

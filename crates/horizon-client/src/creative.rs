@@ -2,6 +2,7 @@
 //! contents as built by the game's own display generators
 //! (`creative-inventory.json`), a 9x5 scrolling grid and the search tab.
 use crate::{Result, items::ItemStack, ui::EditBox};
+use horizon_world::content_view;
 use serde_json::Value;
 use std::{
     collections::HashMap,
@@ -63,12 +64,20 @@ struct Shown {
 /// Display names from the pinned en_us language file.
 #[derive(Default)]
 pub struct Names {
-    map: HashMap<String, String>,
+    ids: HashMap<Box<str>, u32>,
+    text: Box<[Box<str>]>,
 }
 impl Names {
     pub fn load(root: &Path) -> Self {
+        let cache = horizon_world::resource_cache::Cache::for_tree(root, "en-names-v1", &[]);
+        if let Some(map) = cache
+            .as_ref()
+            .and_then(|c| c.read_value::<HashMap<String, String>>())
+        {
+            return Self::from_map(map);
+        }
         let read = |namespace: &str| {
-            fs::read(root.join(format!("assets/{namespace}/lang/en_us.json")))
+            content_view::read(root.join(format!("assets/{namespace}/lang/en_us.json")))
                 .ok()
                 .and_then(|b| serde_json::from_slice::<HashMap<String, String>>(&b).ok())
                 .unwrap_or_default()
@@ -78,14 +87,35 @@ impl Names {
         for namespace in crate::mod_content::namespaces(root) {
             map.extend(read(&namespace));
         }
-        Self { map }
+        if let Some(cache) = cache {
+            let _ = cache.write_value(&map);
+        }
+        Self::from_map(map)
+    }
+    fn from_map(map: HashMap<String, String>) -> Self {
+        let mut by_text = HashMap::new();
+        let ids = map
+            .into_iter()
+            .map(|(key, value)| {
+                let next = by_text.len() as u32;
+                let id = *by_text.entry(value.into_boxed_str()).or_insert(next);
+                (key.into_boxed_str(), id)
+            })
+            .collect();
+        let mut text = vec![Box::<str>::default(); by_text.len()];
+        for (value, id) in by_text {
+            text[id as usize] = value;
+        }
+        Self {
+            ids,
+            text: text.into(),
+        }
     }
     pub fn item(&self, id: &str) -> String {
         let (namespace, path) = id.split_once(':').unwrap_or(("minecraft", id));
-        self.map
-            .get(&format!("item.{namespace}.{path}"))
-            .or_else(|| self.map.get(&format!("block.{namespace}.{path}")))
-            .cloned()
+        self.get(&format!("item.{namespace}.{path}"))
+            .or_else(|| self.get(&format!("block.{namespace}.{path}")))
+            .map(str::to_owned)
             .unwrap_or_else(|| path.replace('_', " "))
     }
     /// An item's display name in the selected language: `item.*` then
@@ -109,7 +139,7 @@ impl Names {
             .or_else(|| self.get(key).map(str::to_owned))
     }
     pub fn get(&self, key: &str) -> Option<&str> {
-        self.map.get(key).map(String::as_str)
+        self.ids.get(key).map(|&id| self.text[id as usize].as_ref())
     }
 }
 
@@ -1035,9 +1065,7 @@ mod tests {
         let mut c = creative(90);
         c.select(2);
         assert!(c.tab().inventory);
-        assert!(!c.can_scroll(&Names {
-            map: HashMap::new()
-        }));
+        assert!(!c.can_scroll(&Names::default()));
     }
 
     #[test]
@@ -1101,9 +1129,7 @@ mod tests {
         );
         // A saved sword in slot 0, an empty slot, then the hint.
         c.set_saved_hotbars(vec![stack("diamond_sword", 1), stack("air", 0), hint]);
-        let names = Names {
-            map: HashMap::new(),
-        };
+        let names = Names::default();
         assert_eq!(c.shown(&names, 0), Some(stack("diamond_sword", 1)));
         assert_eq!(c.shown(&names, 1), None);
         assert_eq!(c.shown(&names, 3), None);
@@ -1133,9 +1159,7 @@ mod tests {
     #[test]
     fn search_matches_vanilla_trees() {
         let c = creative(0);
-        let names = Names {
-            map: HashMap::new(),
-        };
+        let names = Names::default();
         let q = |s: &str| c.search_results(s, &names);
         assert_eq!(q(""), [0, 1, 2]);
         assert_eq!(q("ANVIL"), [0]);
@@ -1160,12 +1184,10 @@ mod tests {
     #[test]
     fn search_matches_the_display_name_in_the_selected_language() {
         let c = creative(0);
-        let names = Names {
-            map: HashMap::from([
-                ("item.minecraft.anvil".to_owned(), "铁砧".to_owned()),
-                ("item.minecraft.wooden_hoe".to_owned(), "木锄".to_owned()),
-            ]),
-        };
+        let names = Names::from_map(HashMap::from([
+            ("item.minecraft.anvil".to_owned(), "铁砧".to_owned()),
+            ("item.minecraft.wooden_hoe".to_owned(), "木锄".to_owned()),
+        ]));
         let q = |s: &str| c.search_results(s, &names);
         assert_eq!(q("铁砧"), [0]);
         assert_eq!(q("木锄"), [2]);
@@ -1178,9 +1200,7 @@ mod tests {
     #[test]
     fn scrollbar_drag_follows_the_mouse_while_held() {
         let mut c = creative(90);
-        let names = Names {
-            map: HashMap::new(),
-        };
+        let names = Names::default();
         c.selected = 1;
         // Pressing the track holds the scrollbar without moving it.
         assert!(c.press_scrollbar(180.0, 60.0, &names));
@@ -1227,9 +1247,7 @@ mod tests {
     #[test]
     fn wheel_moves_one_row_per_notch() {
         let mut c = creative(90);
-        let names = Names {
-            map: HashMap::new(),
-        };
+        let names = Names::default();
         c.selected = 1;
         let rows = (93usize.div_ceil(9) - 5) as f32;
         c.wheel(-1.0, &names);
@@ -1296,5 +1314,69 @@ mod tests {
         assert!(!Creative::tab_wants_hand(&b, false, (169.0, 140.0)));
         assert!(Creative::tab_wants_hand(&b, false, (170.0, 140.0)));
         assert!(!Creative::tab_wants_hand(&b, false, (180.0, 132.0)));
+    }
+
+    #[test]
+    fn names_snapshot_hits_recovers_and_invalidates() {
+        let temp =
+            std::env::temp_dir().join(format!("horizon-en-names-cache-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp);
+        let lang_dir = temp.join("assets/minecraft/lang");
+        fs::create_dir_all(&lang_dir).unwrap();
+        fs::write(temp.join("horizon-mod-content.stamp"), "names-test-v1").unwrap();
+        let en_us = lang_dir.join("en_us.json");
+        let fixture = r#"{"item.minecraft.stick":"Stick","block.minecraft.stick":"Block stick","item.minecraft.stick_alt":"Stick","block.minecraft.stone":"Stone","misc.fixture":""}"#;
+        fs::write(&en_us, fixture).unwrap();
+        let expected: HashMap<String, String> = serde_json::from_str(fixture).unwrap();
+
+        let first = Names::load(&temp);
+        let warm = Names::load(&temp);
+        for (key, value) in &expected {
+            assert_eq!(first.get(key), Some(value.as_str()));
+            assert_eq!(warm.get(key), Some(value.as_str()));
+        }
+        for names in [&first, &warm] {
+            assert_eq!(names.item("stick"), "Stick");
+            assert_eq!(names.item("minecraft:stone"), "Stone");
+            assert_eq!(names.item("mod:missing_name"), "missing name");
+            assert!(std::ptr::eq(
+                names.get("item.minecraft.stick").unwrap(),
+                names.get("item.minecraft.stick_alt").unwrap(),
+            ));
+        }
+
+        let cache =
+            horizon_world::resource_cache::Cache::for_tree(&temp, "en-names-v1", &[]).unwrap();
+        let mut seeded = cache.read_value::<HashMap<String, String>>().unwrap();
+        seeded.insert("item.horizon.cached".into(), "Cached".into());
+        cache.write_value(&seeded).unwrap();
+        assert_eq!(
+            Names::load(&temp).get("item.horizon.cached"),
+            Some("Cached")
+        );
+
+        for entry in fs::read_dir(temp.join(".horizon-derived"))
+            .unwrap()
+            .flatten()
+        {
+            if entry.path().is_file() {
+                fs::write(entry.path(), b"corrupted").unwrap();
+            }
+        }
+        let recovered = Names::load(&temp);
+        assert_eq!(recovered.get("item.minecraft.stick"), Some("Stick"));
+        assert!(recovered.get("item.horizon.cached").is_none());
+
+        fs::write(
+            &en_us,
+            r#"{"item.minecraft.stick":"Stick","item.minecraft.stone":"Stone"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            Names::load(&temp).get("item.minecraft.stone"),
+            Some("Stone")
+        );
+
+        let _ = fs::remove_dir_all(&temp);
     }
 }

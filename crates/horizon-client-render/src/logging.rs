@@ -21,6 +21,30 @@ pub const MAX_ARCHIVES_PER_DAY: u32 = 7;
 /// Formatted lines kept in memory for crash reports.
 const RECENT: usize = 50;
 
+/// Process-wide counters at load boundaries. Deltas include concurrent loader
+/// work and driver allocations, not only allocations made by the calling thread.
+pub fn process_memory(stage: &str) {
+    const MIB: f64 = 1024.0 * 1024.0;
+    if let Some(memory) = horizon_threads::process_memory() {
+        let private = memory.private_bytes.map_or_else(
+            || "unavailable".to_owned(),
+            |bytes| format!("{:.1} MiB", bytes as f64 / MIB),
+        );
+        log::info!(
+            "memory: {stage}; working set {:.1} MiB; private bytes {private}; live_heap_mb={:.1} heap_peak_mb={:.1}",
+            memory.working_set_bytes as f64 / MIB,
+            horizon_threads::live_heap() as f64 / MIB,
+            horizon_threads::heap_peak() as f64 / MIB,
+        );
+    } else {
+        log::info!(
+            "memory: {stage}; process counters unavailable; live_heap_mb={:.1} heap_peak_mb={:.1}",
+            horizon_threads::live_heap() as f64 / MIB,
+            horizon_threads::heap_peak() as f64 / MIB,
+        );
+    }
+}
+
 /// The platform data folder (what the `dirs` crate's data_dir gives).
 pub fn data_dir() -> PathBuf {
     let env = |k: &str| {

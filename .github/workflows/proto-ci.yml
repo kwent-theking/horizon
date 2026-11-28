@@ -1,0 +1,212 @@
+name: Horizon Cloud candidate
+on:
+  push:
+    branches: [ci/proto-c]
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: never
+  RUST_BACKTRACE: "1"
+# A newer push to the same branch cancels the stale run.
+concurrency:
+  group: ${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  bridge:
+    if: github.repository == 'kwent-theking/horizon'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Check the Cloud snapshot
+        shell: bash
+        env:
+          IS_CANDIDATE: "${{ startsWith(github.event.head_commit.message, 'ci: cloud steering candidate') }}"
+          BEFORE: ${{ github.event.before }}
+        run: |
+          bash -n .github/horizon-ci/push-ci.sh
+          if [[ $IS_CANDIDATE == true ]]; then
+            [[ $(git rev-parse HEAD^) == "$BEFORE" ]]
+            paths=$(git diff --name-only --no-renames HEAD^ HEAD)
+            [[ -n $paths ]]
+            while IFS= read -r path; do
+              [[ $path =~ ^crates/(horizon-client|horizon-protocol)/[a-zA-Z0-9_./-]+\.rs$ ]]
+              [[ ! -L $path ]]
+            done <<< "$paths"
+            git diff --check HEAD^ HEAD
+          fi
+  test:
+    needs: bridge
+    if: "${{ startsWith(github.event.head_commit.message, 'ci: cloud steering candidate') }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # Mesa's lavapipe: a software Vulkan driver, so the renderer's GPU tests run.
+      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev pkg-config mesa-vulkan-drivers libvulkan1 vulkan-tools
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Check steering wheel regressions
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p horizon-client --bin horizon-client steering_wheel | tee "$RUNNER_TEMP/steering-wheel.log"
+          grep -Eq '^test result: ok\. [1-9][0-9]* passed' "$RUNNER_TEMP/steering-wheel.log"
+      - name: build and run the touched tests
+        shell: bash
+        # No Vulkan driver here: tests that ask for a GPU skip, as before
+        # lavapipe was installed. The GPU tests run in the next step.
+        env:
+          VK_DRIVER_FILES: /nonexistent/icd.json
+          VK_ICD_FILENAMES: /nonexistent/icd.json
+        run: |
+          set +e
+          fail=0
+          run() {
+            echo "::group::$*"
+            "$@"
+            s=$?
+            echo "::endgroup::"
+            echo "RESULT $s: $*" | tee -a summary.txt
+            if [ $s -ne 0 ]; then fail=1; fi
+          }
+          run cargo test -p horizon-client --lib --bins --no-run
+          run cargo test -p horizon-protocol --lib
+          run cargo test -p horizon-telemetry --lib
+          run cargo test -p horizon-assets --lib
+          run cargo test -p horizon-mods --lib
+          run cargo test -p horizon-client-render --lib model_library
+          run cargo test -p horizon-client-render --lib particle_defs
+          run cargo test -p horizon-client-render --lib particles
+          run cargo test -p horizon-client-render --lib audio
+          run cargo test -p horizon-client-render --lib sound_engine
+          run cargo test -p horizon-client-render --lib mesher
+          run cargo test -p horizon-client-render --lib streaming
+          run cargo test -p horizon-client-render --lib compact_bytes
+          run cargo test -p horizon-client-render --lib hud
+          run cargo test -p horizon-client-render --lib boot_progress
+          run cargo test -p horizon-client-render --lib models::catalog
+          run cargo test -p horizon-threads --lib memory
+          run cargo test -p horizon-threads --lib heap
+          run cargo test -p horizon-world --lib nbt
+          run cargo test -p horizon-world --lib content_view
+          run cargo test -p horizon-client-render --lib breaking
+          run cargo test -p horizon-client-render --lib brewing
+          run cargo test -p horizon-client-render --lib graphics
+          run cargo test -p horizon-client-render --lib graphics_ui
+          run cargo test -p horizon-client-render --lib sprites
+          run cargo test -p horizon-client-render --lib trims
+          run cargo test -p horizon-client-render --lib spans
+          run cargo test -p horizon-client-render --lib gfx::gpu_memory
+          run cargo test -p horizon-world --lib resource_cache
+          run cargo test -p horizon-world --lib registry
+          run cargo test -p horizon-world --lib collision
+          run cargo test -p horizon-world --test neoforge_collision
+          run cargo test -p horizon-items --lib blocks::stream_tests
+          run cargo test -p horizon-items --lib blocks::snapshot
+          run cargo test -p horizon-items --lib items_and_loot_snapshots
+          run cargo test -p horizon-items --lib items::
+          run cargo test -p horizon-client --lib item_render
+          run cargo test -p horizon-client --lib definitions_and_item_ids_snapshots
+          run cargo test -p horizon-client --lib names_snapshot
+          run cargo test -p horizon-client --lib animate_tables_snapshot
+          run cargo test -p horizon-client --lib crafting
+          run cargo test -p horizon-client --lib recipe_files_snapshot
+          run cargo test -p horizon-client --lib mobs::gecko
+          run cargo test -p horizon-client --lib mobs::render
+          run cargo test -p horizon-client --lib mobs::modded
+          run cargo test -p horizon-client --lib mod_content
+          run cargo test -p horizon-client-core --lib lang
+          run cargo test -p horizon-client --lib pick_item
+          run cargo test -p horizon-client --lib player_anim
+          run cargo test -p horizon-client --lib stations
+          run cargo test -p horizon-client --lib modsync
+          run cargo test -p horizon-client --lib mobs::sync
+          run cargo test -p horizon-client --lib probe_memory
+          run cargo test -p horizon-client --test sable_entity_ingress
+          run cargo test -p horizon-client --bin horizon-client sable_phase_5c
+          run cargo test -p horizon-client --bin horizon-client cbc_break_progress_tracks_each_position_and_expires_on_a_sweep
+          run cargo test -p horizon-client --bin horizon-client cbc_smoke_shell_packet_plays_the_extinguish_fire_alias
+          run cargo test -p horizon-client --bin horizon-client autocannon_rounds_have_their_own_spawn_body_and_tracer_bit
+          run cargo test -p horizon-client --bin horizon-client big_cannon_tracer_tracks_the_stack_and_animation_tick
+          run cargo test -p horizon-client --bin horizon-client -- server_states terrain stand_in attribute generic entity_culling non_living living drawn_extent kinetic create_contraption cbc_effects resource_ids
+          cat summary.txt
+          exit $fail
+      - name: Create packet and offscreen render fixture
+        shell: bash
+        env:
+          HORIZON_CREATE_FIXTURE_PNG: ${{ runner.temp }}/create-fixture.png
+          XDG_RUNTIME_DIR: ${{ runner.temp }}
+        run: |
+          cargo test -p horizon-client --bin horizon-client game::kinetics::scene_test::create_fixture_packet_scene -- --exact --nocapture
+          test -s "$HORIZON_CREATE_FIXTURE_PNG"
+      # First run on a real (software) Vulkan device: these tests never ran
+      # in CI, so their failures do not fail the job yet.
+      - name: GPU tests on lavapipe
+        if: ${{ !cancelled() }}
+        shell: bash
+        continue-on-error: true
+        run: |
+          set +e
+          vulkaninfo --summary 2>&1 | grep -iE "deviceName|driverName|apiVersion" | head
+          fail=0
+          for filter in gfx::animate gfx::bc gfx::upload gfx::tests; do
+            echo "::group::$filter"
+            cargo test -p horizon-client-render --lib "$filter" -- --nocapture 2>&1 | tee gpu-$$.txt
+            s=${PIPESTATUS[0]}
+            echo "::endgroup::"
+            echo "RESULT $s: $filter, skipped without an adapter: $(grep -c 'no GPU adapter' gpu-$$.txt)"
+            if [ $s -ne 0 ]; then fail=1; fi
+          done
+          exit $fail
+  windows-exe:
+    needs: bridge
+    if: "${{ startsWith(github.event.head_commit.message, 'ci: cloud steering candidate') }}"
+    runs-on: windows-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: build the client
+        shell: bash
+        run: |
+          cargo build --profile fast -p horizon-client --bin horizon-client --bin horizon-probe
+          cargo build --profile fast -p horizon-prepare --bin horizon-prepare
+      - uses: actions/upload-artifact@v4
+        with:
+          name: horizon-client-exe
+          path: |
+            target/fast/horizon-client.exe
+            target/fast/horizon-probe.exe
+            target/fast/horizon-prepare.exe
+          retention-days: 7
+  launcher:
+    needs: bridge
+    if: "${{ startsWith(github.event.head_commit.message, 'ci: cloud steering candidate') }}"
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: launcher
+          cache-on-failure: true
+      - name: friends launcher tests and build
+        shell: bash
+        run: |
+          cd launcher
+          cargo test --lib friends
+          cargo build --release --bin horizon-friends-launcher
+      - uses: actions/upload-artifact@v4
+        with:
+          name: horizon-friends-launcher
+          path: launcher/target/release/horizon-friends-launcher.exe
+          retention-days: 7

@@ -9,6 +9,8 @@ use crate::{
 };
 use horizon_world::nbt::Tag;
 
+pub(crate) mod v767;
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value {
     Byte(i8),
@@ -127,6 +129,14 @@ fn write_profile(p: &Profile, w: &mut Writer) {
         w.bool(slim);
     }
 }
+/// Internal particle ids used by the 1.21.1 translator, outside the vanilla registry.
+pub const CBC_BIG_CANNON_PLUME: i32 = -1;
+pub const CBC_AUTOCANNON_PLUME: i32 = -2;
+pub const CBC_DROP_MORTAR_PLUME: i32 = -3;
+pub const CBC_CANNON_BLAST_WAVE: i32 = -4;
+pub const CBC_SHELL_BLAST_WAVE: i32 = -5;
+pub const CBC_BREECH_SMOKE: i32 = -6;
+
 /// One `ParticleTypes.STREAM_CODEC` value: the `minecraft:particle_type` id,
 /// then the data its type carries (26.3 registry order).
 #[derive(Clone, Debug, PartialEq)]
@@ -155,12 +165,65 @@ pub enum ParticleData {
     Trail([f64; 3], i32, i32),
     /// An item (ItemStackTemplate: item, count, patch).
     Item(Stack),
+    /// A CBC plume: `BigCannonPlumeParticleData` (size, power, lifetime), or
+    /// the autocannon's and drop mortar's scale alone (power and lifetime 0).
+    CannonPlume {
+        size: f32,
+        power: f32,
+        lifetime: i32,
+    },
+    /// CBC's `AbstractBlastWaveEffectParticleData`, its sound event by name.
+    BlastWave(BlastWave),
     /// Geyser and geyser_plume: water blocks.
     Geyser(i32),
     /// Geyser_base and geyser_poof: water blocks, then the burst impulse.
     GeyserBase(i32, f32),
     /// Vibration: where it travels to, then its arrival time in ticks.
     Vibration { source: PositionSource, ticks: i32 },
+}
+/// CBC 5.11.7 `AbstractBlastWaveEffectParticleData`: the blast radius, the
+/// sound (`SoundEvent` holder, here always its id and optional fixed range),
+/// the `SoundSource` ordinal, volume, pitch, air absorption and shake power.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BlastWave {
+    pub blast_radius: f64,
+    pub sound: String,
+    pub fixed_range: Option<f32>,
+    pub source: i32,
+    pub volume: f32,
+    pub pitch: f32,
+    pub air_absorption: f32,
+    pub power: f32,
+}
+impl BlastWave {
+    pub fn read(r: &mut Reader) -> Result<Self> {
+        let blast_radius = r.f64()?;
+        let sound = r.string(32767)?;
+        let fixed_range = if r.bool()? { Some(r.f32()?) } else { None };
+        Ok(Self {
+            blast_radius,
+            sound,
+            fixed_range,
+            source: r.varint()?,
+            volume: r.f32()?,
+            pitch: r.f32()?,
+            air_absorption: r.f32()?,
+            power: r.f32()?,
+        })
+    }
+    pub fn write(&self, w: &mut Writer) {
+        w.f64(self.blast_radius);
+        w.string(&self.sound);
+        w.bool(self.fixed_range.is_some());
+        if let Some(range) = self.fixed_range {
+            w.f32(range);
+        }
+        w.varint(self.source);
+        w.f32(self.volume);
+        w.f32(self.pitch);
+        w.f32(self.air_absorption);
+        w.f32(self.power);
+    }
 }
 /// `PositionSource.STREAM_CODEC`: a `minecraft:position_source_type` id
 /// (block 0, entity 1), then that type's data.
@@ -219,6 +282,16 @@ impl Particle {
                 let water = r.i32()?;
                 Some(ParticleData::GeyserBase(water, r.f32()?))
             }
+            CBC_BIG_CANNON_PLUME | CBC_AUTOCANNON_PLUME | CBC_DROP_MORTAR_PLUME => {
+                Some(ParticleData::CannonPlume {
+                    size: r.f32()?,
+                    power: r.f32()?,
+                    lifetime: r.varint()?,
+                })
+            }
+            CBC_CANNON_BLAST_WAVE | CBC_SHELL_BLAST_WAVE => {
+                Some(ParticleData::BlastWave(BlastWave::read(r)?))
+            }
             // Every other registered particle carries no data.
             _ => None,
         };
@@ -242,6 +315,16 @@ impl Particle {
                 w.f32(*f);
             }
             ParticleData::Scalar(f) => w.f32(*f),
+            ParticleData::CannonPlume {
+                size,
+                power,
+                lifetime,
+            } => {
+                w.f32(*size);
+                w.f32(*power);
+                w.varint(*lifetime);
+            }
+            ParticleData::BlastWave(wave) => wave.write(w),
             ParticleData::Trail(at, c, d) => {
                 at.iter().for_each(|v| w.f64(*v));
                 w.i32(*c);

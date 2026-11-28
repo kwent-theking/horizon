@@ -1,5 +1,8 @@
 //! Saved section palettes and storage-level chunk access. Changes here do not
 //! run block behavior, lighting, heightmaps, neighbor updates or scheduled ticks.
+mod block_properties;
+pub use block_properties::BlockProperties;
+
 use crate::{
     DATA_VERSION,
     compression::invalid,
@@ -12,7 +15,7 @@ use horizon_core::{
     storage::PackedStorage,
     ticks::{ChunkTicks, SavedTick, TickTypeId},
 };
-use std::{collections::BTreeMap, io};
+use std::io;
 
 fn key(value: &str) -> JavaString {
     JavaString::from(value)
@@ -158,10 +161,10 @@ impl PalettedContainer {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct BlockState {
     pub name: String,
-    pub properties: BTreeMap<String, String>,
+    pub properties: BlockProperties,
 }
 impl BlockState {
     pub fn to_nbt(&self) -> Tag {
@@ -184,13 +187,13 @@ impl BlockState {
         if let Tag::String(name) = tag {
             return Ok(Self {
                 name: name.to_string().map_err(|e| invalid(e.to_string()))?,
-                properties: BTreeMap::new(),
+                properties: BlockProperties::default(),
             });
         }
         let Some(Tag::String(name)) = tag.get("id") else {
             return Err(invalid("block state is missing id"));
         };
-        let mut properties = BTreeMap::new();
+        let mut properties = BlockProperties::default();
         if let Some(tag) = tag.get("properties") {
             let Tag::Compound(map) = tag else {
                 return Err(invalid("block properties are not a compound"));
@@ -745,7 +748,7 @@ mod tests {
                 Tag::compound([("id", Tag::String(format!("minecraft:b{i}").as_str().into()))])
             })
             .collect();
-        let defaults: BTreeMap<_, _> = (0..states)
+        let defaults = (0..states)
             .map(|i| {
                 (
                     JavaString::from(format!("minecraft:b{i}").as_str()),

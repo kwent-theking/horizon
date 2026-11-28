@@ -7,7 +7,7 @@ use crate::{
     text::{Text, format_translation},
     ui,
 };
-use horizon_world::nbt::Tag;
+use horizon_world::{content_view, nbt::Tag};
 use serde_json::Value;
 use std::{collections::BTreeSet, path::Path};
 
@@ -342,7 +342,7 @@ fn load(root: &Path) -> (Vec<Preset>, BTreeSet<String>, BTreeSet<String>) {
             let path = root.join(format!(
                 "data/{namespace}/worldgen/flat_level_generator_preset/{path}.json"
             ));
-            let Ok(text) = std::fs::read_to_string(path) else {
+            let Ok(text) = content_view::read_to_string(path) else {
                 continue;
             };
             let Ok(value) = serde_json::from_str::<Value>(&text) else {

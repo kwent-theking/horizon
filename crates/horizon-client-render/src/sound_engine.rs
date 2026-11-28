@@ -39,7 +39,7 @@ pub enum Attenuation {
     Linear,
 }
 /// The tickable instance kinds Horizon plays (`TickableSoundInstance`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Ticking {
     /// Not tickable.
     No,
@@ -60,6 +60,52 @@ pub enum Ticking {
     GuardianAttack { guardian: u32 },
     /// `ElytraOnPlayerSoundInstance`: ticks since it started.
     Elytra { time: i32 },
+    /// Create Big Cannons' `ShellFlyingSoundInstance` (MIT) following shell
+    /// `shell` within `radius`.
+    CbcShellFlying {
+        shell: i32,
+        radius: f64,
+        base_pitch: f32,
+        time: i32,
+        timeout: i32,
+    },
+}
+/// What a CBC shell's flying sound reads about it.
+#[derive(Clone, Copy, Debug)]
+pub struct ShellSound {
+    pub id: i32,
+    pub position: [f64; 3],
+    /// `getDeltaMovement()`.
+    pub velocity: [f64; 3],
+    /// `AbstractCannonProjectile.localSoundCooldown`.
+    pub cooldown: i32,
+}
+impl ShellSound {
+    /// `Vec3.normalize()` of the shell's motion.
+    fn direction(&self) -> [f64; 3] {
+        normalize(self.velocity)
+    }
+    /// The sound trails the shell by its speed squared, at most 100 blocks.
+    fn sound_position(&self) -> [f64; 3] {
+        let wake = length_sqr(self.velocity).min(100.0);
+        let d = self.direction();
+        std::array::from_fn(|i| self.position[i] - d[i] * wake)
+    }
+}
+fn length_sqr(v: [f64; 3]) -> f64 {
+    v[0] * v[0] + v[1] * v[1] + v[2] * v[2]
+}
+/// `Vec3.normalize`: zero below 1e-5.
+fn normalize(v: [f64; 3]) -> [f64; 3] {
+    let length = length_sqr(v).sqrt();
+    if length < f64::from(1.0e-5f32) {
+        [0.0; 3]
+    } else {
+        v.map(|c| c / length)
+    }
+}
+fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 /// What a minecart's sound instances read about it.
 #[derive(Clone, Copy, Debug)]
@@ -103,6 +149,8 @@ pub struct TickContext {
     pub player_speed_sqr: f64,
     /// `isFallFlying()` of the player.
     pub player_fall_flying: bool,
+    /// The CBC shells in flight (a missing one has been removed).
+    pub cbc_shells: Vec<ShellSound>,
 }
 /// `AbstractSoundInstance` and its subclasses' fields.
 #[derive(Clone, Debug)]
@@ -125,6 +173,9 @@ pub struct SoundInstance {
     pub sound: Option<Sound>,
     /// `soundEvent != null` after `getOrResolve`, and its subtitle.
     pub event: Option<Option<String>>,
+    /// `AL_AIR_ABSORPTION_FACTOR` a mod sets on its sound's source (Create
+    /// Big Cannons' `AirAbsorptionWrapper`); 0 for vanilla sounds.
+    pub air_absorption: f32,
 }
 impl SoundInstance {
     #[allow(clippy::too_many_arguments)]
@@ -156,6 +207,7 @@ impl SoundInstance {
             stopped: false,
             sound: None,
             event: None,
+            air_absorption: 0.0,
         }
     }
     /// `new SimpleSoundInstance(sound, source, volume, pitch, random, x, y, z)`.
@@ -416,6 +468,36 @@ impl SoundInstance {
         s.ticking = Ticking::Elytra { time: 0 };
         s
     }
+    /// `new ShellFlyingSoundInstance(sound, random, player, shell, radius)`:
+    /// looping behind the shell; `base_pitch` is the caller's
+    /// `0.95 + level.random.nextFloat() * 0.3`.
+    pub fn cbc_shell_flying(
+        shell: &ShellSound,
+        radius: f64,
+        base_pitch: f32,
+        random: LegacyRandom,
+    ) -> Self {
+        let mut s = Self::new(
+            "createbigcannons:shell_flying",
+            NEUTRAL,
+            1.0,
+            1.0,
+            random,
+            true,
+            0,
+            Attenuation::Linear,
+            shell.sound_position().map(|c| f64::from(c as f32)),
+            false,
+        );
+        s.ticking = Ticking::CbcShellFlying {
+            shell: shell.id,
+            radius,
+            base_pitch,
+            time: 0,
+            timeout: 0,
+        };
+        s
+    }
     pub fn tickable(&self) -> bool {
         self.ticking != Ticking::No
     }
@@ -569,6 +651,60 @@ impl SoundInstance {
                 self.volume = 0.0 + 1.0 * scale * scale;
                 self.pitch = 0.7 + 0.5 * scale;
             }
+            Ticking::CbcShellFlying {
+                shell,
+                radius,
+                base_pitch,
+                time,
+                timeout,
+            } => {
+                const FADE_IN_TIME: i32 = 1;
+                const FADE_OUT_TIME: i32 = 20;
+                *time += 1;
+                let id = *shell;
+                let found = ctx
+                    .cbc_shells
+                    .iter()
+                    .find(|s| s.id == id && s.cooldown <= 0)
+                    .filter(|_| !ctx.player_removed);
+                if let Some(shell) = found {
+                    let player = ctx.player_position;
+                    let to_player = std::array::from_fn(|i| player[i] - shell.position[i]);
+                    let alignment = dot(shell.direction(), normalize(to_player)) as f32;
+                    let sound_position = shell.sound_position();
+                    self.position = sound_position.map(|c| f64::from(c as f32));
+                    let speed_sqr = length_sqr(shell.velocity) as f32;
+                    self.volume = if speed_sqr >= 1.0e-4 {
+                        (speed_sqr / 4.0).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    if *time < FADE_IN_TIME {
+                        self.volume *= *time as f32 / FADE_IN_TIME as f32;
+                    }
+                    let distance_sqr =
+                        length_sqr(std::array::from_fn(|i| player[i] - sound_position[i]));
+                    let intensity = 1.0 - distance_sqr / *radius / *radius;
+                    if intensity < 1.0 {
+                        self.volume *= intensity as f32;
+                    }
+                    let pitch_shift = (speed_sqr / 25.0).min(1.0) * alignment;
+                    self.pitch = (*base_pitch + pitch_shift).clamp(0.0, 2.0);
+                    if intensity <= 0.0 || alignment < -0.5 {
+                        *timeout += 1;
+                    } else if *timeout > 0 {
+                        *timeout -= 1;
+                    }
+                } else {
+                    *timeout = FADE_OUT_TIME;
+                    self.volume = 0.0;
+                }
+                self.volume *= (1.0 - *timeout as f32 / FADE_OUT_TIME as f32).clamp(0.0, 1.0);
+                if *timeout >= FADE_OUT_TIME {
+                    // The game sets the shell's localSoundCooldown to 3.
+                    self.stop();
+                }
+            }
             Ticking::RidingMinecart { cart, underwater } => {
                 let (id, underwater) = (*cart, *underwater);
                 let found = ctx.carts.iter().find(|c| c.id == id);
@@ -623,6 +759,8 @@ pub trait Backend {
     fn set_looping(&mut self, channel: ChannelId, looping: bool);
     fn set_position(&mut self, channel: ChannelId, position: [f64; 3]);
     fn set_relative(&mut self, channel: ChannelId, relative: bool);
+    /// `AL_AIR_ABSORPTION_FACTOR` (OpenAL EFX), clamped to 0..=10.
+    fn set_air_absorption(&mut self, _channel: ChannelId, _factor: f32) {}
     /// Attach the sound's buffer or stream (when loaded) and play it.
     fn start(&mut self, channel: ChannelId, sound: &Sound, looping: bool);
     fn stop(&mut self, channel: ChannelId);
@@ -1013,8 +1151,12 @@ impl SoundEngine {
         }
         let instance = self.instances.get_mut(&id).expect("present");
         let pitch = Self::calculate_pitch(instance.get_pitch());
-        let (attenuation, relative, tickable) =
-            (instance.attenuation, instance.relative, instance.tickable());
+        let (attenuation, relative, tickable, air_absorption) = (
+            instance.attenuation,
+            instance.relative,
+            instance.tickable(),
+            instance.air_absorption,
+        );
         backend.set_pitch(channel, pitch);
         backend.set_volume(channel, volume);
         backend.set_attenuation(
@@ -1024,6 +1166,9 @@ impl SoundEngine {
         backend.set_looping(channel, looping && !streaming);
         backend.set_position(channel, position);
         backend.set_relative(channel, relative);
+        if air_absorption != 0.0 {
+            backend.set_air_absorption(channel, air_absorption.clamp(0.0, 10.0));
+        }
         backend.start(channel, &sound, looping);
         if tickable {
             self.ticking.push(id);
@@ -1325,6 +1470,109 @@ pub mod test_backend {
         fn unpause(&mut self, _: ChannelId) {}
         fn stopped(&mut self, c: ChannelId) -> bool {
             self.stopped.get(&c).copied().unwrap_or(true)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shell(velocity: [f64; 3], cooldown: i32) -> ShellSound {
+        ShellSound {
+            id: 9,
+            position: [0.0, 64.0, 0.0],
+            velocity,
+            cooldown,
+        }
+    }
+
+    fn context(player: [f64; 3], shells: Vec<ShellSound>) -> TickContext {
+        TickContext {
+            player_position: player,
+            cbc_shells: shells,
+            ..TickContext::default()
+        }
+    }
+
+    #[test]
+    fn cbc_shell_flying_sound_trails_the_shell_and_rises_as_it_closes_in() {
+        let incoming = shell([0.0, 0.0, 2.0], 0);
+        let mut s = SoundInstance::cbc_shell_flying(&incoming, 60.0, 1.0, LegacyRandom::new(1));
+        // AbstractBigCannonProjectile.java:89-90, CBCSoundEvents.java:102.
+        assert_eq!(s.identifier, "createbigcannons:shell_flying");
+        // ShellFlyingSoundInstance.java:12,26,38.
+        assert!(s.looping && s.tickable());
+        // ShellFlyingSoundInstance.java:21-22.
+        assert_eq!((s.source, s.attenuation), (NEUTRAL, Attenuation::Linear));
+        // ShellFlyingSoundInstance.java:27-33.
+        assert_eq!(s.position, [0.0, 64.0, -4.0]);
+        s.tick(&context([0.0, 64.0, 20.0], vec![incoming]));
+        // ShellFlyingSoundInstance.java:48-52.
+        assert_eq!(s.position, [0.0, 64.0, -4.0]);
+        // ShellFlyingSoundInstance.java:53-63: full volume times 1 - 24^2 / 60^2.
+        assert!((s.volume - 0.84).abs() < 1e-6, "{}", s.volume);
+        // ShellFlyingSoundInstance.java:45-46,64-65: basePitch + 4 / 25 for alignment 1.
+        assert!((s.pitch - 1.16).abs() < 1e-6, "{}", s.pitch);
+        // ShellFlyingSoundInstance.java:66-78.
+        assert!(!s.stopped);
+    }
+
+    #[test]
+    fn cbc_shell_flying_sound_times_out_at_or_beyond_the_wake_radius() {
+        let incoming = shell([0.0, 0.0, 2.0], 0);
+        let radius = 60.0;
+        for distance in [radius - 1.0, radius, radius + 1.0] {
+            let mut s =
+                SoundInstance::cbc_shell_flying(&incoming, radius, 1.0, LegacyRandom::new(1));
+            let ctx = context([0.0, 64.0, distance - 4.0], vec![incoming]);
+            for _ in 0..19 {
+                s.tick(&ctx);
+            }
+            // ShellFlyingSoundInstance.java:41,61-78.
+            assert!(!s.stopped);
+            s.tick(&ctx);
+            if distance < radius {
+                // ShellFlyingSoundInstance.java:61-69,75-77.
+                assert!(!s.stopped && s.volume > 0.0);
+            } else {
+                // ShellFlyingSoundInstance.java:41,66-78.
+                assert!(s.stopped && s.volume == 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn cbc_shell_flying_sound_fades_out_once_the_shell_has_passed() {
+        let passed = shell([0.0, 0.0, 2.0], 0);
+        let mut s = SoundInstance::cbc_shell_flying(&passed, 60.0, 1.0, LegacyRandom::new(1));
+        let ctx = context([0.0, 64.0, -10.0], vec![passed]);
+        s.tick(&ctx);
+        let first = s.volume;
+        // ShellFlyingSoundInstance.java:41,66-78.
+        assert!(first > 0.0 && !s.stopped);
+        for _ in 1..19 {
+            s.tick(&ctx);
+        }
+        // ShellFlyingSoundInstance.java:66-78.
+        assert!(s.volume < first && !s.stopped, "{}", s.volume);
+        s.tick(&ctx);
+        // ShellFlyingSoundInstance.java:41,75-78.
+        assert!(s.stopped && s.volume == 0.0);
+    }
+
+    #[test]
+    fn cbc_shell_flying_sound_stops_with_its_shell() {
+        let flying = shell([0.0, 0.0, 2.0], 0);
+        for ctx in [
+            context([0.0, 64.0, 20.0], Vec::new()),
+            // A bounce or a stop sets localSoundCooldown to 3.
+            context([0.0, 64.0, 20.0], vec![shell([0.0, 0.0, 2.0], 3)]),
+        ] {
+            let mut s = SoundInstance::cbc_shell_flying(&flying, 60.0, 1.0, LegacyRandom::new(1));
+            s.tick(&ctx);
+            // ShellFlyingSoundInstance.java:42,71-78.
+            assert!(s.stopped && s.volume == 0.0);
         }
     }
 }
